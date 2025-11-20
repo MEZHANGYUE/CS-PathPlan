@@ -1,0 +1,2 @@
+Invoking command in '/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/pathPlanningAlgorithm': /usr/bin/cmake --build /home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/pathPlanningAlgorithm -- -j8 -l8
+Invoked command in '/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/pathPlanningAlgorithm' returned '2': /usr/bin/cmake --build /home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/pathPlanningAlgorithm -- -j8 -l8

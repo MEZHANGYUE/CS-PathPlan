@@ -1,0 +1,4 @@
+Invoking command in '/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/pathPlanningAlgorithm': /usr/bin/cmake /home/cong/CS-Y2398/UAV/pathPlanningAlgorithm -DCMAKE_INSTALL_PREFIX=/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/install/pathPlanningAlgorithm
+Invoked command in '/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/pathPlanningAlgorithm' returned '0': /usr/bin/cmake /home/cong/CS-Y2398/UAV/pathPlanningAlgorithm -DCMAKE_INSTALL_PREFIX=/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/install/pathPlanningAlgorithm
+Invoking command in '/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/pathPlanningAlgorithm': /usr/bin/cmake --build /home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/pathPlanningAlgorithm -- -j8 -l8
+Invoked command in '/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/pathPlanningAlgorithm' returned '2': /usr/bin/cmake --build /home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/pathPlanningAlgorithm -- -j8 -l8

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libalgo.a CMakeFiles/algo.dir/uavPathPlanning.cpp.o
+/usr/bin/ranlib libalgo.a
