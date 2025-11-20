@@ -1,8 +1,0 @@
-In file included from [01m[K/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/uavPathPlanningTest.cpp:5[m[K:
-[01m[K/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/math_util/planner.h:7:10:[m[K [01;31m[Kfatal error: [m[Kgeometry_msgs/Pose.h: No such file or directory
-    7 | #include [01;31m[K<geometry_msgs/Pose.h>[m[K
-      |          [01;31m[K^~~~~~~~~~~~~~~~~~~~~~[m[K
-compilation terminated.
-gmake[2]: *** [CMakeFiles/uavPathPlanningTest.dir/build.make:76: CMakeFiles/uavPathPlanningTest.dir/uavPathPlanningTest.cpp.o] Error 1
-gmake[1]: *** [CMakeFiles/Makefile2:140: CMakeFiles/uavPathPlanningTest.dir/all] Error 2
-gmake: *** [Makefile:91: all] Error 2

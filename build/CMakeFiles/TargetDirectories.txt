@@ -1,5 +1,0 @@
-/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/CMakeFiles/algo.dir
-/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/CMakeFiles/math_util.dir
-/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/CMakeFiles/uavPathPlanningTest.dir
-/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/CMakeFiles/edit_cache.dir
-/home/cong/CS-Y2398/UAV/pathPlanningAlgorithm/build/CMakeFiles/rebuild_cache.dir
