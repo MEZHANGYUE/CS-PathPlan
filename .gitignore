@@ -1,0 +1,63 @@
+# Build directories
+/build/
+/bin/
+/out/
+
+# C/C++ objects and libraries
+*.o
+*.obj
+*.so
+*.a
+*.dll
+*.exe
+*.out
+
+# Compilers and IDE caches
+*.dSYM/
+*.suo
+*.user
+*.userosscache
+*.sln
+*.VC.db
+*.VC.opendb
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+
+# VSCode
+.vscode/
+
+# CLion / JetBrains
+.idea/
+*.iml
+
+# Logs and temporary
+*.log
+*.tmp
+*.swp
+*~
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Coverage
+coverage/
+*.gcno
+*.gcda
+
+# Python virtualenv (if present)
+venv/
+.env/
+__pycache__/
+
+# Node (if present)
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
