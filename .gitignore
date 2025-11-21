@@ -2,7 +2,8 @@
 /build/
 /bin/
 /out/
-
+/log/
+/install/
 # C/C++ objects and libraries
 *.o
 *.obj
