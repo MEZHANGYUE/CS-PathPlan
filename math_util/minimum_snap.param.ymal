@@ -1,0 +1,22 @@
+# minimum_snap.param.ymal
+# 配置轨迹生成参数 (重命名自 trajectory_generator_config.yaml)
+
+# 多项式导数阶数（d_order），例如 d_order=3 表示最小化 snap
+order: 3
+
+# 平均巡航速度 (m/s)
+V_avg: 200.0
+
+# 单段最小时长 (s)
+min_time_s: 2.0
+
+# 轨迹点采样间隔距离 (m)
+sample_distance: 300.0
+
+# 起始速度与终止速度（可选，格式为 [vx, vy, vz]）
+start_vel: [0.0, 0.0, 0.0]
+end_vel: [0.0, 0.0, 0.0]
+
+# 起始加速度与终止加速度（可选）
+start_acc: [0.0, 0.0, 0.0]
+end_acc: [0.0, 0.0, 0.0]

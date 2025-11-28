@@ -1,4 +1,64 @@
-#include "uavPathPlanning.h"
+#include "uavPathPlanning.hpp"
+#include "math_util/minimum_snap.hpp"
+#include <yaml-cpp/yaml.h>
+
+// 配置命名空间：将时间分配相关默认值和 YAML 加载器内联到此文件中，避免使用单独的 _config.h
+namespace TimeAllocConfig {
+    inline double V_avg_default = 10.0;
+
+    inline double angle_threshold = 0.2;        // 弧度
+    inline double min_time_s = 40.0;            // 最小分配时间 s
+    inline double prev_influence = 0.5;         // 前一段影响系数
+
+    inline double base_pow = 0.65;
+    inline double base_divider = 50.0;
+
+    inline double long_threshold = 10.0;
+    inline double med_threshold = 3.0;
+    inline double small_threshold = 1.0;
+    inline double tiny_threshold = 0.1;
+
+    inline double long_adj = 0.7;
+    inline double med_adj = 1.0;
+    inline double small_adj = 1.1;
+    inline double tiny_adj = 1.3;
+
+    inline double min_alloc = 1.0;
+    inline double max_alloc = 300.0;
+
+    // 从 YAML 文件加载配置，若字段缺失则保留默认值
+    inline bool loadFromYAML(const std::string &yaml_path) {
+        try {
+            YAML::Node config = YAML::LoadFile(yaml_path);
+            if (config["V_avg_default"]) V_avg_default = config["V_avg_default"].as<double>();
+
+            if (config["angle_threshold"]) angle_threshold = config["angle_threshold"].as<double>();
+            if (config["min_time_s"]) min_time_s = config["min_time_s"].as<double>();
+            if (config["prev_influence"]) prev_influence = config["prev_influence"].as<double>();
+
+            if (config["base_pow"]) base_pow = config["base_pow"].as<double>();
+            if (config["base_divider"]) base_divider = config["base_divider"].as<double>();
+
+            if (config["long_threshold"]) long_threshold = config["long_threshold"].as<double>();
+            if (config["med_threshold"]) med_threshold = config["med_threshold"].as<double>();
+            if (config["small_threshold"]) small_threshold = config["small_threshold"].as<double>();
+            if (config["tiny_threshold"]) tiny_threshold = config["tiny_threshold"].as<double>();
+
+            if (config["long_adj"]) long_adj = config["long_adj"].as<double>();
+            if (config["med_adj"]) med_adj = config["med_adj"].as<double>();
+            if (config["small_adj"]) small_adj = config["small_adj"].as<double>();
+            if (config["tiny_adj"]) tiny_adj = config["tiny_adj"].as<double>();
+
+            if (config["min_alloc"]) min_alloc = config["min_alloc"].as<double>();
+            if (config["max_alloc"]) max_alloc = config["max_alloc"].as<double>();
+
+            return true;
+        } catch (const std::exception &e) {
+            std::cerr << "Failed to load time allocation YAML: " << e.what() << std::endl;
+            return false;
+        }
+    }
+}
 WGS84Point origin; 
 // 经纬度转ECEF坐标
 ECEFPoint wgs84ToECEF(const WGS84Point& lla) {
@@ -320,32 +380,33 @@ bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Poin
 }
 std::vector<ENUPoint> Minisnap_3D (std::vector<ENUPoint> Enu_waypoint_,double distance_)
 {
-    planner Planner;
     std::vector<ENUPoint> result{};
-     int dot_num = Enu_waypoint_.size();  //路径点个数
-    Eigen::MatrixXd route(dot_num, 3);    
+    int dot_num = Enu_waypoint_.size();  //路径点个数
+    if (dot_num < 2) return result;
+
+    Eigen::MatrixXd route(dot_num, 3);
     for (int i = 0; i < dot_num; i++) {
         route(i, 0) = Enu_waypoint_[i].east;   // x -> east
         route(i, 1) = Enu_waypoint_[i].north;  // y -> north  
         route(i, 2) = Enu_waypoint_[i].up;     // z -> up
     }
-    cout << "route:" << route <<endl;
-    //时间分配 获得时间参数
-    Eigen::VectorXd time;
-    time = minimumSnapTimeAllocation(route,50,200) ;
-    // time << 440, 140, 260, 260, 120, 35;
-    // time << 5, 5, 5, 5, 5, 5;
-    cout << "time:" << time <<endl;
-    Planner.trajectory_ = Planner.trajectory_path(route,time,distance_);
 
-    // cout << "Planner.trajectory size:" << Planner.trajectory_.size() << endl;
-    for (const auto& pose : Planner.trajectory_.poses) {
+    // 使用刚刚实现的 minimum snap 生成函数
+    TrajectoryGeneratorTool generator;
+    // 使用相对路径的 YAML 配置文件（项目目录下 math_util/minimum_snap.param.ymal）
+    std::string yaml_cfg = "math_util/minimum_snap.param.ymal";
+    Eigen::MatrixXd sampled = generator.GenerateTrajectoryMatrix(route, yaml_cfg);
+
+    // 将采样点转换为 ENUPoint 向量返回
+    for (int i = 0; i < sampled.rows(); ++i) {
         ENUPoint enu_point;
-        enu_point.east = pose.position_x;   // x -> east
-        enu_point.north = pose.position_y;  // y -> north
-        enu_point.up = pose.position_z;     // z -> up
+        enu_point.east = sampled(i, 0);
+        enu_point.north = sampled(i, 1);
+        enu_point.up = sampled(i, 2);
         result.push_back(enu_point);
     }
+
+    std::cout << "Generated trajectory point number:" << result.size() << std::endl;
     return result;
 }
 
@@ -380,7 +441,7 @@ Eigen::VectorXd minimumSnapTimeAllocation(const Eigen::MatrixXd& route, double V
             
             // 处理数值误差，确保cos_angle在[-1,1]范围内
             cos_angle = std::max(-1.0, std::min(1.0, cos_angle));
-            turn_radii(i) = std::acos(cos_angle);}
+            turn_radii(i) = std::acos(cos_angle);}            
             else turn_radii(i)=0;  //第一段轨迹时间分配不考虑转弯  
     }
     std::cout << "turn_radii:" <<turn_radii <<endl;
@@ -390,12 +451,12 @@ Eigen::VectorXd minimumSnapTimeAllocation(const Eigen::MatrixXd& route, double V
     for (int i = 0; i < num_segments; ++i) { 
         if (i>0 )
         {
-            if(turn_radii(i)<0.2)
-            time_allocation(i) = std::max((1+turn_radii(i))*segment_lengths(i)/V_avg , 40.0);
-            else time_allocation(i) = std::max((1+turn_radii(i)-turn_radii(i-1)*0.5)*segment_lengths(i)/V_avg , 40.0);
+            if(turn_radii(i)< TimeAllocConfig::angle_threshold)
+            time_allocation(i) = std::max((1+turn_radii(i))*segment_lengths(i)/V_avg , TimeAllocConfig::min_time_s);
+            else time_allocation(i) = std::max((1+turn_radii(i)-turn_radii(i-1)* TimeAllocConfig::prev_influence)*segment_lengths(i)/V_avg , TimeAllocConfig::min_time_s);
         }
         
-        else time_allocation(i) = std::max((1+turn_radii(i))*segment_lengths(i)/V_avg , 40.0);
+    else time_allocation(i) = std::max((1+turn_radii(i))*segment_lengths(i)/V_avg , TimeAllocConfig::min_time_s);
     }
     return time_allocation;
 }
@@ -420,15 +481,15 @@ Eigen::VectorXd minimumSnapTimeAllocation(const Eigen::MatrixXd& route)
         double length = segment_lengths(i);
         double length_ratio = length / avg_length;
         
-        double base_time = std::pow(length, 0.65) / 50.0;
+    double base_time = std::pow(length, TimeAllocConfig::base_pow) / TimeAllocConfig::base_divider;
         
         // 基础分段策略
-        double adjustment = 1.0;
-        if (length_ratio > 10.0) adjustment = 0.7;
-        else if (length_ratio > 3.0) adjustment = 1.0;
-        else if (length_ratio > 1.0) adjustment = 1.1;
-        else if (length_ratio > 0.1) adjustment = 1.3;
-        else adjustment = 2.0 / base_time;  // 转换为乘数
+    double adjustment = 1.0;
+    if (length_ratio > TimeAllocConfig::long_threshold) adjustment = TimeAllocConfig::long_adj;
+    else if (length_ratio > TimeAllocConfig::med_threshold) adjustment = TimeAllocConfig::med_adj;
+    else if (length_ratio > TimeAllocConfig::small_threshold) adjustment = TimeAllocConfig::small_adj;
+    else if (length_ratio > TimeAllocConfig::tiny_threshold) adjustment = TimeAllocConfig::tiny_adj;
+    else adjustment = 2.0 / base_time;  // 转换为乘数
         
         // 相邻段平衡：如果前一段加了时间，当前段适当减少
         if (i > 0) {
@@ -447,7 +508,7 @@ Eigen::VectorXd minimumSnapTimeAllocation(const Eigen::MatrixXd& route)
         }
         
         time_allocation(i) = base_time * adjustment;
-        time_allocation(i) = std::max(1.0, std::min(time_allocation(i), 300.0));
+        time_allocation(i) = std::max(TimeAllocConfig::min_alloc, std::min(time_allocation(i), TimeAllocConfig::max_alloc));
     }
     
     return time_allocation;

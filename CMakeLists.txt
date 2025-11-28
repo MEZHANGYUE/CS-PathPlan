@@ -11,6 +11,7 @@ include_directories(
 
 find_package(Eigen3 REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 add_library(algo uavPathPlanning.cpp)
 
@@ -19,10 +20,14 @@ add_library(math_util
     math_util/box2d.cpp
     math_util/linear_interpolation.cpp
     math_util/math_utils.cpp
-    math_util/trajectory_generator.cpp
-    math_util/planner.cpp)
+    math_util/minimum_snap.cpp
+    )
+
+# minimum_snap.cpp now contains trajectory-generator and planner implementations
+target_sources(math_util PRIVATE math_util/minimum_snap.cpp)
 
 target_link_libraries(algo math_util)
+target_link_libraries(math_util yaml-cpp)
 
 add_executable(uavPathPlanningTest uavPathPlanningTest.cpp)
 

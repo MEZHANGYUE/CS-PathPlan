@@ -1,9 +1,8 @@
 #include <vector>
 #include <iostream>
 #include <fstream>
-#include "uavPathPlanning.h"
-#include "math_util/planner.h"
-#include "math_util/trajectory_generator.h"
+#include "uavPathPlanning.hpp"
+#include "math_util/minimum_snap.hpp"
 int main(int argc, char *argv[])
 {
     /****** test code ******/
