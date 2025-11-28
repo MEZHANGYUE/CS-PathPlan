@@ -4,6 +4,7 @@
 /out/
 /log/
 /install/
+/data/
 # C/C++ objects and libraries
 *.o
 *.obj
