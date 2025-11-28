@@ -1,6 +1,0 @@
-# DEPRECATED: trajectory_generator_config.yaml
-# This file has been replaced by 'minimum_snap.param.ymal'.
-# Kept for backward compatibility only. Please update any references to
-# use 'math_util/minimum_snap.param.ymal'.
-
-# Original content moved to minimum_snap.param.ymal

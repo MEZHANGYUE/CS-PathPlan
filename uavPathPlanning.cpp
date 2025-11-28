@@ -393,9 +393,36 @@ std::vector<ENUPoint> Minisnap_3D (std::vector<ENUPoint> Enu_waypoint_,double di
 
     // 使用刚刚实现的 minimum snap 生成函数
     TrajectoryGeneratorTool generator;
-    // 使用相对路径的 YAML 配置文件（项目目录下 math_util/minimum_snap.param.ymal）
-    std::string yaml_cfg = "math_util/minimum_snap.param.ymal";
-    Eigen::MatrixXd sampled = generator.GenerateTrajectoryMatrix(route, yaml_cfg);
+    // 尝试若干相对路径以提高在不同运行目录下的健壮性
+    std::vector<std::string> try_paths = {
+        "math_util/minimum_snap_config.ymal",
+        "../math_util/minimum_snap_config.ymal",
+        "../../math_util/minimum_snap_config.ymal"
+    };
+
+    std::string yaml_cfg;
+    bool found = false;
+    for (const auto &p : try_paths) {
+        std::ifstream ifs(p);
+        if (ifs.good()) {
+            yaml_cfg = p;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        // 最后退回到 the original relative path and let the generator report the error
+        yaml_cfg = "math_util/minimum_snap_config.ymal";
+        std::cerr << "Warning: cannot find config in usual locations; will try '" << yaml_cfg << "' and fall back to defaults if unreadable." << std::endl;
+    } else {
+        std::cerr << "Using YAML config: " << yaml_cfg << std::endl;
+    }
+
+    // 如果输入 JSON 中提供了 distance_（distance_points），则优先使用该值作为采样距离
+    if (distance_ > 0) {
+        std::cerr << "Using input JSON distance_points as sampling distance: " << distance_ << " m" << std::endl;
+    }
+    Eigen::MatrixXd sampled = generator.GenerateTrajectoryMatrix(route, yaml_cfg, distance_);
 
     // 将采样点转换为 ENUPoint 向量返回
     for (int i = 0; i < sampled.rows(); ++i) {

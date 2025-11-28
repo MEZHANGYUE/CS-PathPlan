@@ -1,7 +1,7 @@
-# minimum_snap.param.ymal
-# 配置轨迹生成参数 (重命名自 trajectory_generator_config.yaml)
+# minimum_snap_config.ymal
+# 配置轨迹生成参数 (重命名自 minimum_snap.param.ymal)
 
-# 多项式导数阶数（d_order），例如 d_order=3 表示最小化 snap
+# 多项式导数阶数（d_order），例如 d_order=3 表示最小化 jerk ; d_order=4 表示最小化 snap
 order: 3
 
 # 平均巡航速度 (m/s)

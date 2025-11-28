@@ -18,7 +18,7 @@ int TrajectoryGeneratorTool::Factorial(int x) {
     return fac;
 }
 
-Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path) {
+Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path, double sample_distance_override) {
     // 配置默认值
     int order = 3; // 默认最小化 snap 对应 d_order=3 (可在yaml中覆盖)
     double V_avg = 5.0; // m/s
@@ -60,6 +60,14 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
     } catch (const std::exception &e) {
         std::cerr << "TrajectoryGeneratorTool: failed to load YAML config '"<< yaml_path << "': " << e.what() << ". Using defaults." << std::endl;
     }
+
+    // 如果调用者传入了覆盖采样距离的参数，优先使用它
+    if (sample_distance_override > 0.0) {
+        sample_distance = sample_distance_override;
+    }
+
+    // 打印实际使用的采样距离，便于调试
+    std::cerr << "TrajectoryGeneratorTool: sampling distance used = " << sample_distance << " m" << std::endl;
 
     // 输入路径检查
     if (Path.rows() < 2 || Path.cols() < 3) {

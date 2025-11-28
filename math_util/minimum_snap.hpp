@@ -24,7 +24,8 @@ public:
     // 生成完整轨迹并返回采样点矩阵 (N x 3)。
     // Path: (M x 3) 路径点矩阵
     // yaml_path: 配置文件路径，包含 order, V_avg, min_time_s, sample_distance, start/end vel/acc
-    Eigen::MatrixXd GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path);
+    // 如果 sample_distance_override > 0 则覆盖 YAML 中的 sample_distance 值（单位：米）
+    Eigen::MatrixXd GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path, double sample_distance_override = -1.0);
 };
 
 // --- Planner public API merged here for convenience ---
