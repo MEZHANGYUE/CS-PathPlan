@@ -101,59 +101,84 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
     const int p_order = 2 * order - 1;
     const int p_num1d = p_order + 1;
 
-    // 采样：按 sample_distance 近似参数步长采样（使用 dt = sample_distance / V_avg），并保证细粒度
-    double dt_default = (V_avg > 1e-6) ? std::max(0.01, sample_distance / V_avg) : 0.01;
-
+    // 采样：精确的固定距离采样
+    // 使用一个小的时间步长步进，但在每个步进内通过线性插值多次插入满足 sample_distance 的点，保证记录点间距≈sample_distance
+    // double dt_default = (V_avg > 1e-6) ? std::max(0.01, sample_distance / V_avg) : 0.01;
+    double dt_default = 0.1;
     std::vector<Eigen::Vector3d> samples;
     samples.reserve(1000);
+
+    auto eval_poly_at = [&](int seg, double t)->Eigen::Vector3d {
+        Eigen::Vector3d pt(0,0,0);
+        for (int dim = 0; dim < 3; ++dim) {
+            Eigen::VectorXd coeff = polyCoeff.row(seg).segment(dim * p_num1d, p_num1d);
+            double val = 0.0;
+            for (int k = 0; k < p_num1d; ++k) {
+                double c = coeff(k);
+                int exp = p_num1d - 1 - k;
+                val += c * std::pow(t, exp);
+            }
+            pt(dim) = val;
+        }
+        return pt;
+    };
+
+    Eigen::Vector3d last_recorded(0,0,0);
+    bool has_last = false;
+    Eigen::Vector3d prev_pt(0,0,0);
 
     for (int seg = 0; seg < num_segments; ++seg) {
         double T = Time(seg);
         double dt = dt_default;
-        // 为每段至少进行若干采样点
         if (dt > T/10.0) dt = T/10.0;
 
-        for (double t = 0.0; t <= T; t += dt) {
-            // 跳过每段的起点，除非这是第一段（seg==0），以避免段边界点重复
-            if (seg > 0 && t <= 1e-9) continue;
+        // 在段起始点处进行一次评估以获得连续性（但不在非首段重复写入）
+        Eigen::Vector3d t0_pt = eval_poly_at(seg, 0.0);
+        if (!has_last) {
+            samples.push_back(t0_pt);
+            last_recorded = t0_pt;
+            has_last = true;
+        }
+        prev_pt = t0_pt;
 
-            Eigen::Vector3d pt(0,0,0);
-            for (int dim = 0; dim < 3; ++dim) {
-                Eigen::VectorXd coeff = polyCoeff.row(seg).segment(dim * p_num1d, p_num1d);
-                // Evaluate polynomial: coeff[0]*t^{p_num1d-1} + ... + coeff[last]
-                double val = 0.0;
-                for (int k = 0; k < p_num1d; ++k) {
-                    double c = coeff(k);
-                    int exp = p_num1d - 1 - k;
-                    val += c * std::pow(t, exp);
-                }
-                pt(dim) = val;
+        for (double t = dt; t <= T + 1e-12; t += dt) {
+            double tt = std::min(t, T);
+            Eigen::Vector3d cur_pt = eval_poly_at(seg, tt);
+
+            // 从 prev_pt 到 cur_pt 这一小段上可能包含一个或多个采样点
+            double remain_needed = sample_distance - (prev_pt - last_recorded).norm();
+            if (remain_needed <= 0) {
+                // 理论上不应发生，但处理为重置
+                remain_needed = sample_distance;
             }
 
-            if (samples.empty()) {
-                samples.push_back(pt);
-            } else {
-                // 控制按距离采样：仅在与上一个样点距离>=sample_distance时添加
-                if ((pt - samples.back()).norm() >= sample_distance) {
-                    samples.push_back(pt);
-                }
+            Eigen::Vector3d seg_vec = cur_pt - prev_pt;
+            double seg_len = seg_vec.norm();
+
+            // 当这一小段长度大于需要的剩余距离时，插值并可能多次插入
+            while (seg_len + 1e-12 >= remain_needed) {
+                double alpha = (remain_needed) / seg_len; // 在 prev_pt -> cur_pt 上的位置
+                Eigen::Vector3d sample_pt = prev_pt + alpha * seg_vec;
+                samples.push_back(sample_pt);
+                last_recorded = sample_pt;
+
+                // 更新 prev_pt 到 sample_pt，并重新计算剩余段长
+                prev_pt = sample_pt;
+                seg_vec = cur_pt - prev_pt;
+                seg_len = seg_vec.norm();
+                // 接下来在同一小段上寻找下一个采样点，所需距离为 sample_distance
+                remain_needed = sample_distance;
+                // 防止无限循环：如果 seg_len 非常小则跳出
+                if (seg_len < 1e-9) break;
             }
+
+            // 将 prev_pt 移动到 cur_pt 以供下一步使用
+            prev_pt = cur_pt;
         }
 
-        // 仅在最后一段时确保终点被加入，避免把每段终点都加入导致重复
+        // 在最后一段时，确保终点被加入（避免重复）
         if (seg == num_segments - 1) {
-            // evaluate at T
-            Eigen::Vector3d endpt(0,0,0);
-            for (int dim = 0; dim < 3; ++dim) {
-                Eigen::VectorXd coeff = polyCoeff.row(seg).segment(dim * p_num1d, p_num1d);
-                double val = 0.0;
-                for (int k = 0; k < p_num1d; ++k) {
-                    double c = coeff(k);
-                    int exp = p_num1d - 1 - k;
-                    val += c * std::pow(T, exp);
-                }
-                endpt(dim) = val;
-            }
+            Eigen::Vector3d endpt = eval_poly_at(seg, T);
             if (samples.empty() || (samples.back() - endpt).norm() > 1e-6) samples.push_back(endpt);
         }
     }

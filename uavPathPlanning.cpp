@@ -2,6 +2,9 @@
 #include "math_util/minimum_snap.hpp"
 #include <yaml-cpp/yaml.h>
 
+// Single global trajectory generator to reuse heavy-initialized resources across functions
+static TrajectoryGeneratorTool generator;
+
 // 配置命名空间：将时间分配相关默认值和 YAML 加载器内联到此文件中，避免使用单独的 _config.h
 namespace TimeAllocConfig {
     inline double V_avg_default = 10.0;
@@ -331,7 +334,7 @@ double getDistanceFromJSON(const json& j, const std::string& key)
 
 //
 
-bool getPlan(json &input_json, json &output_json)
+bool getPlan(json &input_json, json &output_json, bool use3D)
 {
     std::vector<ENUPoint> Enu_waypoint;
     double distance;
@@ -360,8 +363,13 @@ bool getPlan(json &input_json, json &output_json)
     // 将 leader_speed 写回 input_data 以便其他函数使用
     if (leader_speed > 0) input_data.leader_speed = leader_speed;
 
-    std::vector<ENUPoint> Trajectory_ENU = Minisnap_3D(Enu_waypoint, distance, input_data.leader_speed); //三维规划
-    std::cout << "trajectory point number:" << Trajectory_ENU.size() << std::endl;
+    std::vector<ENUPoint> Trajectory_ENU;
+    if (use3D) {
+        Trajectory_ENU = Minisnap_3D(Enu_waypoint, distance, input_data.leader_speed);
+    } else {
+        Trajectory_ENU = Minisnap_EN(Enu_waypoint, distance, input_data.leader_speed);
+    }
+    // std::cout << "trajectory point number:" << Trajectory_ENU.size() << std::endl;
     //东北天坐标转换为经纬高
     std::vector<WGS84Point> Trajectory_WGS84 = enuToWGS84_Batch(Trajectory_ENU,origin);
     // 将经纬高路径写入 output_json —— leader
@@ -489,22 +497,23 @@ json generateFollowerTrajectories(const json &input_json, const InputData &input
 
     return plane_array;
 }
-std::vector<ENUPoint> Minisnap_3D (std::vector<ENUPoint> Enu_waypoint_, double distance_, double v_avg_override) //distance_ : 采样距离
+// Minisnap_EN: 仅在平面上(东/北)进行轨迹优化，忽略高度(将高度固定为起点高度)
+std::vector<ENUPoint> Minisnap_EN (std::vector<ENUPoint> Enu_waypoint_, double distance_, double v_avg_override)
 {
     std::vector<ENUPoint> result{};
     int dot_num = Enu_waypoint_.size();  //路径点个数
     if (dot_num < 2) return result;
 
+    // 构造仅包含 XY 的路线（Z 设为 0），让最小 snap 规划器只优化平面轨迹
     Eigen::MatrixXd route(dot_num, 3);
     for (int i = 0; i < dot_num; i++) {
         route(i, 0) = Enu_waypoint_[i].east;   // x -> east
-        route(i, 1) = Enu_waypoint_[i].north;  // y -> north  
-        route(i, 2) = Enu_waypoint_[i].up;     // z -> up
+        route(i, 1) = Enu_waypoint_[i].north;  // y -> north
+        route(i, 2) = 0.0;                     // z -> 0 (忽略高度)
     }
 
-    // 使用刚刚实现的 minimum snap 生成函数
-    TrajectoryGeneratorTool generator;
-    // 尝试若干相对路径以提高在不同运行目录下的健壮性
+    // use global generator
+    // 与 Minisnap_3D 相同的配置查找策略
     std::vector<std::string> try_paths = {
         "math_util/minimum_snap_config.ymal",
         "../math_util/minimum_snap_config.ymal",
@@ -522,20 +531,80 @@ std::vector<ENUPoint> Minisnap_3D (std::vector<ENUPoint> Enu_waypoint_, double d
         }
     }
     if (!found) {
-        // 最后退回到 the original relative path and let the generator report the error
         yaml_cfg = "math_util/minimum_snap_config.ymal";
         std::cerr << "Warning: cannot find config in usual locations; will try '" << yaml_cfg << "' and fall back to defaults if unreadable." << std::endl;
     } else {
         std::cerr << "Using YAML config: " << yaml_cfg << std::endl;
     }
 
-    // 如果输入 JSON 中提供了 distance_（distance_points），则优先使用该值作为采样距离
     if (distance_ > 0) {
         std::cerr << "Using input JSON distance_points as sampling distance: " << distance_ << " m" << std::endl;
     }
     if (v_avg_override > 0) {
-        std::cerr << "Using input JSON leader_speed as average speed: " << v_avg_override << " m/s" << std::endl;
+        std::cerr << "Using leader_speed as average speed: " << v_avg_override << " m/s" << std::endl;
     }
+
+    Eigen::MatrixXd sampled = generator.GenerateTrajectoryMatrix(route, yaml_cfg, distance_, v_avg_override);
+
+    // 将采样的平面点转换回 ENUPoint，并把高度固定为起点高度（高度可保持不变或任意）
+    double up_value = Enu_waypoint_[0].up; // 固定高度为起点高度
+    for (int i = 0; i < sampled.rows(); ++i) {
+        ENUPoint enu_point;
+        enu_point.east = sampled(i, 0);
+        enu_point.north = sampled(i, 1);
+        enu_point.up = up_value;
+        result.push_back(enu_point);
+    }
+
+    std::cout << "Generated 2D trajectory point number:" << result.size() << std::endl;
+    return result;
+}
+
+// Minisnap_3D: 三维轨迹优化（保留高度），如果未找到专门配置同样使用默认 YAML 路径
+std::vector<ENUPoint> Minisnap_3D(std::vector<ENUPoint> Enu_waypoint_, double distance_, double v_avg_override)
+{
+    std::vector<ENUPoint> result{};
+    int dot_num = Enu_waypoint_.size();  //路径点个数
+    if (dot_num < 2) return result;
+
+    Eigen::MatrixXd route(dot_num, 3);
+    for (int i = 0; i < dot_num; i++) {
+        route(i, 0) = Enu_waypoint_[i].east;   // x -> east
+        route(i, 1) = Enu_waypoint_[i].north;  // y -> north  
+        route(i, 2) = Enu_waypoint_[i].up;     // z -> up
+    }
+
+    // use global generator
+    std::vector<std::string> try_paths = {
+        "math_util/minimum_snap_config.ymal",
+        "../math_util/minimum_snap_config.ymal",
+        "../../math_util/minimum_snap_config.ymal"
+    };
+
+    std::string yaml_cfg;
+    bool found = false;
+    for (const auto &p : try_paths) {
+        std::ifstream ifs(p);
+        if (ifs.good()) {
+            yaml_cfg = p;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        yaml_cfg = "math_util/minimum_snap_config.ymal";
+        std::cerr << "Warning: cannot find config in usual locations; will try '" << yaml_cfg << "' and fall back to defaults if unreadable." << std::endl;
+    } else {
+        std::cerr << "Using YAML config: " << yaml_cfg << std::endl;
+    }
+
+    if (distance_ > 0) {
+        std::cerr << "Using input JSON distance_points as sampling distance: " << distance_ << " m" << std::endl;
+    }
+    if (v_avg_override > 0) {
+        std::cerr << "Using leader_speed as average speed: " << v_avg_override << " m/s" << std::endl;
+    }
+
     Eigen::MatrixXd sampled = generator.GenerateTrajectoryMatrix(route, yaml_cfg, distance_, v_avg_override);
 
     // 将采样点转换为 ENUPoint 向量返回
@@ -547,7 +616,7 @@ std::vector<ENUPoint> Minisnap_3D (std::vector<ENUPoint> Enu_waypoint_, double d
         result.push_back(enu_point);
     }
 
-    std::cout << "Generated trajectory point number:" << result.size() << std::endl;
+    std::cout << "Generated 3D trajectory point number:" << result.size() << std::endl;
     return result;
 }
 

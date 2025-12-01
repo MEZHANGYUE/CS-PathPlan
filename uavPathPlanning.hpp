@@ -17,7 +17,7 @@ using namespace math_util;
 struct InputData
 {
     double distance_points;
-    double leader_speed = 5.0; // m/s, average speed override read from input JSON (formerly V_avg)
+    double leader_speed = 100.0; // m/s, average speed override read from input JSON (formerly V_avg)
     double leader_fly_high;
     int formation_model;
     int formation_using;
@@ -91,8 +91,10 @@ extern std::vector<ENUPoint>  Trajectory_ENU;
 
 // Minisnap_3D: origin_waypoints, sampling distance (m), optional average speed override (m/s)
 std::vector<ENUPoint>  Minisnap_3D(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0);
+std::vector<ENUPoint>  Minisnap_EN(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0);
 
-bool getPlan(json &input_json, json &output_json);
+// getPlan: 如果 use3D 为 true 则使用三维规划(Minisnap_3D)，否则使用二维平面规划(Minisnap_EN)
+bool getPlan(json &input_json, json &output_json, bool use3D = true);
 
 bool loadData(InputData &input_data, json &input_json);
 bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj);
