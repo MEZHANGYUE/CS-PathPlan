@@ -94,6 +94,10 @@ bool getPlan(json &input_json, json &output_json);
 
 bool loadData(InputData &input_data, json &input_json);
 bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj);
+// 生成跟随者（followers）的编队轨迹，返回用于写入 output_json 的 plane_array
+json generateFollowerTrajectories(const json &input_json, const InputData &input_data,
+                                  const std::vector<ENUPoint> &Trajectory_ENU,
+                                  const std::vector<WGS84Point> &Trajectory_WGS84);
 Eigen::VectorXd minimumSnapTimeAllocation(const Eigen::MatrixXd& route, double V_avg, double min_turn_radius = 200);
 Eigen::VectorXd minimumSnapTimeAllocation(const Eigen::MatrixXd& route);
 // 主转换函数：WGS84经纬度转东北天坐标

@@ -4,6 +4,7 @@ import numpy as np
 import sys
 import os
 import glob
+import re
 from matplotlib import font_manager
 
 def setup_chinese_font():
@@ -72,33 +73,93 @@ def extract_coordinates(data, path_key):
     
     return coordinates
 
-def plot_path_and_trajectory(waypoints, trajectory_points, title="Path and Trajectory Visualization"):
-    """绘制路径点和轨迹点"""
+
+def extract_all_plane_trajectories(data, prefix_regex=r'^uav_plane'):
+    """解析 JSON 中所有以 uav_plane 开头的键，返回列表 [(id, [(lon,lat), ...]), ...]
+
+    处理的数据格式示例：
+    "uav_plane1": [
+        [33, [lon, lat, alt], [lon, lat, alt], ...],
+        [34, [lon, lat, alt], ...]
+    ]
+    """
+    plane_trajs = []
+    if not isinstance(data, dict):
+        return plane_trajs
+
+    for key, val in data.items():
+        if re.match(prefix_regex, key):
+            if isinstance(val, list):
+                for entry in val:
+                    # entry 应为列表，第一项是 id，后面是点
+                    if isinstance(entry, list) and len(entry) >= 2:
+                        try:
+                            pid = entry[0]
+                            pts = []
+                            for p in entry[1:]:
+                                if isinstance(p, (list, tuple)) and len(p) >= 2:
+                                    # 支持 [lon, lat] 或 [lon, lat, alt]
+                                    pts.append((p[0], p[1]))
+                                elif isinstance(p, dict):
+                                    if 'lat' in p and 'lng' in p:
+                                        pts.append((p['lng'], p['lat']))
+                                    elif 'latitude' in p and 'longitude' in p:
+                                        pts.append((p['longitude'], p['latitude']))
+                            if pts:
+                                plane_trajs.append((pid, pts))
+                        except Exception:
+                            # 忽略单条格式错误的 entry
+                            continue
+
+    return plane_trajs
+
+def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization"):
+    """绘制路径点、leader 轨迹（可选）以及多条 plane 轨迹（plane_trajs 为 [(id, [(lon,lat),...]), ...]）。
+
+    - waypoints: 列表 [(lon,lat), ...]
+    - leader_traj: 列表 [(lon,lat), ...]
+    - plane_trajs: 列表 [(id, [(lon,lat), ...]), ...]
+    """
     plt.figure(figsize=(12, 8))
-    
-    # 提取坐标
+
+    # 绘制路径点
     if waypoints:
         wp_x, wp_y = zip(*waypoints)
-        plt.scatter(wp_x, wp_y, c='red', s=100, marker='o', label='Waypoints', zorder=5)
+        plt.scatter(wp_x, wp_y, c='red', s=80, marker='o', label='Waypoints', zorder=5)
         plt.plot(wp_x, wp_y, 'r--', alpha=0.7, linewidth=2, label='Planned Path')
-        
-        # 在路径点上添加编号
         for i, (x, y) in enumerate(waypoints):
-            plt.annotate(f'{i}', (x, y), xytext=(5, 5), textcoords='offset points', 
-                        fontsize=8, color='red')
-    
-    if trajectory_points:
-        traj_x, traj_y = zip(*trajectory_points)
-        plt.scatter(traj_x, traj_y, c='blue', s=30, marker='.', alpha=0.6, label='Trajectory Points')
-        plt.plot(traj_x, traj_y, 'b-', alpha=0.8, linewidth=1.5, label='Actual Trajectory')
-    
+            plt.annotate(f'{i}', (x, y), xytext=(5, 5), textcoords='offset points', fontsize=8, color='red')
+
+    # 绘制 leader 轨迹（优先用蓝色）
+    if leader_traj:
+        try:
+            traj_x, traj_y = zip(*leader_traj)
+            plt.scatter(traj_x, traj_y, c='blue', s=30, marker='.', alpha=0.6, label='Leader Trajectory')
+            plt.plot(traj_x, traj_y, 'b-', alpha=0.8, linewidth=1.5)
+        except Exception:
+            pass
+
+    # 绘制 plane_trajs（多条），使用 colormap 区分
+    if plane_trajs:
+        cmap = plt.get_cmap('tab10')
+        for idx, (pid, pts) in enumerate(plane_trajs):
+            if not pts:
+                continue
+            color = cmap(idx % 10)
+            xs, ys = zip(*pts)
+            plt.plot(xs, ys, '-', color=color, linewidth=1.5, alpha=0.9, label=f'Plane {pid}')
+            plt.scatter(xs, ys, c=[color], s=20, marker='.', alpha=0.9)
+            # 在首点处标注 id
+            try:
+                plt.annotate(f'id:{pid}', (xs[0], ys[0]), xytext=(4, 4), textcoords='offset points', fontsize=8, color=color)
+            except Exception:
+                pass
+
     plt.xlabel('Longitude / X Coordinate')
     plt.ylabel('Latitude / Y Coordinate')
     plt.title(title)
     plt.legend()
     plt.grid(True, alpha=0.3)
-    
-    # 设置等比例显示
     plt.axis('equal')
     plt.tight_layout()
     plt.show()
@@ -193,32 +254,35 @@ def main(file_path):
     input_data = read_json_file(input_file)
     if input_data is None:
         return
-    
+
     # 读取输出文件（轨迹点）
     print("Reading output file...")
     output_data = read_json_file(output_file)
     if output_data is None:
         return
-    
-    # 提取路径点
+
+    # 提取路径点（leader 中的中间航点）
     waypoints = extract_coordinates(input_data, "leader_midway_point_wgs84")
     print(f"Found {len(waypoints)} waypoints")
-    
-    # 提取轨迹点
-    trajectory_points = extract_coordinates(output_data, "uav_leader_plane1")
-    print(f"Found {len(trajectory_points)} trajectory points")
-    
-    if not waypoints and not trajectory_points:
+
+    # 提取 leader 轨迹（如果存在）
+    leader_traj = extract_coordinates(output_data, "uav_leader_plane1")
+    print(f"Found {len(leader_traj)} leader trajectory points")
+
+    # 提取所有 uav_plane* 的轨迹（支持多条，每条带 id）
+    plane_trajs = extract_all_plane_trajectories(output_data)
+    print(f"Found {len(plane_trajs)} plane trajectories (uav_plane*)")
+
+    if not waypoints and not leader_traj and not plane_trajs:
         print("No valid waypoint or trajectory data found")
         return
-    
+
     # 从文件名中提取 UAV 编号用于标题
     uav_id = os.path.basename(file_path).split('_')[0]
-    
+
     # 可视化
     print("Generating visualization...")
-    plot_path_and_trajectory(waypoints, trajectory_points, 
-                           f"{uav_id} Path Planning and Execution Trajectory")
+    plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory")
 
 def analyze_data_structure(filename):
     """分析JSON文件数据结构（用于调试）"""

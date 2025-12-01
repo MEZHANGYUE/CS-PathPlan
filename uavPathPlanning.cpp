@@ -350,11 +350,22 @@ bool getPlan(json &input_json, json &output_json)
     std::cout << "trajectory point number:" << Trajectory_ENU.size() << std::endl;
     //东北天坐标转换为经纬高
     std::vector<WGS84Point> Trajectory_WGS84 = enuToWGS84_Batch(Trajectory_ENU,origin);
-    //将经纬高路径写入outputjson
-    putWGS84ToJson(output_json,"uav_leader_plane1",Trajectory_WGS84) ;
+    // 将经纬高路径写入 output_json —— leader 保持在原始键名 "uav_leader_plane1"
+    putWGS84ToJson(output_json, "uav_leader_plane1", Trajectory_WGS84);
+    // uav_plane1 用于保存编队（followers）列表，每个子数组以 follower id 开头后跟点列表
+    json plane_array = json::array();
+
+    // 生成并写入跟随者轨迹（提取到子函数以保持 getPlan 清晰）
+    try {
+        json plane_array = generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
+        output_json["uav_plane1"] = plane_array;
+    } catch (const std::exception &e) {
+        std::cerr << "调用 generateFollowerTrajectories 出错: " << e.what() << std::endl;
+    }
 
     return true;
 }
+
 
 bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj) {
     try {
@@ -377,6 +388,92 @@ bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Poin
         std::cerr << "Error saving WGS84 to JSON: " << e.what() << std::endl;
         return false;
     }
+}
+
+json generateFollowerTrajectories(const json &input_json, const InputData &input_data,
+                                  const std::vector<ENUPoint> &Trajectory_ENU,
+                                  const std::vector<WGS84Point> &Trajectory_WGS84) {
+    json plane_array = json::array();
+
+    if (!(input_json.contains("uavs_id") && input_json.contains("uav_start_point_wgs84"))) {
+        return plane_array; // empty
+    }
+
+    auto uavs_ids = input_json["uavs_id"];
+    auto uav_starts = input_json["uav_start_point_wgs84"];
+
+    // 计算 leader 起始 ENU（使用相同的 origin）
+    WGS84Point leader_start_wgs{input_data.uav_leader_start_point_wgs84.lon,
+                                input_data.uav_leader_start_point_wgs84.lat,
+                                input_data.uav_leader_start_point_wgs84.alt};
+    ENUPoint leader_start_enu = wgs84ToENU(leader_start_wgs, origin);
+
+    // 计算 leader 初始航向（使用采样轨迹的前两点）
+    double leader_initial_heading = 0.0;
+    if (Trajectory_ENU.size() >= 2) {
+        double dx = Trajectory_ENU[1].east - Trajectory_ENU[0].east;
+        double dy = Trajectory_ENU[1].north - Trajectory_ENU[0].north;
+        leader_initial_heading = atan2(dy, dx);
+    }
+    double cos0 = cos(leader_initial_heading);
+    double sin0 = sin(leader_initial_heading);
+    Eigen::Matrix2d R0;
+    R0 << cos0, -sin0,
+          sin0,  cos0;
+
+    size_t N = Trajectory_ENU.size();
+    std::vector<Eigen::Vector2d> leader_xy; leader_xy.reserve(N);
+    for (const auto &p : Trajectory_ENU) leader_xy.emplace_back(p.east, p.north);
+
+    for (size_t idx = 0; idx < uavs_ids.size(); ++idx) {
+        int uid = uavs_ids[idx].get<int>();
+        if (idx >= uav_starts.size()) break;
+        auto s = uav_starts[idx];
+        WGS84Point follower_start_wgs{s[0].get<double>(), s[1].get<double>(), s.size()>=3 ? s[2].get<double>() : 0.0};
+        ENUPoint follower_start_enu = wgs84ToENU(follower_start_wgs, origin);
+
+        Eigen::Vector2d rel_global(follower_start_enu.east - leader_start_enu.east,
+                                   follower_start_enu.north - leader_start_enu.north);
+        double rel_up = follower_start_enu.up - leader_start_enu.up;
+        Eigen::Vector2d rel_body = R0.transpose() * rel_global;
+
+        // 构造 follower 的 entry
+        json follower_entry = json::array();
+        follower_entry.push_back(uid);
+
+        for (size_t t = 0; t < N; ++t) {
+            double heading = 0.0;
+            if (t + 1 < N) {
+                Eigen::Vector2d diff = leader_xy[t+1] - leader_xy[t];
+                heading = atan2(diff.y(), diff.x());
+            } else if (t > 0) {
+                Eigen::Vector2d diff = leader_xy[t] - leader_xy[t-1];
+                heading = atan2(diff.y(), diff.x());
+            } else {
+                heading = leader_initial_heading;
+            }
+            double c = cos(heading);
+            double s_ = sin(heading);
+            Eigen::Matrix2d Rt; Rt << c, -s_, s_, c;
+            Eigen::Vector2d offset_global = Rt * rel_body;
+
+            ENUPoint fp;
+            fp.east = leader_xy[t].x() + offset_global.x();
+            fp.north = leader_xy[t].y() + offset_global.y();
+            fp.up = Trajectory_ENU[t].up + rel_up;
+
+            WGS84Point wp = enuToWGS84(fp, origin);
+            json pa = json::array();
+            pa.push_back(wp.lon);
+            pa.push_back(wp.lat);
+            pa.push_back(wp.alt);
+            follower_entry.push_back(pa);
+        }
+
+        plane_array.push_back(follower_entry);
+    }
+
+    return plane_array;
 }
 std::vector<ENUPoint> Minisnap_3D (std::vector<ENUPoint> Enu_waypoint_,double distance_)
 {
