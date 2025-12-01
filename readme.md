@@ -1,4 +1,4 @@
-测试: /UAV/pathPlanningAlgorithm/build
+测试: /UAV/pathPlanningAlgorithm/build 目录下
 cmake .  
 make
 ./uavPathPlanningTest 

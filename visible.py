@@ -113,7 +113,7 @@ def extract_all_plane_trajectories(data, prefix_regex=r'^uav_plane'):
 
     return plane_trajs
 
-def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization"):
+def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True):
     """绘制路径点、leader 轨迹（可选）以及多条 plane 轨迹（plane_trajs 为 [(id, [(lon,lat),...]), ...]）。
 
     - waypoints: 列表 [(lon,lat), ...]
@@ -162,7 +162,23 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
     plt.grid(True, alpha=0.3)
     plt.axis('equal')
     plt.tight_layout()
-    plt.show()
+    # 如果指定了保存路径，先保存图像
+    if save_path:
+        try:
+            plt.savefig(save_path, dpi=200)
+            print(f"Saved plot to: {save_path}")
+        except Exception as e:
+            print(f"Warning: failed to save plot to {save_path}: {e}")
+
+    if show_plot:
+        try:
+            plt.show()
+        except Exception:
+            # 在无 GUI 环境中，plt.show() 可能失败，已保存图像则可忽略
+            print("Note: unable to show plot (no display). If save_path provided, image was saved.")
+            plt.close()
+    else:
+        plt.close()
 
 def find_matching_files(file_pattern):
     """智能查找匹配的文件"""
@@ -282,7 +298,14 @@ def main(file_path):
 
     # 可视化
     print("Generating visualization...")
-    plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory")
+    # 默认把图像保存到与输出 JSON 同名的 PNG 文件
+    try:
+        save_path = os.path.splitext(output_file)[0] + '.png'
+    except Exception:
+        save_path = None
+    if save_path:
+        print(f"Will save plot to: {save_path}")
+    plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path)
 
 def analyze_data_structure(filename):
     """分析JSON文件数据结构（用于调试）"""

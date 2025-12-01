@@ -346,16 +346,30 @@ bool getPlan(json &input_json, json &output_json)
     }
     Enu_waypoint = getENUFromJSON(input_json,"leader_midway_point_wgs84"); //
     distance  = getDistanceFromJSON(input_json,"distance_points");
-    std::vector<ENUPoint> Trajectory_ENU = Minisnap_3D (Enu_waypoint,distance); //三维规划
+    // 支持从输入 JSON 中指定平均速度（key: "leader_speed"），兼容旧键 "V_avg" / "v_avg"
+    double leader_speed = -1.0;
+    try {
+        if (input_json.contains("leader_speed") && !input_json["leader_speed"].empty()) {
+            leader_speed = input_json["leader_speed"].get<double>();
+        } else if (input_json.contains("V_avg") && !input_json["V_avg"].empty()) {
+            leader_speed = input_json["V_avg"].get<double>();
+        } else if (input_json.contains("v_avg") && !input_json["v_avg"].empty()) {
+            leader_speed = input_json["v_avg"].get<double>();
+        }
+    } catch(...) { leader_speed = -1.0; }
+    // 将 leader_speed 写回 input_data 以便其他函数使用
+    if (leader_speed > 0) input_data.leader_speed = leader_speed;
+
+    std::vector<ENUPoint> Trajectory_ENU = Minisnap_3D(Enu_waypoint, distance, input_data.leader_speed); //三维规划
     std::cout << "trajectory point number:" << Trajectory_ENU.size() << std::endl;
     //东北天坐标转换为经纬高
     std::vector<WGS84Point> Trajectory_WGS84 = enuToWGS84_Batch(Trajectory_ENU,origin);
-    // 将经纬高路径写入 output_json —— leader 保持在原始键名 "uav_leader_plane1"
+    // 将经纬高路径写入 output_json —— leader
     putWGS84ToJson(output_json, "uav_leader_plane1", Trajectory_WGS84);
     // uav_plane1 用于保存编队（followers）列表，每个子数组以 follower id 开头后跟点列表
     json plane_array = json::array();
 
-    // 生成并写入跟随者轨迹（提取到子函数以保持 getPlan 清晰）
+    // 生成并写入跟随者轨迹
     try {
         json plane_array = generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
         output_json["uav_plane1"] = plane_array;
@@ -475,7 +489,7 @@ json generateFollowerTrajectories(const json &input_json, const InputData &input
 
     return plane_array;
 }
-std::vector<ENUPoint> Minisnap_3D (std::vector<ENUPoint> Enu_waypoint_,double distance_)
+std::vector<ENUPoint> Minisnap_3D (std::vector<ENUPoint> Enu_waypoint_, double distance_, double v_avg_override) //distance_ : 采样距离
 {
     std::vector<ENUPoint> result{};
     int dot_num = Enu_waypoint_.size();  //路径点个数
@@ -519,7 +533,10 @@ std::vector<ENUPoint> Minisnap_3D (std::vector<ENUPoint> Enu_waypoint_,double di
     if (distance_ > 0) {
         std::cerr << "Using input JSON distance_points as sampling distance: " << distance_ << " m" << std::endl;
     }
-    Eigen::MatrixXd sampled = generator.GenerateTrajectoryMatrix(route, yaml_cfg, distance_);
+    if (v_avg_override > 0) {
+        std::cerr << "Using input JSON leader_speed as average speed: " << v_avg_override << " m/s" << std::endl;
+    }
+    Eigen::MatrixXd sampled = generator.GenerateTrajectoryMatrix(route, yaml_cfg, distance_, v_avg_override);
 
     // 将采样点转换为 ENUPoint 向量返回
     for (int i = 0; i < sampled.rows(); ++i) {
@@ -664,6 +681,22 @@ bool loadData(InputData &input_data, json &input_json)
     else
     {
         std::cout << "distance_points is empty." << std::endl;
+    }
+    // 允许从输入 JSON 指定平均速度 V_avg（m/s）
+    if (input_json.contains("leader_speed") && !input_json["leader_speed"].empty()) {
+        try {
+            input_data.leader_speed = input_json["leader_speed"].get<double>();
+        } catch(...) {
+            // ignore parse errors, keep default
+        }
+    } else if (input_json.contains("V_avg") && !input_json["V_avg"].empty()) {
+        try {
+            input_data.leader_speed = input_json["V_avg"].get<double>();
+        } catch(...) {}
+    } else if (input_json.contains("v_avg") && !input_json["v_avg"].empty()) {
+        try {
+            input_data.leader_speed = input_json["v_avg"].get<double>();
+        } catch(...) {}
     }
     if (input_json["leader_fly_high"].size() != 0)
     {

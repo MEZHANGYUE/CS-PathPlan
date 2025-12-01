@@ -17,6 +17,7 @@ using namespace math_util;
 struct InputData
 {
     double distance_points;
+    double leader_speed = 5.0; // m/s, average speed override read from input JSON (formerly V_avg)
     double leader_fly_high;
     int formation_model;
     int formation_using;
@@ -88,7 +89,8 @@ inline double rad2deg(double rad) {
 }
 extern std::vector<ENUPoint>  Trajectory_ENU;
 
-std::vector<ENUPoint>  Minisnap_3D(std::vector<ENUPoint> origin_waypoints,double distance_);
+// Minisnap_3D: origin_waypoints, sampling distance (m), optional average speed override (m/s)
+std::vector<ENUPoint>  Minisnap_3D(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0);
 
 bool getPlan(json &input_json, json &output_json);
 

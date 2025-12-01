@@ -18,7 +18,7 @@ int TrajectoryGeneratorTool::Factorial(int x) {
     return fac;
 }
 
-Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path, double sample_distance_override) {
+Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path, double sample_distance_override, double v_avg_override) {
     // 配置默认值
     int order = 3; // 默认最小化 snap 对应 d_order=3 (可在yaml中覆盖)
     double V_avg = 5.0; // m/s
@@ -65,9 +65,13 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
     if (sample_distance_override > 0.0) {
         sample_distance = sample_distance_override;
     }
+    // 如果调用者传入了覆盖平均速度参数，优先使用它
+    if (v_avg_override > 0.0) {
+        V_avg = v_avg_override;
+    }
 
     // 打印实际使用的采样距离，便于调试
-    std::cerr << "TrajectoryGeneratorTool: sampling distance used = " << sample_distance << " m" << std::endl;
+    // std::cerr << "TrajectoryGeneratorTool: sampling distance used = " << sample_distance << " m" << std::endl;
 
     // 输入路径检查
     if (Path.rows() < 2 || Path.cols() < 3) {
@@ -109,8 +113,10 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
         // 为每段至少进行若干采样点
         if (dt > T/10.0) dt = T/10.0;
 
-        bool first_point = true;
         for (double t = 0.0; t <= T; t += dt) {
+            // 跳过每段的起点，除非这是第一段（seg==0），以避免段边界点重复
+            if (seg > 0 && t <= 1e-9) continue;
+
             Eigen::Vector3d pt(0,0,0);
             for (int dim = 0; dim < 3; ++dim) {
                 Eigen::VectorXd coeff = polyCoeff.row(seg).segment(dim * p_num1d, p_num1d);
@@ -124,9 +130,8 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
                 pt(dim) = val;
             }
 
-            if (first_point) {
+            if (samples.empty()) {
                 samples.push_back(pt);
-                first_point = false;
             } else {
                 // 控制按距离采样：仅在与上一个样点距离>=sample_distance时添加
                 if ((pt - samples.back()).norm() >= sample_distance) {
@@ -134,20 +139,23 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
                 }
             }
         }
-        // 确保段终点被加入
-        // evaluate at T
-        Eigen::Vector3d endpt(0,0,0);
-        for (int dim = 0; dim < 3; ++dim) {
-            Eigen::VectorXd coeff = polyCoeff.row(seg).segment(dim * p_num1d, p_num1d);
-            double val = 0.0;
-            for (int k = 0; k < p_num1d; ++k) {
-                double c = coeff(k);
-                int exp = p_num1d - 1 - k;
-                val += c * std::pow(T, exp);
+
+        // 仅在最后一段时确保终点被加入，避免把每段终点都加入导致重复
+        if (seg == num_segments - 1) {
+            // evaluate at T
+            Eigen::Vector3d endpt(0,0,0);
+            for (int dim = 0; dim < 3; ++dim) {
+                Eigen::VectorXd coeff = polyCoeff.row(seg).segment(dim * p_num1d, p_num1d);
+                double val = 0.0;
+                for (int k = 0; k < p_num1d; ++k) {
+                    double c = coeff(k);
+                    int exp = p_num1d - 1 - k;
+                    val += c * std::pow(T, exp);
+                }
+                endpt(dim) = val;
             }
-            endpt(dim) = val;
+            if (samples.empty() || (samples.back() - endpt).norm() > 1e-6) samples.push_back(endpt);
         }
-        if (samples.empty() || (samples.back() - endpt).norm() > 1e-6) samples.push_back(endpt);
     }
 
     // 转换为矩阵输出

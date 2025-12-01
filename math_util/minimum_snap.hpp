@@ -25,7 +25,9 @@ public:
     // Path: (M x 3) 路径点矩阵
     // yaml_path: 配置文件路径，包含 order, V_avg, min_time_s, sample_distance, start/end vel/acc
     // 如果 sample_distance_override > 0 则覆盖 YAML 中的 sample_distance 值（单位：米）
-    Eigen::MatrixXd GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path, double sample_distance_override = -1.0);
+    // sample_distance_override: if >0 overrides YAML sample_distance
+    // v_avg_override: if >0 overrides YAML V_avg (average speed in m/s)
+    Eigen::MatrixXd GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path, double sample_distance_override = -1.0, double v_avg_override = -1.0);
 };
 
 // --- Planner public API merged here for convenience ---
