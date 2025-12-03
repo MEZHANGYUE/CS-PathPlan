@@ -106,7 +106,7 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
     // double dt_default = (V_avg > 1e-6) ? std::max(0.01, sample_distance / V_avg) : 0.01;
     double dt_default = 0.1;
     std::vector<Eigen::Vector3d> samples;
-    samples.reserve(1000);
+    samples.reserve(1000); //预分配内存,减少动态扩展次数
 
     auto eval_poly_at = [&](int seg, double t)->Eigen::Vector3d {
         Eigen::Vector3d pt(0,0,0);
@@ -130,7 +130,10 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
     for (int seg = 0; seg < num_segments; ++seg) {
         double T = Time(seg);
         double dt = dt_default;
-        if (dt > T/10.0) dt = T/10.0;
+        if (dt > T/10.0) dt = T/10.0;    //每段至少取10个点
+
+        // 记录本段开始前已有的采样点数，用于统计本段新增的采样点
+        size_t samples_before = samples.size();
 
         // 在段起始点处进行一次评估以获得连续性（但不在非首段重复写入）
         Eigen::Vector3d t0_pt = eval_poly_at(seg, 0.0);
@@ -144,38 +147,19 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
         for (double t = dt; t <= T + 1e-12; t += dt) {
             double tt = std::min(t, T);
             Eigen::Vector3d cur_pt = eval_poly_at(seg, tt);
-
-            // 从 prev_pt 到 cur_pt 这一小段上可能包含一个或多个采样点
-            double remain_needed = sample_distance - (prev_pt - last_recorded).norm();
-            if (remain_needed <= 0) {
-                // 理论上不应发生，但处理为重置
-                remain_needed = sample_distance;
-            }
-
             Eigen::Vector3d seg_vec = cur_pt - prev_pt;
             double seg_len = seg_vec.norm();
-
-            // 当这一小段长度大于需要的剩余距离时，插值并可能多次插入
-            while (seg_len + 1e-12 >= remain_needed) {
-                double alpha = (remain_needed) / seg_len; // 在 prev_pt -> cur_pt 上的位置
-                Eigen::Vector3d sample_pt = prev_pt + alpha * seg_vec;
-                samples.push_back(sample_pt);
-                last_recorded = sample_pt;
-
-                // 更新 prev_pt 到 sample_pt，并重新计算剩余段长
-                prev_pt = sample_pt;
-                seg_vec = cur_pt - prev_pt;
-                seg_len = seg_vec.norm();
-                // 接下来在同一小段上寻找下一个采样点，所需距离为 sample_distance
-                remain_needed = sample_distance;
-                // 防止无限循环：如果 seg_len 非常小则跳出
-                if (seg_len < 1e-9) break;
-            }
+            if(seg_len>=sample_distance)
 
             // 将 prev_pt 移动到 cur_pt 以供下一步使用
-            prev_pt = cur_pt;
+            {
+                prev_pt = cur_pt;
+                samples.push_back(cur_pt);
+            }
         }
-
+    // 输出本段统计信息：段索引与本段新增采样点数量
+    size_t samples_added = samples.size() - samples_before;
+    std::cout << "segment: " << seg << " samples_added: " << samples_added << std::endl;
         // 在最后一段时，确保终点被加入（避免重复）
         if (seg == num_segments - 1) {
             Eigen::Vector3d endpt = eval_poly_at(seg, T);
@@ -219,7 +203,7 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
 
     const int p_order = 2 * order - 1;//多项式的最高次数 p^(p_order)t^(p_order) + ...
     const int p_num1d = p_order + 1;//每一段轨迹的变量个数，对于五阶多项式为：p5, p4, ... p0
-
+    std::cout << "input points number : " << Path.rows() << std::endl;
     const int number_segments = Time.size();
     //每一段都有x,y,z三个方向，每一段多项式的系数的个数有3*p_num1d
     MatrixXd PolyCoeff = MatrixXd::Zero(number_segments, 3 * p_num1d);
@@ -401,155 +385,3 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
     return PolyCoeff;
 }
 
-// -------------------- planner.cpp implementations merged below --------------------
-
-// 获取配置文件参数 - 保持原有行为（示例硬编码），可改为从文件读取
-void planner::getparam(void)
-{
-    // 这里需要根据你的实际配置源重写
-    // 示例硬编码数据，实际应用中应该从文件读取
-    dot_num = 4; // 示例：4个路径点
-    
-    route.resize(dot_num, 3);
-    // 示例路径点数据
-    route << 0.0, 0.0, 0.0,
-             1.0, 0.0, 0.0,
-             1.0, 1.0, 0.0,
-             0.0, 1.0, 0.0;
-    
-    time.resize(3); // 示例：3个时间段
-    time << 2.0, 2.0, 2.0; // 每个段2秒
-}
-
-// 从文件中获取参数,见getparam();
-Eigen::MatrixXd planner::getcoeff(void)
-{
-    Eigen::MatrixXd polycoeff;
-    Eigen::MatrixXd vel = Eigen::MatrixXd::Zero(2, 3);
-    Eigen::MatrixXd acc = Eigen::MatrixXd::Zero(2, 3);
-    TrajectoryGeneratorTool TrajectoryGeneratorTool;
-    getparam();
-    polycoeff = TrajectoryGeneratorTool.SolveQPClosedForm(mode, route, vel, acc, time);
-    return polycoeff; 
-}
-
-// 传入路径和时间分配参数
-Eigen::MatrixXd planner::getcoeff(Eigen::MatrixXd route_,Eigen::VectorXd time_)
-{
-    Eigen::MatrixXd polycoeff;
-    Eigen::MatrixXd vel = Eigen::MatrixXd::Zero(2, 3);
-    Eigen::MatrixXd acc = Eigen::MatrixXd::Zero(2, 3);
-    TrajectoryGeneratorTool TrajectoryGeneratorTool;
-    //路径和时间采用传入的参数
-    polycoeff = TrajectoryGeneratorTool.SolveQPClosedForm(mode, route_, vel, acc, time_);
-    return polycoeff; 
-}
-
-// 求解第k个轨迹段t时刻对应的位置
-Eigen::Vector3d planner::getPosPoly(Eigen::MatrixXd polyCoeff, int k, double t) 
-{
-    Eigen::Vector3d pt;
-    poly_coeff_num = 2 * mode;
-
-    for (int dim = 0; dim < 3; dim++) 
-    {
-        Eigen::VectorXd coeff;
-        coeff.resize(poly_coeff_num);
-        
-        coeff = (polyCoeff.row(k)).segment(dim * poly_coeff_num, poly_coeff_num);
-        Eigen::VectorXd times = Eigen::VectorXd::Zero(poly_coeff_num);
-        
-        for (int j = 0; j < poly_coeff_num; j++)
-            if (j == 0)
-                times(j) = 1.0;
-            else
-                times(j) = pow(t, j);
-        
-        double temp_pose = 0.0;
-        for (int i = 0; i < times.rows(); ++i) 
-        {
-            temp_pose = temp_pose + coeff(i) * times(times.rows() - i - 1);
-        }
-        pt(dim) = temp_pose;
-    }
-
-    return pt;
-}
-
-// 生成轨迹路径
-Path planner::trajectory_path(void)  //参数文件读取时间分配 (手动)
-{
-    Path trajectory;
-    Eigen::Vector3d pos;
-
-    for (int i = 0; i < time.size(); i++) 
-    {
-        for (double t = 0.0; t < time(i); t += 0.01) 
-        {
-            pos = getPosPoly(poly_coeff, i, t);
-            trajectory.push_back(Pose(pos(0), pos(1), pos(2)));
-        }
-    }
-    
-    return trajectory;
-}
-Path planner::trajectory_path(Eigen::MatrixXd route_,Eigen::VectorXd time_)  //输入时间分配,1s一个点
-{
-    Path trajectory;
-    Eigen::Vector3d pos;
-    poly_coeff = getcoeff(route_,time_);
-    for (int i = 0; i < time_.size(); i++) 
-    {
-        for (double t = 0.0; t < time_(i); t += 1) 
-        {
-            pos = getPosPoly(poly_coeff, i, t);
-            trajectory.push_back(Pose(pos(0), pos(1), pos(2)));
-        }
-    }
-    // std::cout << "trajectory point number:" << trajectory.size() << std::endl;
-    return trajectory;
-}
-Path planner::trajectory_path(Eigen::MatrixXd route_, Eigen::VectorXd time_, double dis)  //输入时间分配,dis距离取一个点
-{
-    Path trajectory;
-    Eigen::Vector3d pos, prev_pos;
-    bool first_point = true;
-    poly_coeff = getcoeff(route_, time_);
-    
-    for (int i = 0; i < time_.size(); i++) 
-    {
-        double accumulated_distance = 0.0;
-        prev_pos = getPosPoly(poly_coeff, i, 0.0); // 获取段起始点
-        
-        for (double t = 0.0; t <= time_(i); t += 0.1) // 使用较小时间步长进行精细采样
-        {
-            pos = getPosPoly(poly_coeff, i, t);
-            
-            if (first_point) {
-                trajectory.push_back(Pose(pos(0), pos(1), pos(2)));
-                prev_pos = pos;
-                first_point = false;
-                continue;
-            }
-            
-            // 计算当前点与前一个点的距离
-            double segment_distance = (pos - prev_pos).norm();
-            accumulated_distance += segment_distance;
-            
-            // 如果累积距离达到或超过目标距离，添加路径点
-            if (accumulated_distance >= dis) {
-                trajectory.push_back(Pose(pos(0), pos(1), pos(2)));
-                accumulated_distance = 0.0; // 重置累积距离
-            }
-            
-            prev_pos = pos;
-        }
-        
-        // 确保添加段的终点
-        pos = getPosPoly(poly_coeff, i, time_(i));
-        trajectory.push_back(Pose(pos(0), pos(1), pos(2)));
-    }
-    
-    // std::cout << "trajectory point number:" << trajectory.size() << std::endl;
-    return trajectory;
-}

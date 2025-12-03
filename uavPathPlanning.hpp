@@ -102,8 +102,7 @@ bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Poin
 json generateFollowerTrajectories(const json &input_json, const InputData &input_data,
                                   const std::vector<ENUPoint> &Trajectory_ENU,
                                   const std::vector<WGS84Point> &Trajectory_WGS84);
-Eigen::VectorXd minimumSnapTimeAllocation(const Eigen::MatrixXd& route, double V_avg, double min_turn_radius = 200);
-Eigen::VectorXd minimumSnapTimeAllocation(const Eigen::MatrixXd& route);
+
 // 主转换函数：WGS84经纬度转东北天坐标
 ENUPoint wgs84ToENU(const WGS84Point& target, const WGS84Point& reference);
 // 东北天坐标转WGS84经纬度
