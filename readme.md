@@ -3,7 +3,7 @@ cmake .
 make
 ./uavPathPlanningTest 
 可视化:/UAV/pathPlanningAlgorithm
-python3 visible.py ./data/uav34_0_planning 2d/3d (不设置2d/3d默认为3d)
+python3 visible.py ./data/uav34_0_planning
 
 经纬高和东北天坐标之间的转换
 输出测试结果:
