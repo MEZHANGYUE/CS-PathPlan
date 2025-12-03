@@ -54,33 +54,22 @@ def read_json_file(filename):
 def extract_coordinates(data, path_key):
     """从数据中提取坐标点"""
     coordinates = []
+    
     if isinstance(data, dict) and path_key in data:
         points = data[path_key]
         if isinstance(points, list):
             for point in points:
-                # 列表或元组形式: [lon, lat] 或 [lon, lat, alt]
                 if isinstance(point, (list, tuple)) and len(point) >= 2:
-                    if len(point) >= 3:
-                        coordinates.append((point[0], point[1], point[2]))
-                    else:
-                        coordinates.append((point[0], point[1]))
-                # 字典形式，支持多种键名
+                    # 假设坐标格式为 [经度, 纬度] 或 [x, y]
+                    coordinates.append((point[0], point[1]))
                 elif isinstance(point, dict):
+                    # 如果坐标是对象形式，如 {"lat": xx, "lng": xx}
                     if 'lat' in point and 'lng' in point:
-                        if 'alt' in point or 'altitude' in point:
-                            coordinates.append((point.get('lng'), point.get('lat'), point.get('alt') or point.get('altitude')))
-                        else:
-                            coordinates.append((point.get('lng'), point.get('lat')))
+                        coordinates.append((point['lng'], point['lat']))
                     elif 'latitude' in point and 'longitude' in point:
-                        if 'altitude' in point:
-                            coordinates.append((point.get('longitude'), point.get('latitude'), point.get('altitude')))
-                        else:
-                            coordinates.append((point.get('longitude'), point.get('latitude')))
+                        coordinates.append((point['longitude'], point['latitude']))
                     elif 'x' in point and 'y' in point:
-                        if 'z' in point:
-                            coordinates.append((point.get('x'), point.get('y'), point.get('z')))
-                        else:
-                            coordinates.append((point.get('x'), point.get('y')))
+                        coordinates.append((point['x'], point['y']))
     
     return coordinates
 
@@ -110,21 +99,12 @@ def extract_all_plane_trajectories(data, prefix_regex=r'^uav_plane'):
                             for p in entry[1:]:
                                 if isinstance(p, (list, tuple)) and len(p) >= 2:
                                     # 支持 [lon, lat] 或 [lon, lat, alt]
-                                    if len(p) >= 3:
-                                        pts.append((p[0], p[1], p[2]))
-                                    else:
-                                        pts.append((p[0], p[1]))
+                                    pts.append((p[0], p[1]))
                                 elif isinstance(p, dict):
                                     if 'lat' in p and 'lng' in p:
-                                        if 'alt' in p or 'altitude' in p:
-                                            pts.append((p.get('lng'), p.get('lat'), p.get('alt') or p.get('altitude')))
-                                        else:
-                                            pts.append((p['lng'], p['lat']))
+                                        pts.append((p['lng'], p['lat']))
                                     elif 'latitude' in p and 'longitude' in p:
-                                        if 'altitude' in p:
-                                            pts.append((p.get('longitude'), p.get('latitude'), p.get('altitude')))
-                                        else:
-                                            pts.append((p['longitude'], p['latitude']))
+                                        pts.append((p['longitude'], p['latitude']))
                             if pts:
                                 plane_trajs.append((pid, pts))
                         except Exception:
@@ -133,74 +113,29 @@ def extract_all_plane_trajectories(data, prefix_regex=r'^uav_plane'):
 
     return plane_trajs
 
-def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True, plot_3d=None):
+def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True):
     """绘制路径点、leader 轨迹（可选）以及多条 plane 轨迹（plane_trajs 为 [(id, [(lon,lat),...]), ...]）。
 
     - waypoints: 列表 [(lon,lat), ...]
     - leader_traj: 列表 [(lon,lat), ...]
     - plane_trajs: 列表 [(id, [(lon,lat), ...]), ...]
     """
-    # 自动检测是否需要 3D 绘图：如果任何坐标包含第三维度，则切换为 3D
-    need_3d = False
-    def has_z(points):
-        if not points:
-            return False
-        for p in points:
-            if isinstance(p, (list, tuple)) and len(p) >= 3:
-                return True
-        return False
-
-    # plot_3d 参数优先：None = 自动检测；True/False = 强制
-    if plot_3d is None:
-        if has_z(waypoints) or has_z(leader_traj) or (plane_trajs and any(has_z(pts) for (_id, pts) in plane_trajs)):
-            need_3d = True
-    else:
-        need_3d = bool(plot_3d)
-
-    fig = plt.figure(figsize=(12, 8))
-    if need_3d:
-        ax = fig.add_subplot(111, projection='3d')
-    else:
-        ax = fig.add_subplot(111)
+    plt.figure(figsize=(12, 8))
 
     # 绘制路径点
     if waypoints:
-        # 支持 (x,y) 或 (x,y,z)
-        if need_3d:
-            wp_x = [p[0] for p in waypoints]
-            wp_y = [p[1] for p in waypoints]
-            wp_z = [p[2] if len(p) >= 3 else 0 for p in waypoints]
-            ax.scatter(wp_x, wp_y, wp_z, c='red', s=80, marker='o', label='Waypoints', zorder=5)
-            ax.plot(wp_x, wp_y, wp_z, 'r--', alpha=0.7, linewidth=2, label='Planned Path')
-            for i, (x, y, *rest) in enumerate(waypoints):
-                z = rest[0] if rest else 0
-                try:
-                    ax.text(x, y, z, f'{i}', fontsize=8, color='red')
-                except Exception:
-                    pass
-        else:
-            wp_x, wp_y = zip(*[(p[0], p[1]) for p in waypoints])
-            ax.scatter(wp_x, wp_y, c='red', s=80, marker='o', label='Waypoints', zorder=5)
-            ax.plot(wp_x, wp_y, 'r--', alpha=0.7, linewidth=2, label='Planned Path')
-            for i, (x, y, z) in enumerate(waypoints):  #高度不用,但需要读取
-                try:
-                    ax.annotate(f'{i}', (x, y), xytext=(5, 5), textcoords='offset points', fontsize=8, color='red')
-                except Exception:
-                    pass
+        wp_x, wp_y = zip(*waypoints)
+        plt.scatter(wp_x, wp_y, c='red', s=80, marker='o', label='Waypoints', zorder=5)
+        plt.plot(wp_x, wp_y, 'r--', alpha=0.7, linewidth=2, label='Planned Path')
+        for i, (x, y) in enumerate(waypoints):
+            plt.annotate(f'{i}', (x, y), xytext=(5, 5), textcoords='offset points', fontsize=8, color='red')
 
     # 绘制 leader 轨迹（优先用蓝色）
     if leader_traj:
         try:
-            if need_3d:
-                traj_x = [p[0] for p in leader_traj]
-                traj_y = [p[1] for p in leader_traj]
-                traj_z = [p[2] if len(p) >= 3 else 0 for p in leader_traj]
-                ax.scatter(traj_x, traj_y, traj_z, c='blue', s=30, marker='.', alpha=0.6, label='Leader Trajectory')
-                ax.plot(traj_x, traj_y, traj_z, 'b-', alpha=0.8, linewidth=1.5)
-            else:
-                traj_x, traj_y = zip(*[(p[0], p[1]) for p in leader_traj])
-                ax.scatter(traj_x, traj_y, c='blue', s=30, marker='.', alpha=0.6, label='Leader Trajectory')
-                ax.plot(traj_x, traj_y, 'b-', alpha=0.8, linewidth=1.5)
+            traj_x, traj_y = zip(*leader_traj)
+            plt.scatter(traj_x, traj_y, c='blue', s=30, marker='.', alpha=0.6, label='Leader Trajectory')
+            plt.plot(traj_x, traj_y, 'b-', alpha=0.8, linewidth=1.5)
         except Exception:
             pass
 
@@ -211,47 +146,21 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
             if not pts:
                 continue
             color = cmap(idx % 10)
-            if need_3d:
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                zs = [p[2] if len(p) >= 3 else 0 for p in pts]
-                ax.plot(xs, ys, zs, '-', color=color, linewidth=1.5, alpha=0.9, label=f'Plane {pid}')
-                ax.scatter(xs, ys, zs, c=[color], s=20, marker='.', alpha=0.9)
-                try:
-                    ax.text(xs[0], ys[0], zs[0], f'id:{pid}', fontsize=8, color=color)
-                except Exception:
-                    pass
-            else:
-                xs, ys = zip(*[(p[0], p[1]) for p in pts])
-                ax.plot(xs, ys, '-', color=color, linewidth=1.5, alpha=0.9, label=f'Plane {pid}')
-                ax.scatter(xs, ys, c=[color], s=20, marker='.', alpha=0.9)
-                # 在首点处标注 id
-                try:
-                    ax.annotate(f'id:{pid}', (xs[0], ys[0]), xytext=(4, 4), textcoords='offset points', fontsize=8, color=color)
-                except Exception:
-                    pass
+            xs, ys = zip(*pts)
+            plt.plot(xs, ys, '-', color=color, linewidth=1.5, alpha=0.9, label=f'Plane {pid}')
+            plt.scatter(xs, ys, c=[color], s=20, marker='.', alpha=0.9)
+            # 在首点处标注 id
+            try:
+                plt.annotate(f'id:{pid}', (xs[0], ys[0]), xytext=(4, 4), textcoords='offset points', fontsize=8, color=color)
+            except Exception:
+                pass
 
-    ax.set_xlabel('Longitude / X Coordinate')
-    ax.set_ylabel('Latitude / Y Coordinate')
-    if need_3d:
-        try:
-            ax.set_zlabel('Altitude / Z')
-        except Exception:
-            pass
+    plt.xlabel('Longitude / X Coordinate')
+    plt.ylabel('Latitude / Y Coordinate')
     plt.title(title)
     plt.legend()
-    try:
-        ax.grid(True, alpha=0.3)
-    except Exception:
-        pass
-
-    # 3D 不支持 axis('equal') 的通用实现，这里仅在 2D 时使用
-    if not need_3d:
-        try:
-            ax.set_aspect('equal', 'box')
-        except Exception:
-            pass
-
+    plt.grid(True, alpha=0.3)
+    plt.axis('equal')
     plt.tight_layout()
     # 如果指定了保存路径，先保存图像
     if save_path:
@@ -437,56 +346,16 @@ def print_usage():
     print("  - Case-insensitive matching supported")
 
 if __name__ == "__main__":
-    # 支持可选的第二个参数来强制 3D/2D：
-    #   python3 visible.py <file>            -> 自动检测 2D/3D
-    #   python3 visible.py <file> 3d|--3d    -> 强制 3D
-    #   python3 visible.py <file> 2d|--2d    -> 强制 2D
-    if len(sys.argv) < 2 or len(sys.argv) > 3:
+    # 检查命令行参数
+    if len(sys.argv) != 2:
         print("Error: Please provide file path as argument")
         print_usage()
         sys.exit(1)
-
+    
     file_path = sys.argv[1]
-    force_3d = None
-    if len(sys.argv) == 3:
-        flag = sys.argv[2].lower()
-        if flag in ('3d', '--3d'):
-            force_3d = True
-        elif flag in ('2d', '--2d'):
-            force_3d = False
-        else:
-            print(f"Warning: unknown flag '{sys.argv[2]}', ignoring and using auto-detect")
-            force_3d = None
-
-    # 如果不强制指定，则直接使用 main 的自动检测流程
-    if force_3d is None:
-        # 如果需要分析数据结构，取消下面的注释
-        # analyze_data_structure(f"{file_path}_input.json")
-        # analyze_data_structure(f"{file_path}_output.json")
-        main(file_path)
-    else:
-        # 强制 3D/2D：读取同 main 的文件并传入 plot_3d 标志
-        setup_chinese_font()
-        input_file, output_file = auto_detect_files(file_path)
-        if not input_file:
-            print("Error: Input file not found")
-            print_usage()
-            sys.exit(1)
-        if not output_file:
-            print("Error: Output file not found")
-            sys.exit(1)
-
-        input_data = read_json_file(input_file)
-        output_data = read_json_file(output_file)
-        waypoints = extract_coordinates(input_data, "leader_midway_point_wgs84")
-        leader_traj = extract_coordinates(output_data, "uav_leader_plane1")
-        plane_trajs = extract_all_plane_trajectories(output_data)
-
-        uav_id = os.path.basename(file_path).split('_')[0]
-        try:
-            save_path = os.path.splitext(output_file)[0] + '.png'
-        except Exception:
-            save_path = None
-
-        print(f"Generating {'3D' if force_3d else '2D'} visualization (forced)...")
-        plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path, plot_3d=force_3d)
+    
+    # 如果需要分析数据结构，取消下面的注释
+    # analyze_data_structure(f"{file_path}_input.json")
+    # analyze_data_structure(f"{file_path}_output.json")
+    
+    main(file_path)
