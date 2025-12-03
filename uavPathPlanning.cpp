@@ -354,10 +354,6 @@ bool getPlan(json &input_json, json &output_json, bool use3D)
     try {
         if (input_json.contains("leader_speed") && !input_json["leader_speed"].empty()) {
             leader_speed = input_json["leader_speed"].get<double>();
-        } else if (input_json.contains("V_avg") && !input_json["V_avg"].empty()) {
-            leader_speed = input_json["V_avg"].get<double>();
-        } else if (input_json.contains("v_avg") && !input_json["v_avg"].empty()) {
-            leader_speed = input_json["v_avg"].get<double>();
         }
     } catch(...) { leader_speed = -1.0; }
     // 将 leader_speed 写回 input_data 以便其他函数使用
@@ -654,14 +650,6 @@ bool loadData(InputData &input_data, json &input_json)
         } catch(...) {
             // ignore parse errors, keep default
         }
-    } else if (input_json.contains("V_avg") && !input_json["V_avg"].empty()) {
-        try {
-            input_data.leader_speed = input_json["V_avg"].get<double>();
-        } catch(...) {}
-    } else if (input_json.contains("v_avg") && !input_json["v_avg"].empty()) {
-        try {
-            input_data.leader_speed = input_json["v_avg"].get<double>();
-        } catch(...) {}
     }
     if (input_json["leader_fly_high"].size() != 0)
     {
