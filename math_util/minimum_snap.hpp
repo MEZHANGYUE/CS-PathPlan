@@ -9,7 +9,8 @@
 class TrajectoryGeneratorTool {
 private:
     int Factorial(int x);
-
+    // 读取是否启用路径偏差惩罚（使每段收敛到直线）的权重
+    double path_weight = 0.0;
 public:
     TrajectoryGeneratorTool() = default;
     ~TrajectoryGeneratorTool() = default;
@@ -19,7 +20,9 @@ public:
             const Eigen::MatrixXd &Path,
             const Eigen::MatrixXd &Vel,
             const Eigen::MatrixXd &Acc,
-            const Eigen::VectorXd &Time);
+        const Eigen::VectorXd &Time,
+        double path_weight = 0.0,
+        double vel_zero_weight = 0.0);
 
     // 生成完整轨迹并返回采样点矩阵 (N x 3)。
     // Path: (M x 3) 路径点矩阵

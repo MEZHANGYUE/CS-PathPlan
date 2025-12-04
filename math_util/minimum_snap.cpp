@@ -2,6 +2,8 @@
 #include "minimum_snap.hpp"
 #include <iostream>
 #include <yaml-cpp/yaml.h>
+#include <cmath>
+#include <vector>
 
 using namespace std;
 using namespace Eigen;
@@ -30,9 +32,12 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
     Eigen::MatrixXd Acc = Eigen::MatrixXd::Zero(2, 3);
 
     // 读取 YAML 配置（若文件存在且字段可用则覆盖默认值）
+    double vel_zero_weight = 0.0;
     try {
         YAML::Node cfg = YAML::LoadFile(yaml_path);
         if (cfg["order"]) order = cfg["order"].as<int>();
+        if (cfg["path_weight"]) path_weight = cfg["path_weight"].as<double>();
+        if (cfg["vel_zero_weight"]) vel_zero_weight = cfg["vel_zero_weight"].as<double>();
         if (cfg["V_avg"]) V_avg = cfg["V_avg"].as<double>();
         if (cfg["min_time_s"]) min_time_s = cfg["min_time_s"].as<double>();
         if (cfg["sample_distance"]) sample_distance = cfg["sample_distance"].as<double>();
@@ -94,8 +99,9 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
         Time(i) = t;
     }
 
+
     // 调用闭式解求解多项式系数
-    Eigen::MatrixXd polyCoeff = SolveQPClosedForm(order, Path, Vel, Acc, Time);
+    Eigen::MatrixXd polyCoeff = SolveQPClosedForm(order, Path, Vel, Acc, Time, path_weight, vel_zero_weight);
 
     // 多项式次数与每段系数个数
     const int p_order = 2 * order - 1;
@@ -133,7 +139,7 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
         if (dt > T/10.0) dt = T/10.0;    //每段至少取10个点
 
         // 记录本段开始前已有的采样点数，用于统计本段新增的采样点
-        size_t samples_before = samples.size();
+        // size_t samples_before = samples.size();
 
         // 在段起始点处进行一次评估以获得连续性（但不在非首段重复写入）
         Eigen::Vector3d t0_pt = eval_poly_at(seg, 0.0);
@@ -158,8 +164,8 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
             }
         }
     // 输出本段统计信息：段索引与本段新增采样点数量
-    size_t samples_added = samples.size() - samples_before;
-    std::cout << "segment: " << seg << " samples_added: " << samples_added << std::endl;
+    // size_t samples_added = samples.size() - samples_before;
+    // std::cout << "segment: " << seg << " samples_added: " << samples_added << std::endl;
         // 在最后一段时，确保终点被加入（避免重复）
         if (seg == num_segments - 1) {
             Eigen::Vector3d endpt = eval_poly_at(seg, T);
@@ -199,7 +205,9 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
         const Eigen::MatrixXd &Path,
         const Eigen::MatrixXd &Vel,
         const Eigen::MatrixXd &Acc,
-        const Eigen::VectorXd &Time) {
+    const Eigen::VectorXd &Time,
+    double path_weight,
+    double vel_zero_weight) {
 
     const int p_order = 2 * order - 1;//多项式的最高次数 p^(p_order)t^(p_order) + ...
     const int p_num1d = p_order + 1;//每一段轨迹的变量个数，对于五阶多项式为：p5, p4, ... p0
@@ -295,8 +303,205 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
         const int row = k * p_num1d;
         Q.block(row, row, p_num1d, p_num1d) = sub_Q;
     }
+    // 如果启用了路径偏差惩罚（使段向直线收敛），构造额外的二次项 A 和线性项 f
+    VectorXd f_coeff_x = VectorXd::Zero(number_coefficients);
+    VectorXd f_coeff_y = VectorXd::Zero(number_coefficients);
+    VectorXd f_coeff_z = VectorXd::Zero(number_coefficients);
+
+    // 先保存原始 Q（未加 A）以便打印
+    MatrixXd Q_original = Q;
+
+    // 全局 A 矩阵（累加到 Q），即 ∫ φ_i φ_j dt
+    MatrixXd A = MatrixXd::Zero(number_coefficients, number_coefficients);
+    // 保存每段的最远点 t* 和最远距离（平方），便于在求解后评估“加约束后”的距离
+    std::vector<double> seg_best_t(number_segments, 0.0);
+    std::vector<double> seg_best_dist2_before(number_segments, 0.0);
+    // If path_weight > 0, we will approximate "max deviation" penalty by
+    // an iterative 1-step reweighting: first solve with Q_original, find per-segment
+    // worst-sample t*, then add quadratic penalty that targets that sample (Phi(t*)^T Phi(t*)).
+    if (path_weight > 0.0) {
+        // --- 1) initial solve using Q_original (no A) to get coefficients Px0,Py0,Pz0 ---
+        MatrixXd Q_tmp = Q_original;
+        MatrixXd R_tmp = C_T.transpose() * M.transpose().inverse() * Q_tmp * M.inverse() * C_T;
+
+        VectorXd Px0 = VectorXd::Zero(number_coefficients);
+        VectorXd Py0 = VectorXd::Zero(number_coefficients);
+        VectorXd Pz0 = VectorXd::Zero(number_coefficients);
+
+        // solve per axis similarly to later code but with zero linear term
+        for (int axis = 0; axis < 3; ++axis) {
+            VectorXd d_selected = VectorXd::Zero(number_valid_variables);
+            for (int i = 0; i < number_coefficients; ++i) {
+                if (i == 0) {
+                    d_selected(i) = Path(0, axis);
+                    continue;
+                }
+                if (i == 1 && order >= 2) {
+                    d_selected(i) = Vel(0, axis);
+                    continue;
+                }
+                if (i == 2 && order >= 3) {
+                    d_selected(i) = Acc(0, axis);
+                    continue;
+                }
+                if (i == number_coefficients - order + 2 && order >= 3) {
+                    d_selected(number_fixed_variables - order + 2) = Acc(1, axis);
+                    continue;
+                }
+                if (i == number_coefficients - order + 1 && order >= 2) {
+                    d_selected(number_fixed_variables - order + 1) = Vel(1, axis);
+                    continue;
+                }
+                if (i == number_coefficients - order) {
+                    d_selected(number_fixed_variables - order) = Path(number_segments, axis);
+                    continue;
+                }
+                if ((i % order == 0) && (i / order % 2 == 0)) {
+                    const int index = i / (2 * order) + order - 1;
+                    d_selected(index) = Path(i / (2 * order), axis);
+                    continue;
+                }
+            }
+
+            MatrixXd R_PP_tmp = R_tmp.block(number_fixed_variables, number_fixed_variables,
+                                            number_valid_variables - number_fixed_variables,
+                                            number_valid_variables - number_fixed_variables);
+            VectorXd d_F_tmp = d_selected.head(number_fixed_variables);
+            MatrixXd R_FP_tmp = R_tmp.block(0, number_fixed_variables, number_fixed_variables,
+                                            number_valid_variables - number_fixed_variables);
+
+            VectorXd d_opt_tmp = -R_PP_tmp.inverse() * R_FP_tmp.transpose() * d_F_tmp;
+            d_selected.tail(number_valid_variables - number_fixed_variables) = d_opt_tmp;
+            VectorXd d_tmp = C_T * d_selected;
+
+            if (axis == 0) Px0 = M.inverse() * d_tmp;
+            if (axis == 1) Py0 = M.inverse() * d_tmp;
+            if (axis == 2) Pz0 = M.inverse() * d_tmp;
+        }
+
+    // --- 2) per-segment sampling to find worst t* and build A (sample-based) and f_coeff ---
+        const int nsamples = 16; // per-segment sampling resolution for max search
+        for (int k = 0; k < number_segments; ++k) {
+            double T = Time(k);
+            double best_t = 0.0;
+            double best_dist2 = -1.0;
+
+            // evaluate samples
+            for (int s = 0; s <= nsamples; ++s) {
+                double tt = T * double(s) / double(nsamples);
+                // evaluate polynomial at tt for each axis using Px0/Py0/Pz0
+                Eigen::VectorXd phi(p_num1d);
+                for (int i = 0; i < p_num1d; ++i) {
+                    int exp = p_order - i;
+                    phi(i) = std::pow(tt, exp);
+                }
+
+                int row = k * p_num1d;
+                double x = phi.dot(Px0.segment(row, p_num1d));
+                double y = phi.dot(Py0.segment(row, p_num1d));
+                double z = phi.dot(Pz0.segment(row, p_num1d));
+
+                // straight line L(tt)
+                Eigen::Vector3d P0(Path(k,0), Path(k,1), Path(k,2));
+                Eigen::Vector3d P1(Path(k+1,0), Path(k+1,1), Path(k+1,2));
+                Eigen::Vector3d L = P0 + (tt / T) * (P1 - P0);
+                Eigen::Vector3d P(x,y,z);
+                double dist2 = (P - L).squaredNorm();
+                if (dist2 > best_dist2) {
+                    best_dist2 = dist2;
+                    best_t = tt;
+                }
+            }
+
+            // 输出该段的最远距离（以米为单位），便于调试
+            // std::cout << "segment " << k << " max deviation (m): " << std::sqrt(best_dist2) << std::endl;
+
+            // construct Phi at best_t and add sample-based penalty
+            Eigen::VectorXd phi_best(p_num1d);
+            for (int i = 0; i < p_num1d; ++i) phi_best(i) = std::pow(best_t, p_order - i);
+
+            int row = k * p_num1d;
+            MatrixXd sub_A = phi_best * phi_best.transpose(); // p_num1d x p_num1d
+            A.block(row, row, p_num1d, p_num1d) = sub_A;
+
+            // linear term b = Phi^T * L(best_t)
+            Eigen::Vector3d P0(Path(k,0), Path(k,1), Path(k,2));
+            Eigen::Vector3d P1(Path(k+1,0), Path(k+1,1), Path(k+1,2));
+            Eigen::Vector3d Lbest = P0 + (best_t / T) * (P1 - P0);
+            for (int i = 0; i < p_num1d; ++i) {
+                int idx = row + i;
+                double bi_x = phi_best(i) * Lbest(0);
+                double bi_y = phi_best(i) * Lbest(1);
+                double bi_z = phi_best(i) * Lbest(2);
+                f_coeff_x(idx) = -2.0 * bi_x * path_weight;
+                f_coeff_y(idx) = -2.0 * bi_y * path_weight;
+                f_coeff_z(idx) = -2.0 * bi_z * path_weight;
+            }
+
+            // 保存该段的最远 t* 与最远距离平方
+            seg_best_t[k] = best_t;
+            seg_best_dist2_before[k] = best_dist2;
+        }
+
+        // add weighted sample-based A to Q
+        Q += path_weight * A;
+    }
+
+    // 打印 path_weight, 原始 Q 矩阵（Q_original）与添加的 A 矩阵
+    std::cout << "path_weight: " << path_weight << std::endl;
+    // std::cout << "Q_original: \n" << Q_original << std::endl;
+    // std::cout << "A (added block, may be zero if path_weight==0): \n" << A << std::endl;
+
+    // 速度软惩罚（将路径点处速度压向0）：如果设定了 vel_zero_weight，则构造速度惩罚矩阵 V 并加入 Q
+    MatrixXd V = MatrixXd::Zero(number_coefficients, number_coefficients);
+    if (vel_zero_weight > 0.0) {
+        auto eval_phi_dot = [&](double t)->Eigen::VectorXd {
+            Eigen::VectorXd phi_d(p_num1d);
+            for (int i = 0; i < p_num1d; ++i) {
+                int power = p_order - i - 1;
+                if (power < 0) {
+                    phi_d(i) = 0.0;
+                } else if (power == 0) {
+                    phi_d(i) = double(p_order - i);
+                } else {
+                    phi_d(i) = double(p_order - i) * std::pow(t, power);
+                }
+            }
+            return phi_d;
+        };
+
+        for (int k = 0; k < number_segments; ++k) {
+            double T = Time(k);
+            int row = k * p_num1d;
+
+            // start (t=0)
+            Eigen::VectorXd phi_d_start = eval_phi_dot(0.0);
+            MatrixXd sub_Vs = phi_d_start * phi_d_start.transpose();
+            V.block(row, row, p_num1d, p_num1d) += sub_Vs;
+
+            // end (t=T)
+            Eigen::VectorXd phi_d_end = eval_phi_dot(T);
+            MatrixXd sub_Ve = phi_d_end * phi_d_end.transpose();
+            V.block(row, row, p_num1d, p_num1d) += sub_Ve;
+        }
+
+        Q += vel_zero_weight * V;
+        std::cout << "vel_zero_weight: " << vel_zero_weight << std::endl;
+        std::cout << "V (velocity-penalty) Frobenius norm: " << V.norm() << std::endl;
+    }
 
     MatrixXd R = C_T.transpose() * M.transpose().inverse() * Q * M.inverse() * C_T;
+
+    // 如果存在线性项 f（来自路径偏差），将其变换到 d_selected 空间：
+    VectorXd f_valid_x = VectorXd::Zero(number_valid_variables);
+    VectorXd f_valid_y = VectorXd::Zero(number_valid_variables);
+    VectorXd f_valid_z = VectorXd::Zero(number_valid_variables);
+    if (path_weight > 0.0) {
+        // f_coeff_* 已在上面构造（长度 number_coefficients），通过变换得到 f_valid
+        f_valid_x = C_T.transpose() * M.transpose().inverse() * f_coeff_x;
+        f_valid_y = C_T.transpose() * M.transpose().inverse() * f_coeff_y;
+        f_valid_z = C_T.transpose() * M.transpose().inverse() * f_coeff_z;
+    }
 
     for (int axis = 0; axis < 3; ++axis) {
         VectorXd d_selected = VectorXd::Zero(number_valid_variables);
@@ -338,14 +543,22 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
             }
         }
 
-        MatrixXd R_PP = R.block(number_fixed_variables, number_fixed_variables,
-                                number_valid_variables - number_fixed_variables,
-                                number_valid_variables - number_fixed_variables);
-        VectorXd d_F = d_selected.head(number_fixed_variables);
-        MatrixXd R_FP = R.block(0, number_fixed_variables, number_fixed_variables,
-                                number_valid_variables - number_fixed_variables);
+    MatrixXd R_PP = R.block(number_fixed_variables, number_fixed_variables,
+                number_valid_variables - number_fixed_variables,
+                number_valid_variables - number_fixed_variables);
+    VectorXd d_F = d_selected.head(number_fixed_variables);
+    MatrixXd R_FP = R.block(0, number_fixed_variables, number_fixed_variables,
+                number_valid_variables - number_fixed_variables);
 
-        MatrixXd d_optimal = -R_PP.inverse() * R_FP.transpose() * d_F;
+    // 考虑线性项 f_valid (在 d_selected 空间)。如果没有启用 path_weight，则 f_valid_* 为 0
+    VectorXd f_valid;
+    if (axis == 0) f_valid = f_valid_x;
+    else if (axis == 1) f_valid = f_valid_y;
+    else f_valid = f_valid_z;
+
+    VectorXd f_P = f_valid.tail(number_valid_variables - number_fixed_variables);
+
+    MatrixXd d_optimal = -R_PP.inverse() * (R_FP.transpose() * d_F + f_P);
 
         d_selected.tail(number_valid_variables - number_fixed_variables) = d_optimal;
         VectorXd d = C_T * d_selected;
@@ -358,6 +571,30 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
 
         if (axis == 2)
             Pz = M.inverse() * d;
+    }
+
+    // 在得到最终的 Px,Py,Pz 后，评估并打印每段在之前记录的 t* 处的最终偏差
+    for (int k = 0; k < number_segments; ++k) {
+        double best_t = 0.0;
+        if (k < (int)seg_best_t.size()) best_t = seg_best_t[k];
+        Eigen::VectorXd phi_best(p_num1d);
+        for (int i = 0; i < p_num1d; ++i) phi_best(i) = std::pow(best_t, p_order - i);
+
+        int row = k * p_num1d;
+        double x_final = phi_best.dot(Px.segment(row, p_num1d));
+        double y_final = phi_best.dot(Py.segment(row, p_num1d));
+        double z_final = phi_best.dot(Pz.segment(row, p_num1d));
+
+        Eigen::Vector3d P0(Path(k,0), Path(k,1), Path(k,2));
+        Eigen::Vector3d P1(Path(k+1,0), Path(k+1,1), Path(k+1,2));
+        double T = Time(k);
+        Eigen::Vector3d Lbest = P0 + (best_t / T) * (P1 - P0);
+        double dist_after = std::sqrt((Eigen::Vector3d(x_final,y_final,z_final) - Lbest).squaredNorm());
+        double dist_before = 0.0;
+        if (k < (int)seg_best_dist2_before.size()) dist_before = std::sqrt(seg_best_dist2_before[k]);
+
+        std::cout << "segment " << k << " max deviation before(m): " << dist_before
+                  << ", after(m): " << dist_after << std::endl;
     }
 
     for (int i = 0; i < number_segments; ++i) {
@@ -381,7 +618,7 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
             }
         }
     }
-
+    
     return PolyCoeff;
 }
 

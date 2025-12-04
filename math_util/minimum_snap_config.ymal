@@ -3,12 +3,15 @@
 
 # 多项式导数阶数（d_order），例如 d_order=3 表示最小化 jerk ; d_order=4 表示最小化 snap
 order: 2
-
+#每一个路径点的0速度约束,(经过路径点减速)
+vel_zero_weight: 0.01
+#偏离直线段惩罚权重
+path_weight: 0.00000001
 # 平均巡航速度 (m/s)
 V_avg: 200.0
 
 # 单段最小时长 (s)
-min_time_s: 2.0
+min_time_s: 1.0
 
 # 轨迹点采样间隔距离 (m)
 sample_distance: 300.0
