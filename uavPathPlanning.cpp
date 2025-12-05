@@ -1,9 +1,9 @@
 #include "uavPathPlanning.hpp"
 #include "math_util/minimum_snap.hpp"
+#include "math_util/altitude_optimizer.hpp"
 #include <yaml-cpp/yaml.h>
 
-// Single global trajectory generator to reuse heavy-initialized resources across functions
-static TrajectoryGeneratorTool generator;
+// (moved into UavPathPlanner::generator_)
 
 // 配置命名空间：将时间分配相关默认值和 YAML 加载器内联到此文件中，避免使用单独的 _config.h
 namespace TimeAllocConfig {
@@ -62,9 +62,8 @@ namespace TimeAllocConfig {
         }
     }
 }
-WGS84Point origin; 
 // 经纬度转ECEF坐标
-ECEFPoint wgs84ToECEF(const WGS84Point& lla) {
+ECEFPoint UavPathPlanner::wgs84ToECEF(const WGS84Point& lla) {
     double lat_rad = deg2rad(lla.lat);
     double lon_rad = deg2rad(lla.lon);
     
@@ -82,8 +81,17 @@ ECEFPoint wgs84ToECEF(const WGS84Point& lla) {
     return ecef;
 }
 
+// UavPathPlanner 构造/析构
+UavPathPlanner::UavPathPlanner() {
+    origin_.lon = 0.0;
+    origin_.lat = 0.0;
+    origin_.alt = 0.0;
+}
+
+UavPathPlanner::~UavPathPlanner() = default;
+
 // ECEF转经纬度（迭代法）
-WGS84Point ecefToWGS84(const ECEFPoint& ecef) {
+WGS84Point UavPathPlanner::ecefToWGS84(const ECEFPoint& ecef) {
     // 初始估计
     double p = sqrt(ecef.x * ecef.x + ecef.y * ecef.y);
     double theta = atan2(ecef.z * WGS84_A, p * WGS84_A * (1 - WGS84_E2));
@@ -128,7 +136,7 @@ WGS84Point ecefToWGS84(const ECEFPoint& ecef) {
 }
 
 // 计算东北天坐标系的旋转矩阵
-std::array<std::array<double, 3>, 3> computeENURotationMatrix(double lat_rad, double lon_rad) {
+std::array<std::array<double, 3>, 3> UavPathPlanner::computeENURotationMatrix(double lat_rad, double lon_rad) {
     std::array<std::array<double, 3>, 3> R;
     
     double cos_lat = cos(lat_rad);
@@ -155,7 +163,7 @@ std::array<std::array<double, 3>, 3> computeENURotationMatrix(double lat_rad, do
 }
 
 // 计算东北天坐标系的逆旋转矩阵（转置）
-std::array<std::array<double, 3>, 3> computeENURotationMatrixInverse(double lat_rad, double lon_rad) {
+std::array<std::array<double, 3>, 3> UavPathPlanner::computeENURotationMatrixInverse(double lat_rad, double lon_rad) {
     std::array<std::array<double, 3>, 3> R;
     
     double cos_lat = cos(lat_rad);
@@ -180,8 +188,8 @@ std::array<std::array<double, 3>, 3> computeENURotationMatrixInverse(double lat_
 }
 
 // ECEF坐标差转东北天坐标
-ENUPoint ecefToENU(const ECEFPoint& delta_ecef, double ref_lat_rad, double ref_lon_rad) {
-    auto R = computeENURotationMatrix(ref_lat_rad, ref_lon_rad);
+ENUPoint UavPathPlanner::ecefToENU(const ECEFPoint& delta_ecef, double ref_lat_rad, double ref_lon_rad) {
+    auto R = UavPathPlanner::computeENURotationMatrix(ref_lat_rad, ref_lon_rad);
     
     ENUPoint enu;
     enu.east = R[0][0] * delta_ecef.x + R[0][1] * delta_ecef.y + R[0][2] * delta_ecef.z;
@@ -192,8 +200,8 @@ ENUPoint ecefToENU(const ECEFPoint& delta_ecef, double ref_lat_rad, double ref_l
 }
 
 // 东北天坐标转ECEF坐标差
-ECEFPoint enuToECEF(const ENUPoint& enu, double ref_lat_rad, double ref_lon_rad) {
-    auto R_inv = computeENURotationMatrixInverse(ref_lat_rad, ref_lon_rad);
+ECEFPoint UavPathPlanner::enuToECEF(const ENUPoint& enu, double ref_lat_rad, double ref_lon_rad) {
+    auto R_inv = UavPathPlanner::computeENURotationMatrixInverse(ref_lat_rad, ref_lon_rad);
     
     ECEFPoint delta_ecef;
     delta_ecef.x = R_inv[0][0] * enu.east + R_inv[0][1] * enu.north + R_inv[0][2] * enu.up;
@@ -204,10 +212,10 @@ ECEFPoint enuToECEF(const ENUPoint& enu, double ref_lat_rad, double ref_lon_rad)
 }
 
 // 主转换函数：WGS84经纬度转东北天坐标
-ENUPoint wgs84ToENU(const WGS84Point& target, const WGS84Point& reference) {
+ENUPoint UavPathPlanner::wgs84ToENU(const WGS84Point& target, const WGS84Point& reference) {
     // 将参考点和目标点转换为ECEF坐标
-    ECEFPoint ref_ecef = wgs84ToECEF(reference);
-    ECEFPoint target_ecef = wgs84ToECEF(target);
+    ECEFPoint ref_ecef = UavPathPlanner::wgs84ToECEF(reference);
+    ECEFPoint target_ecef = UavPathPlanner::wgs84ToECEF(target);
     
     // 计算ECEF坐标差
     ECEFPoint delta_ecef;
@@ -219,18 +227,18 @@ ENUPoint wgs84ToENU(const WGS84Point& target, const WGS84Point& reference) {
     double ref_lat_rad = deg2rad(reference.lat);
     double ref_lon_rad = deg2rad(reference.lon);
     
-    return ecefToENU(delta_ecef, ref_lat_rad, ref_lon_rad);
+    return UavPathPlanner::ecefToENU(delta_ecef, ref_lat_rad, ref_lon_rad);
 }
 
 // 东北天坐标转WGS84经纬度
-WGS84Point enuToWGS84(const ENUPoint& enu, const WGS84Point& reference) {
+WGS84Point UavPathPlanner::enuToWGS84(const ENUPoint& enu, const WGS84Point& reference) {
     // 将参考点转换为ECEF坐标
-    ECEFPoint ref_ecef = wgs84ToECEF(reference);
+    ECEFPoint ref_ecef = UavPathPlanner::wgs84ToECEF(reference);
     
     // 将东北天坐标转换为ECEF坐标差
     double ref_lat_rad = deg2rad(reference.lat);
     double ref_lon_rad = deg2rad(reference.lon);
-    ECEFPoint delta_ecef = enuToECEF(enu, ref_lat_rad, ref_lon_rad);
+    ECEFPoint delta_ecef = UavPathPlanner::enuToECEF(enu, ref_lat_rad, ref_lon_rad);
     
     // 计算目标点的ECEF坐标
     ECEFPoint target_ecef;
@@ -242,7 +250,7 @@ WGS84Point enuToWGS84(const ENUPoint& enu, const WGS84Point& reference) {
     return ecefToWGS84(target_ecef);
 }
 // 批量WGS84转ENU
-std::vector<ENUPoint> wgs84ToENU_Batch(const std::vector<WGS84Point>& targets, 
+std::vector<ENUPoint> UavPathPlanner::wgs84ToENU_Batch(const std::vector<WGS84Point>& targets, 
                                       const WGS84Point& reference) {
     std::vector<ENUPoint> results;
     results.reserve(targets.size()); // 预分配空间以提高效率
@@ -255,7 +263,7 @@ std::vector<ENUPoint> wgs84ToENU_Batch(const std::vector<WGS84Point>& targets,
 }
 
 // 批量ENU转WGS84
-std::vector<WGS84Point> enuToWGS84_Batch(const std::vector<ENUPoint>& targets, 
+std::vector<WGS84Point> UavPathPlanner::enuToWGS84_Batch(const std::vector<ENUPoint>& targets, 
                                         const WGS84Point& reference) {
     std::vector<WGS84Point> results;
     results.reserve(targets.size()); // 预分配空间以提高效率
@@ -267,11 +275,94 @@ std::vector<WGS84Point> enuToWGS84_Batch(const std::vector<ENUPoint>& targets,
     return results;
 }
 
+// UavPathPlanner::runAltitudeOptimization 实现（封装后的私有方法）
+bool UavPathPlanner::runAltitudeOptimization(std::vector<ENUPoint> &Trajectory_ENU, const json &input_json)
+{
+    try {
+        math_util::AltitudeOptimizer altopt;
+        std::string elev_file;
+        if (input_json.contains("map_name") && !input_json["map_name"].empty()) {
+            elev_file = input_json["map_name"].get<std::string>();
+        } else {
+            // try default data/config.conf
+            try {
+                YAML::Node cfg = YAML::LoadFile("data/config.conf");
+                if (cfg["map_name"]) {
+                    std::string mn = cfg["map_name"].as<std::string>();
+                    // if relative, prefix with data/
+                    if (mn.rfind("/", 0) == 0) elev_file = mn; else elev_file = std::string("data/") + mn;
+                }
+            } catch (...) {
+                // ignore
+            }
+        }
+
+        if (elev_file.empty()) return false;
+
+        if (!altopt.load_elevation_data(elev_file)) {
+            std::cerr << "AltitudeOptimizer: failed to load elevation file: " << elev_file << "\n";
+            return false;
+        }
+
+        const auto &emap = altopt.getElevationMap();
+
+        // compute elev min/max
+        double elev_min = 1e300, elev_max = -1e300;
+        for (int r = 0; r < emap.getHeight(); ++r) {
+            for (int c = 0; c < emap.getWidth(); ++c) {
+                double wx = emap.getGeoTransform().origin_x + (c + 0.5) * emap.getGeoTransform().pixel_w;
+                double wy = emap.getGeoTransform().origin_y + (r + 0.5) * emap.getGeoTransform().pixel_h;
+                double ev;
+                if (emap.getElevationAt(wx, wy, ev)) {
+                    elev_min = std::min(elev_min, ev);
+                    elev_max = std::max(elev_max, ev);
+                }
+            }
+        }
+        if (elev_min > elev_max) return false;
+
+        math_util::CostMap cmap;
+        cmap.fromElevationMap(emap, elev_min, elev_max);
+
+        // build waypoint vector for optimizer
+        std::vector<Eigen::Vector3d> wpts;
+        wpts.reserve(Trajectory_ENU.size());
+        for (size_t i = 0; i < Trajectory_ENU.size(); ++i) {
+            const auto &p = Trajectory_ENU[i];
+            wpts.emplace_back(p.east, p.north, p.up);
+        }
+
+        math_util::AltitudeOptimizer::Params params;
+        // override params from input_json if present
+        if (input_json.contains("lambda_smooth")) params.lambda_smooth = input_json["lambda_smooth"].get<double>();
+        if (input_json.contains("lambda_follow")) params.lambda_follow = input_json["lambda_follow"].get<double>();
+        if (input_json.contains("max_climb_rate")) params.max_climb_rate = input_json["max_climb_rate"].get<double>();
+        if (input_json.contains("uav_R")) params.uav_R = input_json["uav_R"].get<double>();
+
+        std::vector<double> out_z;
+        if (altopt.optimizeHeights(wpts, emap, cmap, params, out_z)) {
+            for (size_t i = 0; i < out_z.size() && i < Trajectory_ENU.size(); ++i) {
+                Trajectory_ENU[i].up = out_z[i];
+            }
+            std::cerr << "AltitudeOptimizer: optimized heights applied (" << out_z.size() << " points)\n";
+            return true;
+        } else {
+            std::cerr << "AltitudeOptimizer: optimization failed\n";
+            return false;
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "runAltitudeOptimization exception: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
 //get the input data of uav waypoints
 // 读取JSON文件中的路径点并直接返回东北天坐标
 // 从JSON对象中读取路径点并直接返回东北天坐标
 
-std::vector<ENUPoint> getENUFromJSON(const json& j, const std::string& key) 
+std::vector<ENUPoint> UavPathPlanner::getENUFromJSON(const json& j, const std::string& key) 
 {
     std::vector<ENUPoint> enu_path;
     
@@ -303,15 +394,15 @@ std::vector<ENUPoint> getENUFromJSON(const json& j, const std::string& key)
         }
         
         // 设置ENU坐标系原点（使用第一个点作为原点）
-        origin = wgs84_points[0];
-        origin.alt=0;
-        enu_path = wgs84ToENU_Batch(wgs84_points,origin);        
+        this->origin_ = wgs84_points[0];
+        this->origin_.alt = 0;
+        enu_path = this->wgs84ToENU_Batch(wgs84_points, this->origin_);
     } catch (const std::exception& e) {
         std::cerr << "从JSON获取ENU坐标错误: " << e.what() << std::endl;
     }
     return enu_path;
 }
-double getDistanceFromJSON(const json& j, const std::string& key) 
+double UavPathPlanner::getDistanceFromJSON(const json& j, const std::string& key) 
 {
     double distance_;
     
@@ -334,7 +425,7 @@ double getDistanceFromJSON(const json& j, const std::string& key)
 
 //
 
-bool getPlan(json &input_json, json &output_json, bool use3D)
+bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D)
 {
     std::vector<ENUPoint> Enu_waypoint;
     double distance;
@@ -347,8 +438,8 @@ bool getPlan(json &input_json, json &output_json, bool use3D)
     {
         std::cerr << "Successfully load intput json data." << std::endl;
     }
-    Enu_waypoint = getENUFromJSON(input_json,"leader_midway_point_wgs84"); //
-    distance  = getDistanceFromJSON(input_json,"distance_points");
+    Enu_waypoint = this->getENUFromJSON(input_json,"leader_midway_point_wgs84"); //
+    distance  = this->getDistanceFromJSON(input_json,"distance_points");
     // 支持从输入 JSON 中指定平均速度（key: "leader_speed"），兼容旧键 "V_avg" / "v_avg"
     double leader_speed = -1.0;
     try {
@@ -359,23 +450,34 @@ bool getPlan(json &input_json, json &output_json, bool use3D)
     // 将 leader_speed 写回 input_data 以便其他函数使用
     if (leader_speed > 0) input_data.leader_speed = leader_speed;
 
-    std::vector<ENUPoint> Trajectory_ENU;
+    
     if (use3D) {
-        Trajectory_ENU = Minisnap_3D(Enu_waypoint, distance, input_data.leader_speed);
+        Trajectory_ENU = this->Minisnap_3D(Enu_waypoint, distance, input_data.leader_speed);
     } else {
-        Trajectory_ENU = Minisnap_EN(Enu_waypoint, distance, input_data.leader_speed);
+        Trajectory_ENU = this->Minisnap_EN(Enu_waypoint, distance, input_data.leader_speed);
     }
+    // --- Altitude optimization post-process ---
+    // 提取为单独函数以便复用和测试
+    try {
+        bool ok = this->runAltitudeOptimization(Trajectory_ENU, input_json);
+        if (!ok) {
+            std::cerr << "AltitudeOptimizer: no optimization applied or failed." << std::endl;
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "Altitude optimization error: " << e.what() << std::endl;
+    }
+    // --- end altitude optimization ---
     // std::cout << "trajectory point number:" << Trajectory_ENU.size() << std::endl;
     //东北天坐标转换为经纬高
-    std::vector<WGS84Point> Trajectory_WGS84 = enuToWGS84_Batch(Trajectory_ENU,origin);
+    std::vector<WGS84Point> Trajectory_WGS84 = this->enuToWGS84_Batch(Trajectory_ENU,this->origin_);
     // 将经纬高路径写入 output_json —— leader
-    putWGS84ToJson(output_json, "uav_leader_plane1", Trajectory_WGS84);
+    this->putWGS84ToJson(output_json, "uav_leader_plane1", Trajectory_WGS84);
     // uav_plane1 用于保存编队（followers）列表，每个子数组以 follower id 开头后跟点列表
     json plane_array = json::array();
 
     // 生成并写入跟随者轨迹
     try {
-        json plane_array = generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
+        json plane_array = this->generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
         output_json["uav_plane1"] = plane_array;
     } catch (const std::exception &e) {
         std::cerr << "调用 generateFollowerTrajectories 出错: " << e.what() << std::endl;
@@ -385,7 +487,7 @@ bool getPlan(json &input_json, json &output_json, bool use3D)
 }
 
 
-bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj) {
+bool UavPathPlanner::putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj) {
     try {
         // 创建二维数组
         json trajectory_array = json::array();
@@ -408,7 +510,7 @@ bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Poin
     }
 }
 
-json generateFollowerTrajectories(const json &input_json, const InputData &input_data,
+json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const InputData &input_data,
                                   const std::vector<ENUPoint> &Trajectory_ENU,
                                   const std::vector<WGS84Point> &Trajectory_WGS84) {
     json plane_array = json::array();
@@ -424,7 +526,7 @@ json generateFollowerTrajectories(const json &input_json, const InputData &input
     WGS84Point leader_start_wgs{input_data.uav_leader_start_point_wgs84.lon,
                                 input_data.uav_leader_start_point_wgs84.lat,
                                 input_data.uav_leader_start_point_wgs84.alt};
-    ENUPoint leader_start_enu = wgs84ToENU(leader_start_wgs, origin);
+    ENUPoint leader_start_enu = this->wgs84ToENU(leader_start_wgs, this->origin_);
 
     // 计算 leader 初始航向（使用采样轨迹的前两点）
     double leader_initial_heading = 0.0;
@@ -448,7 +550,7 @@ json generateFollowerTrajectories(const json &input_json, const InputData &input
         if (idx >= uav_starts.size()) break;
         auto s = uav_starts[idx];
         WGS84Point follower_start_wgs{s[0].get<double>(), s[1].get<double>(), s.size()>=3 ? s[2].get<double>() : 0.0};
-        ENUPoint follower_start_enu = wgs84ToENU(follower_start_wgs, origin);
+    ENUPoint follower_start_enu = this->wgs84ToENU(follower_start_wgs, this->origin_);
 
         Eigen::Vector2d rel_global(follower_start_enu.east - leader_start_enu.east,
                                    follower_start_enu.north - leader_start_enu.north);
@@ -480,7 +582,7 @@ json generateFollowerTrajectories(const json &input_json, const InputData &input
             fp.north = leader_xy[t].y() + offset_global.y();
             fp.up = Trajectory_ENU[t].up + rel_up;
 
-            WGS84Point wp = enuToWGS84(fp, origin);
+            WGS84Point wp = this->enuToWGS84(fp, this->origin_);
             json pa = json::array();
             pa.push_back(wp.lon);
             pa.push_back(wp.lat);
@@ -494,7 +596,7 @@ json generateFollowerTrajectories(const json &input_json, const InputData &input
     return plane_array;
 }
 // Minisnap_EN: 仅在平面上(东/北)进行轨迹优化，忽略高度(将高度固定为起点高度)
-std::vector<ENUPoint> Minisnap_EN (std::vector<ENUPoint> Enu_waypoint_, double distance_, double v_avg_override)
+std::vector<ENUPoint> UavPathPlanner::Minisnap_EN (std::vector<ENUPoint> Enu_waypoint_, double distance_, double v_avg_override)
 {
     std::vector<ENUPoint> result{};
     int dot_num = Enu_waypoint_.size();  //路径点个数
@@ -540,7 +642,7 @@ std::vector<ENUPoint> Minisnap_EN (std::vector<ENUPoint> Enu_waypoint_, double d
         std::cerr << "Using leader_speed as average speed: " << v_avg_override << " m/s" << std::endl;
     }
 
-    Eigen::MatrixXd sampled = generator.GenerateTrajectoryMatrix(route, yaml_cfg, distance_, v_avg_override);
+    Eigen::MatrixXd sampled = this->generator_.GenerateTrajectoryMatrix(route, yaml_cfg, distance_, v_avg_override);
 
     // 将采样的平面点转换回 ENUPoint，并把高度固定为起点高度（高度可保持不变或任意）
     double up_value = Enu_waypoint_[0].up; // 固定高度为起点高度
@@ -557,7 +659,7 @@ std::vector<ENUPoint> Minisnap_EN (std::vector<ENUPoint> Enu_waypoint_, double d
 }
 
 // Minisnap_3D: 三维轨迹优化（保留高度），如果未找到专门配置同样使用默认 YAML 路径
-std::vector<ENUPoint> Minisnap_3D(std::vector<ENUPoint> Enu_waypoint_, double distance_, double v_avg_override)
+std::vector<ENUPoint> UavPathPlanner::Minisnap_3D(std::vector<ENUPoint> Enu_waypoint_, double distance_, double v_avg_override)
 {
     std::vector<ENUPoint> result{};
     int dot_num = Enu_waypoint_.size();  //路径点个数
@@ -601,7 +703,7 @@ std::vector<ENUPoint> Minisnap_3D(std::vector<ENUPoint> Enu_waypoint_, double di
         std::cerr << "Using leader_speed as average speed: " << v_avg_override << " m/s" << std::endl;
     }
 
-    Eigen::MatrixXd sampled = generator.GenerateTrajectoryMatrix(route, yaml_cfg, distance_, v_avg_override);
+    Eigen::MatrixXd sampled = this->generator_.GenerateTrajectoryMatrix(route, yaml_cfg, distance_, v_avg_override);
 
     // 将采样点转换为 ENUPoint 向量返回
     for (int i = 0; i < sampled.rows(); ++i) {
@@ -616,7 +718,7 @@ std::vector<ENUPoint> Minisnap_3D(std::vector<ENUPoint> Enu_waypoint_, double di
     return result;
 }
 
-bool loadData(InputData &input_data, json &input_json)
+bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
 {
     if (input_json["battle_high_list"].size() != 0)
     {

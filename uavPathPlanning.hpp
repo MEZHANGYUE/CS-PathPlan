@@ -9,6 +9,7 @@
 #include <vector>
 #include<iostream>
 #include "math_util/minimum_snap.hpp"
+#include "math_util/altitude_optimizer.hpp"
 #include <algorithm>
 using namespace std;
 using json = nlohmann::json;
@@ -17,7 +18,7 @@ using namespace math_util;
 struct InputData
 {
     double distance_points;
-    double leader_speed = 100.0; // m/s, average speed override read from input JSON (formerly V_avg)
+    double leader_speed = 30.0; // m/s, average speed override read from input JSON (formerly V_avg)
     double leader_fly_high;
     int formation_model;
     int formation_using;
@@ -87,49 +88,66 @@ inline double deg2rad(double deg) {
 inline double rad2deg(double rad) {
     return rad * 180.0 / M_PI;
 }
-extern std::vector<ENUPoint>  Trajectory_ENU;
 
-// Minisnap_3D: origin_waypoints, sampling distance (m), optional average speed override (m/s)
-std::vector<ENUPoint>  Minisnap_3D(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0);
-std::vector<ENUPoint>  Minisnap_EN(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0);
+// UavPathPlanner: 将 uavPathPlanning 中的功能封装为类
+class UavPathPlanner {
+public:
+    UavPathPlanner();
+    ~UavPathPlanner();
+    std::vector<ENUPoint> Trajectory_ENU={}; //单独优化高度时使用,非空时才能调用高度优化
+    // Minisnap 轨迹生成接口
+    std::vector<ENUPoint> Minisnap_3D(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0);
+    std::vector<ENUPoint> Minisnap_EN(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0);
 
-// getPlan: 如果 use3D 为 true 则使用三维规划(Minisnap_3D)，否则使用二维平面规划(Minisnap_EN)
-bool getPlan(json &input_json, json &output_json, bool use3D = true);
+    // 主规划接口
+    bool getPlan(json &input_json, json &output_json, bool use3D = true);
 
-bool loadData(InputData &input_data, json &input_json);
-bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj);
-// 生成跟随者（followers）的编队轨迹，返回用于写入 output_json 的 plane_array
-json generateFollowerTrajectories(const json &input_json, const InputData &input_data,
-                                  const std::vector<ENUPoint> &Trajectory_ENU,
-                                  const std::vector<WGS84Point> &Trajectory_WGS84);
+    // 辅助函数
+    bool loadData(InputData &input_data, json &input_json);
+    bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj);
+    json generateFollowerTrajectories(const json &input_json, const InputData &input_data,
+                                      const std::vector<ENUPoint> &Trajectory_ENU,
+                                      const std::vector<WGS84Point> &Trajectory_WGS84);
 
-// 主转换函数：WGS84经纬度转东北天坐标
-ENUPoint wgs84ToENU(const WGS84Point& target, const WGS84Point& reference);
-// 东北天坐标转WGS84经纬度
-WGS84Point enuToWGS84(const ENUPoint& enu, const WGS84Point& reference);
-// 批量转换
-std::vector<ENUPoint> wgs84ToENU_Batch(const std::vector<WGS84Point>& targets, 
-                                      const WGS84Point& reference);
-std::vector<WGS84Point> enuToWGS84_Batch(const std::vector<ENUPoint>& targets, 
-                                      const WGS84Point& reference);
-inline bool saveJsonToFile(const json &j, const std::string &filename) {
-    try {
-        std::ofstream file(filename);
-        if (!file.is_open()) {
-            std::cerr << "Error: Cannot open file " << filename << std::endl;
+    // 坐标变换
+    ENUPoint wgs84ToENU(const WGS84Point& target, const WGS84Point& reference);
+    WGS84Point enuToWGS84(const ENUPoint& enu, const WGS84Point& reference);
+    std::vector<ENUPoint> wgs84ToENU_Batch(const std::vector<WGS84Point>& targets, const WGS84Point& reference);
+    std::vector<WGS84Point> enuToWGS84_Batch(const std::vector<ENUPoint>& targets, const WGS84Point& reference);
+
+    // 保存 JSON
+    static inline bool saveJsonToFile(const json &j, const std::string &filename) {
+        try {
+            std::ofstream file(filename);
+            if (!file.is_open()) {
+                std::cerr << "Error: Cannot open file " << filename << std::endl;
+                return false;
+            }
+            file << j.dump(4);
+            file.close();
+            std::cout << "Successfully saved JSON to " << filename << std::endl;
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error saving JSON to file: " << e.what() << std::endl;
             return false;
         }
-        
-        // 修正：使用 dump() 方法将 json 对象转换为字符串
-        file << j.dump(4);  // 缩进4个空格，美化输出
-        file.close();
-        
-        std::cout << "Successfully saved JSON to " << filename << std::endl;
-        return true;
-        
-    } catch (const std::exception& e) {
-        std::cerr << "Error saving JSON to file: " << e.what() << std::endl;
-        return false;
     }
-}                                     
+
+private:
+    // 内部状态
+    TrajectoryGeneratorTool generator_;
+    WGS84Point origin_;
+    // 提取的高度优化器函数仍在 cpp 中实现为私有方法
+    bool runAltitudeOptimization(std::vector<ENUPoint> &Trajectory_ENU, const json &input_json);
+    // 内部辅助：从 JSON 读取 ENU 路径与 distance
+    std::vector<ENUPoint> getENUFromJSON(const json& j, const std::string& key);
+    double getDistanceFromJSON(const json& j, const std::string& key);
+    // 低级坐标辅助函数（封装到类内）
+    static ECEFPoint wgs84ToECEF(const WGS84Point& lla);
+    static WGS84Point ecefToWGS84(const ECEFPoint& ecef);
+    static std::array<std::array<double, 3>, 3> computeENURotationMatrix(double lat_rad, double lon_rad);
+    static std::array<std::array<double, 3>, 3> computeENURotationMatrixInverse(double lat_rad, double lon_rad);
+    static ENUPoint ecefToENU(const ECEFPoint& delta_ecef, double ref_lat_rad, double ref_lon_rad);
+    static ECEFPoint enuToECEF(const ENUPoint& enu, double ref_lat_rad, double ref_lon_rad);
+};
 #endif
