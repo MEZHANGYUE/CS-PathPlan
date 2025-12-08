@@ -7,6 +7,8 @@ import glob
 import re
 from matplotlib import font_manager
 import math
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
 
 def setup_chinese_font():
     """设置中文字体支持"""
@@ -39,6 +41,48 @@ def setup_chinese_font():
         print(f"字体设置警告: {e}")
         plt.rcParams['font.family'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 
+
+def load_tiff_elevation(path, target_size=(200, 200)):
+    """Load TIFF elevation data, downsample, and extract extent from GeoTIFF tags."""
+    try:
+        img = Image.open(path)
+        
+        # Extract GeoTIFF tags
+        # 33550: ModelPixelScaleTag (ScaleX, ScaleY, ScaleZ)
+        # 33922: ModelTiepointTag (I, J, K, X, Y, Z)
+        tags = img.tag_v2
+        extent = None
+        if 33550 in tags and 33922 in tags:
+            scale = tags[33550]
+            tiepoint = tags[33922]
+            
+            # tiepoint format: (I, J, K, X, Y, Z)
+            origin_x = tiepoint[3]
+            origin_y = tiepoint[4]
+            pixel_w = scale[0]
+            pixel_h = -scale[1] # Y axis is usually inverted in images
+            
+            w, h = img.size
+            xmin = origin_x
+            xmax = origin_x + pixel_w * w
+            ymin = origin_y + pixel_h * h
+            ymax = origin_y 
+            
+            # Ensure ymin < ymax
+            if ymin > ymax:
+                ymin, ymax = ymax, ymin
+                
+            extent = [xmin, xmax, ymin, ymax]
+            print(f"Loaded TIFF elevation with extent: {extent}")
+            
+        # Resize image for 3D plotting performance
+        img_resized = img.resize(target_size, Image.BILINEAR)
+        data = np.array(img_resized)
+        
+        return data, extent
+    except Exception as e:
+        print(f"Error loading TIFF elevation: {e}")
+        return None, None
 
 def load_pgm_image(path):
     """简单的 PGM (P5/P2) 读取器，返回 numpy 数组（H x W）或 None。"""
@@ -222,7 +266,7 @@ def extract_all_plane_trajectories(data, prefix_regex=r'^uav_plane'):
 
     return plane_trajs
 
-def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True, plot_3d=None, bg_img=None, bg_extent=None, bg_cmap='gray'):
+def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True, plot_3d=None, bg_img=None, bg_extent=None, bg_cmap='gray', elevation_data=None, elevation_extent=None):
     """绘制路径点、leader 轨迹（可选）以及多条 plane 轨迹（plane_trajs 为 [(id, [(lon,lat),...]), ...]）。
 
     - waypoints: 列表 [(lon,lat), ...]
@@ -249,6 +293,22 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
     fig = plt.figure(figsize=(12, 8))
     if need_3d:
         ax = fig.add_subplot(111, projection='3d')
+        
+        # 绘制3D高程地形
+        if elevation_data is not None and elevation_extent is not None:
+            try:
+                xmin, xmax, ymin, ymax = elevation_extent
+                h, w = elevation_data.shape
+                x = np.linspace(xmin, xmax, w)
+                y = np.linspace(ymax, ymin, h)
+                X, Y = np.meshgrid(x, y)
+                
+                # 使用 terrain colormap
+                ax.plot_surface(X, Y, elevation_data, cmap='terrain', alpha=0.5, linewidth=0, antialiased=False, zorder=0)
+                print("Plotted 3D elevation surface")
+            except Exception as e:
+                print(f"Warning: failed to plot 3D elevation: {e}")
+                
     else:
         ax = fig.add_subplot(111)
 
@@ -500,10 +560,20 @@ def main(file_path):
     # 尝试加载 data 目录下的 neimeng 高程 PGM，并解析 aux.xml 获取 GeoTransform
     bg_img = None
     bg_extent = None
+    elevation_data = None
+    elevation_extent = None
+    
     data_dir = os.path.join(os.path.dirname(__file__), 'data')
     # fallback to ./data if __file__ resolution fails
     if not os.path.isdir(data_dir):
         data_dir = './data'
+    
+    # Load .tif.ovr for 3D elevation
+    ovr_path = os.path.join(data_dir, 'neimeng.tif.ovr')
+    if os.path.exists(ovr_path):
+        print(f"Loading 3D elevation data from: {ovr_path}")
+        elevation_data, elevation_extent = load_tiff_elevation(ovr_path)
+    
     pgm_path = os.path.join(data_dir, 'neimeng.tif.band1.pgm')
     aux_path = os.path.join(data_dir, 'neimeng.tif.aux.xml')
     if os.path.exists(pgm_path):
@@ -557,7 +627,7 @@ def main(file_path):
     else:
         print(f"Elevation PGM not found at {pgm_path}, skipping background image")
 
-    plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path, bg_img=bg_img, bg_extent=bg_extent)
+    plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path, bg_img=bg_img, bg_extent=bg_extent, elevation_data=elevation_data, elevation_extent=elevation_extent)
 
 def analyze_data_structure(filename):
     """分析JSON文件数据结构（用于调试）"""
@@ -649,5 +719,26 @@ if __name__ == "__main__":
         except Exception:
             save_path = None
 
+        # Load elevation data if needed (especially for 3D)
+        elevation_data = None
+        elevation_extent = None
+        bg_img = None
+        bg_extent = None
+        
+        data_dir = os.path.join(os.path.dirname(__file__), 'data')
+        if not os.path.isdir(data_dir):
+            data_dir = './data'
+            
+        if force_3d:
+            ovr_path = os.path.join(data_dir, 'neimeng.tif.ovr')
+            if os.path.exists(ovr_path):
+                print(f"Loading 3D elevation data from: {ovr_path}")
+                elevation_data, elevation_extent = load_tiff_elevation(ovr_path)
+        
+        # Also load PGM for 2D fallback or if needed
+        pgm_path = os.path.join(data_dir, 'neimeng.tif.band1.pgm')
+        if os.path.exists(pgm_path):
+             bg_img = load_pgm_image(pgm_path)
+
         print(f"Generating {'3D' if force_3d else '2D'} visualization (forced)...")
-        plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path, plot_3d=force_3d)
+        plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path, plot_3d=force_3d, elevation_data=elevation_data, elevation_extent=elevation_extent)
