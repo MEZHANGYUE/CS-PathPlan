@@ -69,10 +69,16 @@ int main(int argc, char *argv[])
     std::cout << "input:" << std::endl;
     std::cout << json_string << std::endl;
 
-    if (!getPlan(obj_total, result_json))
+    UavPathPlanner planner;
+    if (!planner.getPlan(obj_total, result_json))
     {
         std::cerr << "Failed to plan!" << std::endl;
     }
+
+    // if (!planner.runAltitudeOptimization("../data/neimeng.tif.ovr"))
+    // {
+    //     std::cerr << "Failed to Altitude Optimization!" << std::endl;
+    // }
     // else
     // {
     //     std::cout << "output:" << std::endl;
@@ -80,6 +86,6 @@ int main(int argc, char *argv[])
     //     std::cout << out_string << std::endl;
     // }
     // 保存到自动推断的输出路径
-    saveJsonToFile(result_json, output_path);
+    planner.saveJsonToFile(result_json, output_path);
     
 }

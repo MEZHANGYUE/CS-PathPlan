@@ -275,30 +275,17 @@ std::vector<WGS84Point> UavPathPlanner::enuToWGS84_Batch(const std::vector<ENUPo
     return results;
 }
 
-// UavPathPlanner::runAltitudeOptimization 实现（封装后的私有方法）
-bool UavPathPlanner::runAltitudeOptimization(std::vector<ENUPoint> &Trajectory_ENU, const json &input_json)
+// UavPathPlanner::runAltitudeOptimization: 现在只接受一个高程文件路径参数 (.tif 或 PGM)
+bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file)
 {
     try {
-        math_util::AltitudeOptimizer altopt;
-        std::string elev_file;
-        if (input_json.contains("map_name") && !input_json["map_name"].empty()) {
-            elev_file = input_json["map_name"].get<std::string>();
-        } else {
-            // try default data/config.conf
-            try {
-                YAML::Node cfg = YAML::LoadFile("data/config.conf");
-                if (cfg["map_name"]) {
-                    std::string mn = cfg["map_name"].as<std::string>();
-                    // if relative, prefix with data/
-                    if (mn.rfind("/", 0) == 0) elev_file = mn; else elev_file = std::string("data/") + mn;
-                }
-            } catch (...) {
-                // ignore
-            }
+        if (elev_file.empty()) return false;
+        if (this->Trajectory_ENU.empty()) {
+            std::cerr << "runAltitudeOptimization: Trajectory_ENU is empty, nothing to optimize\n";
+            return false;
         }
 
-        if (elev_file.empty()) return false;
-
+        math_util::AltitudeOptimizer altopt;
         if (!altopt.load_elevation_data(elev_file)) {
             std::cerr << "AltitudeOptimizer: failed to load elevation file: " << elev_file << "\n";
             return false;
@@ -306,7 +293,7 @@ bool UavPathPlanner::runAltitudeOptimization(std::vector<ENUPoint> &Trajectory_E
 
         const auto &emap = altopt.getElevationMap();
 
-        // compute elev min/max
+        // compute elev min/max (naive scan)
         double elev_min = 1e300, elev_max = -1e300;
         for (int r = 0; r < emap.getHeight(); ++r) {
             for (int c = 0; c < emap.getWidth(); ++c) {
@@ -324,25 +311,20 @@ bool UavPathPlanner::runAltitudeOptimization(std::vector<ENUPoint> &Trajectory_E
         math_util::CostMap cmap;
         cmap.fromElevationMap(emap, elev_min, elev_max);
 
-        // build waypoint vector for optimizer
+        // build waypoint vector for optimizer from member Trajectory_ENU
         std::vector<Eigen::Vector3d> wpts;
-        wpts.reserve(Trajectory_ENU.size());
-        for (size_t i = 0; i < Trajectory_ENU.size(); ++i) {
-            const auto &p = Trajectory_ENU[i];
+        wpts.reserve(this->Trajectory_ENU.size());
+        for (size_t i = 0; i < this->Trajectory_ENU.size(); ++i) {
+            const auto &p = this->Trajectory_ENU[i];
             wpts.emplace_back(p.east, p.north, p.up);
         }
 
-        math_util::AltitudeOptimizer::Params params;
-        // override params from input_json if present
-        if (input_json.contains("lambda_smooth")) params.lambda_smooth = input_json["lambda_smooth"].get<double>();
-        if (input_json.contains("lambda_follow")) params.lambda_follow = input_json["lambda_follow"].get<double>();
-        if (input_json.contains("max_climb_rate")) params.max_climb_rate = input_json["max_climb_rate"].get<double>();
-        if (input_json.contains("uav_R")) params.uav_R = input_json["uav_R"].get<double>();
+        math_util::AltitudeOptimizer::Params params; // use defaults
 
         std::vector<double> out_z;
         if (altopt.optimizeHeights(wpts, emap, cmap, params, out_z)) {
-            for (size_t i = 0; i < out_z.size() && i < Trajectory_ENU.size(); ++i) {
-                Trajectory_ENU[i].up = out_z[i];
+            for (size_t i = 0; i < out_z.size() && i < this->Trajectory_ENU.size(); ++i) {
+                this->Trajectory_ENU[i].up = out_z[i];
             }
             std::cerr << "AltitudeOptimizer: optimized heights applied (" << out_z.size() << " points)\n";
             return true;
@@ -456,17 +438,9 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D)
     } else {
         Trajectory_ENU = this->Minisnap_EN(Enu_waypoint, distance, input_data.leader_speed);
     }
-    // --- Altitude optimization post-process ---
-    // 提取为单独函数以便复用和测试
-    try {
-        bool ok = this->runAltitudeOptimization(Trajectory_ENU, input_json);
-        if (!ok) {
-            std::cerr << "AltitudeOptimizer: no optimization applied or failed." << std::endl;
-        }
-    } catch (const std::exception &e) {
-        std::cerr << "Altitude optimization error: " << e.what() << std::endl;
-    }
-    // --- end altitude optimization ---
+    // Altitude optimization is no longer performed automatically here.
+    // Use UavPathPlanner::runAltitudeOptimization(elev_file) externally to run
+    // a separate altitude-only optimization step when desired.
     // std::cout << "trajectory point number:" << Trajectory_ENU.size() << std::endl;
     //东北天坐标转换为经纬高
     std::vector<WGS84Point> Trajectory_WGS84 = this->enuToWGS84_Batch(Trajectory_ENU,this->origin_);

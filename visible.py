@@ -6,6 +6,7 @@ import os
 import glob
 import re
 from matplotlib import font_manager
+import math
 
 def setup_chinese_font():
     """设置中文字体支持"""
@@ -37,6 +38,94 @@ def setup_chinese_font():
     except Exception as e:
         print(f"字体设置警告: {e}")
         plt.rcParams['font.family'] = ['DejaVu Sans', 'Arial', 'sans-serif']
+
+
+def load_pgm_image(path):
+    """简单的 PGM (P5/P2) 读取器，返回 numpy 数组（H x W）或 None。"""
+    try:
+        with open(path, 'rb') as f:
+            # 读取魔数（如 P5 或 P2）并跳过注释
+            magic = f.readline().strip()
+            if not magic:
+                return None
+            magic = magic.decode('ascii') if isinstance(magic, bytes) else magic
+            # 跳过注释和空白行，读取尺寸
+            def read_token():
+                tok = b''
+                while True:
+                    ch = f.read(1)
+                    if not ch:
+                        break
+                    if ch.isspace():
+                        if tok:
+                            break
+                        else:
+                            continue
+                    if ch == b'#':
+                        # 跳过整行注释
+                        f.readline()
+                        continue
+                    tok += ch
+                return tok.decode('ascii') if tok else None
+
+            w = int(read_token())
+            h = int(read_token())
+            maxv = int(read_token())
+            if magic == 'P5':
+                # 二进制数据
+                # consume single whitespace/newline after maxv if any
+                # 已由 read_token 停留在下一个字节
+                data = f.read(w * h)
+                arr = np.frombuffer(data, dtype=np.uint8)
+                if arr.size != w * h:
+                    # 有时像素为 2 字节（maxv > 255）
+                    f.seek(0)
+                    # 回退并使用更稳健的读取方式
+                    f = open(path, 'r')
+                    content = f.read()
+                    # fallback: use matplotlib.imread
+                    try:
+                        img = plt.imread(path)
+                        if img.ndim == 3:
+                            img = img[:, :, 0]
+                        return img.astype(np.float32)
+                    except Exception:
+                        return None
+                arr = arr.reshape((h, w))
+                return arr.astype(np.float32)
+            elif magic == 'P2':
+                # ASCII 格式
+                toks = []
+                while len(toks) < w * h:
+                    t = read_token()
+                    if t is None:
+                        break
+                    toks.append(int(t))
+                arr = np.array(toks, dtype=np.float32).reshape((h, w))
+                return arr
+            else:
+                return None
+    except Exception:
+        return None
+
+
+def parse_aux_xml_for_geotransform(aux_path):
+    """尝试从 .aux.xml 文件中解析 GeoTransform（返回 6 元素列表或 None）。"""
+    if not os.path.exists(aux_path):
+        return None
+    try:
+        text = open(aux_path, 'r', encoding='utf-8', errors='ignore').read()
+        # 搜索 <GeoTransform> .. numbers .. </GeoTransform>
+        m = re.search(r"<GeoTransform>([\s\S]*?)</GeoTransform>", text)
+        if not m:
+            return None
+        nums = re.findall(r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?", m.group(1))
+        if len(nums) >= 6:
+            gt = [float(x) for x in nums[:6]]
+            return gt
+    except Exception:
+        return None
+    return None
 
 def read_json_file(filename):
     """读取JSON文件"""
@@ -133,7 +222,7 @@ def extract_all_plane_trajectories(data, prefix_regex=r'^uav_plane'):
 
     return plane_trajs
 
-def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True, plot_3d=None):
+def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True, plot_3d=None, bg_img=None, bg_extent=None, bg_cmap='gray'):
     """绘制路径点、leader 轨迹（可选）以及多条 plane 轨迹（plane_trajs 为 [(id, [(lon,lat),...]), ...]）。
 
     - waypoints: 列表 [(lon,lat), ...]
@@ -162,6 +251,18 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
         ax = fig.add_subplot(111, projection='3d')
     else:
         ax = fig.add_subplot(111)
+
+    # 绘制背景高程图（如果提供）
+    if bg_img is not None and bg_extent is not None and not need_3d:
+        try:
+            # 确保 bg_img 为二维数组
+            img = bg_img
+            if img.ndim == 3:
+                img = img[:, :, 0]
+            extent = bg_extent  # [xmin, xmax, ymin, ymax]
+            ax.imshow(img, cmap=bg_cmap, extent=extent, origin='upper', alpha=0.7, zorder=0)
+        except Exception as e:
+            print(f"Warning: failed to draw background elevation image: {e}")
 
     # 绘制路径点
     if waypoints:
@@ -396,7 +497,67 @@ def main(file_path):
         save_path = None
     if save_path:
         print(f"Will save plot to: {save_path}")
-    plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path)
+    # 尝试加载 data 目录下的 neimeng 高程 PGM，并解析 aux.xml 获取 GeoTransform
+    bg_img = None
+    bg_extent = None
+    data_dir = os.path.join(os.path.dirname(__file__), 'data')
+    # fallback to ./data if __file__ resolution fails
+    if not os.path.isdir(data_dir):
+        data_dir = './data'
+    pgm_path = os.path.join(data_dir, 'neimeng.tif.band1.pgm')
+    aux_path = os.path.join(data_dir, 'neimeng.tif.aux.xml')
+    if os.path.exists(pgm_path):
+        print(f"Loading elevation image from: {pgm_path}")
+        img = load_pgm_image(pgm_path)
+        if img is not None:
+            bg_img = img
+            gt = parse_aux_xml_for_geotransform(aux_path) if os.path.exists(aux_path) else None
+            h, w = img.shape
+            if gt is not None:
+                origin_x = gt[0]
+                pixel_w = gt[1]
+                origin_y = gt[3]
+                pixel_h = gt[5]
+                xmin = origin_x
+                xmax = origin_x + pixel_w * w
+                # 根据 pixel_h 正负计算 ymin/ymax
+                if pixel_h < 0:
+                    ymax = origin_y
+                    ymin = origin_y + pixel_h * h
+                else:
+                    ymin = origin_y
+                    ymax = origin_y + pixel_h * h
+                bg_extent = [xmin, xmax, ymin, ymax]
+                print(f"Parsed GeoTransform from aux: extent={bg_extent}")
+            else:
+                # 根据数据中的点范围来推断 extent（略放大一点）
+                all_coords = []
+                if waypoints:
+                    all_coords += [(p[0], p[1]) for p in waypoints]
+                if leader_traj:
+                    all_coords += [(p[0], p[1]) for p in leader_traj]
+                for (_id, pts) in plane_trajs:
+                    all_coords += [(p[0], p[1]) for p in pts]
+                if all_coords:
+                    xs = [c[0] for c in all_coords]
+                    ys = [c[1] for c in all_coords]
+                    xmin, xmax = min(xs), max(xs)
+                    ymin, ymax = min(ys), max(ys)
+                    # 扩展一些边距
+                    padx = max(1e-6, (xmax - xmin) * 0.1)
+                    pady = max(1e-6, (ymax - ymin) * 0.1)
+                    bg_extent = [xmin - padx, xmax + padx, ymin - pady, ymax + pady]
+                    print(f"Using coordinates-derived extent for background: {bg_extent}")
+                else:
+                    # 无法确定坐标系，使用像素坐标范围
+                    bg_extent = [0, w, 0, h]
+                    print("No trajectory coordinates found; using pixel coordinates for elevation extent")
+        else:
+            print(f"Warning: failed to load PGM image: {pgm_path}")
+    else:
+        print(f"Elevation PGM not found at {pgm_path}, skipping background image")
+
+    plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path, bg_img=bg_img, bg_extent=bg_extent)
 
 def analyze_data_structure(filename):
     """分析JSON文件数据结构（用于调试）"""

@@ -101,7 +101,8 @@ public:
 
     // 主规划接口
     bool getPlan(json &input_json, json &output_json, bool use3D = true);
-
+    //高度优化接口
+    bool runAltitudeOptimization(const std::string &elev_file);
     // 辅助函数
     bool loadData(InputData &input_data, json &input_json);
     bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj);
@@ -138,7 +139,8 @@ private:
     TrajectoryGeneratorTool generator_;
     WGS84Point origin_;
     // 提取的高度优化器函数仍在 cpp 中实现为私有方法
-    bool runAltitudeOptimization(std::vector<ENUPoint> &Trajectory_ENU, const json &input_json);
+    // 现在只输入高程文件路径（例如 .tif），函数直接使用类成员 Trajectory_ENU 进行高度优化
+    // bool runAltitudeOptimization(const std::string &elev_file);
     // 内部辅助：从 JSON 读取 ENU 路径与 distance
     std::vector<ENUPoint> getENUFromJSON(const json& j, const std::string& key);
     double getDistanceFromJSON(const json& j, const std::string& key);
