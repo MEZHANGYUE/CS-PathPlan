@@ -108,7 +108,7 @@ int main(int argc, char *argv[])
         if (!elevation_file.empty()) {
             std::cout << "Running Altitude Optimization with file: " << elevation_file << std::endl;
             auto start_time = std::chrono::high_resolution_clock::now();
-            if (!planner.runAltitudeOptimization(elevation_file))
+            if (!planner.runAltitudeOptimization(elevation_file, result_json, obj_total))
             {
                 std::cerr << "Failed to Altitude Optimization!" << std::endl;
             }
@@ -124,5 +124,6 @@ int main(int argc, char *argv[])
 
     // 保存到自动推断的输出路径
     planner.saveJsonToFile(result_json, output_path);
+    std::cout << "Output JSON updated in memory." << std::endl;
     
 }

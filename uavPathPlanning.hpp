@@ -114,7 +114,7 @@ public:
     // 主规划接口
     bool getPlan(json &input_json, json &output_json, bool use3D = true);
     //高度优化接口
-    bool runAltitudeOptimization(const std::string &elev_file);
+    bool runAltitudeOptimization(const std::string &elev_file, json &output_json, const json &input_json);
     // 辅助函数
     bool loadData(InputData &input_data, json &input_json);
     bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj);
@@ -151,6 +151,38 @@ public:
         }
     }
 
+    // CostMap: simple cost map storing height values (float)
+    class CostMap {
+    public:
+      CostMap() : width_(0), height_(0), resolution_(0.0), origin_x_(0.0), origin_y_(0.0) {}
+      void create(int width, int height, double resolution, double origin_x, double origin_y);
+      void setCost(int x, int y, float c);
+      float getCost(int x, int y) const;
+      int getWidth() const { return width_; }
+      int getHeight() const { return height_; }
+      double getResolution() const { return resolution_; }
+      double getOriginX() const { return origin_x_; }
+      double getOriginY() const { return origin_y_; }
+    
+      // get value at world coordinates (x,y)
+      bool getValueAt(double x, double y, float &val) const;
+    
+      // fill from elevation map (copy elevation values)
+      // Note: In this merged version, we pass the UavPathPlanner instance or relevant data directly
+      // But since CostMap is now nested or we just use UavPathPlanner's elevation data, 
+      // we might not need a separate fromElevationMap if we access UavPathPlanner's data.
+      // However, to keep logic similar to before, we can let it access UavPathPlanner's elevation data.
+      // For simplicity, let's keep CostMap as a helper class or struct within UavPathPlanner or just use UavPathPlanner's methods.
+      // The user asked to merge ElevationMap and CostMap classes into uavPathPlanning.
+      // ElevationMap logic is already largely merged into UavPathPlanner (elev_data_, etc).
+      // CostMap logic (grid of costs) can also be merged.
+      
+    private:
+      int width_, height_;
+      double resolution_, origin_x_, origin_y_;
+      std::vector<float> costs_; // row-major, top-left origin
+    };
+
 private:
     // 内部状态
     TrajectoryGeneratorTool generator_;
@@ -177,6 +209,14 @@ private:
     GeoTransform elev_geo_;
     bool elev_valid_ = false;
 
+    // CostMap Data
+    int cost_width_ = 0;
+    int cost_height_ = 0;
+    double cost_resolution_ = 0.0;
+    double cost_origin_x_ = 0.0;
+    double cost_origin_y_ = 0.0;
+    std::vector<float> cost_data_; // row-major, top-left origin
+
     // Helpers for elevation
     bool performDownsampling(void* poDS_ptr, int full_w, int full_h, uint64_t bytes_needed, uint64_t target_bytes, const std::string& path);
     bool getElevationAt(double x, double y, double &elev) const;
@@ -191,5 +231,13 @@ private:
     // Elevation Map Info
     void printElevationInfo() const;
     bool isElevationValid() const { return elev_valid_; }
+
+    // CostMap methods
+    void createCostMap(int width, int height, double resolution, double origin_x, double origin_y);
+    void setCost(int x, int y, float c);
+    float getCost(int x, int y) const;
+    bool getCostAt(double x, double y, float &val) const;
+    // void initCostMapFromElevation(); // Removed in favor of local ENU map
+    void buildLocalENUCostMap(double margin, double resolution);
 };
 #endif

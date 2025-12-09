@@ -295,19 +295,19 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
         ax = fig.add_subplot(111, projection='3d')
         
         # 绘制3D高程地形
-        if elevation_data is not None and elevation_extent is not None:
-            try:
-                xmin, xmax, ymin, ymax = elevation_extent
-                h, w = elevation_data.shape
-                x = np.linspace(xmin, xmax, w)
-                y = np.linspace(ymax, ymin, h)
-                X, Y = np.meshgrid(x, y)
+        # if elevation_data is not None and elevation_extent is not None:
+        #     try:
+        #         xmin, xmax, ymin, ymax = elevation_extent
+        #         h, w = elevation_data.shape
+        #         x = np.linspace(xmin, xmax, w)
+        #         y = np.linspace(ymax, ymin, h)
+        #         X, Y = np.meshgrid(x, y)
                 
-                # 使用 terrain colormap
-                ax.plot_surface(X, Y, elevation_data, cmap='terrain', alpha=0.5, linewidth=0, antialiased=False, zorder=0)
-                print("Plotted 3D elevation surface")
-            except Exception as e:
-                print(f"Warning: failed to plot 3D elevation: {e}")
+        #         # 使用 terrain colormap
+        #         ax.plot_surface(X, Y, elevation_data, cmap='terrain', alpha=0.5, linewidth=0, antialiased=False, zorder=0)
+        #         print("Plotted 3D elevation surface")
+        #     except Exception as e:
+        #         print(f"Warning: failed to plot 3D elevation: {e}")
                 
     else:
         ax = fig.add_subplot(111)

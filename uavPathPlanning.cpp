@@ -289,7 +289,7 @@ std::vector<WGS84Point> UavPathPlanner::enuToWGS84_Batch(const std::vector<ENUPo
 }
 
 // UavPathPlanner::runAltitudeOptimization: 现在只接受一个高程文件路径参数 (.tif 或 PGM)
-bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file)
+bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json &output_json, const json &input_json)
 {
     try {
         if (elev_file.empty()) return false;
@@ -302,6 +302,13 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file)
             std::cerr << "AltitudeOptimizer: failed to load elevation file: " << elev_file << "\n";
             return false;
         }
+
+        // Initialize CostMap from ElevationMap
+        // this->initCostMapFromElevation();
+        // Instead of copying the whole map (which is in WGS84), we build a local ENU costmap
+        // around the trajectory. This solves the coordinate system mismatch.
+        // Use a reasonable resolution (e.g. 10m) and margin (e.g. 200m)
+        this->buildLocalENUCostMap(200.0, 10.0);
 
         // build waypoint vector for optimizer from member Trajectory_ENU
         std::vector<Eigen::Vector3d> wpts;
@@ -319,6 +326,35 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file)
                 this->Trajectory_ENU[i].up = out_z[i];
             }
             std::cerr << "AltitudeOptimizer: optimized heights applied (" << out_z.size() << " points)\n";
+
+            std::cout << "--- Optimized Trajectory Heights ---" << std::endl;
+            for (size_t i = 0; i < out_z.size(); ++i) {
+                std::cout << "Point " << i << ": " << out_z[i] << " m" << std::endl;
+            }
+            std::cout << "------------------------------------" << std::endl;
+
+            // Update output_json
+            // 1. Convert updated ENU trajectory to WGS84
+            std::vector<WGS84Point> Trajectory_WGS84 = this->enuToWGS84_Batch(this->Trajectory_ENU, this->origin_);
+            
+            // 2. Update leader trajectory in output_json
+            this->putWGS84ToJson(output_json, "uav_leader_plane1", Trajectory_WGS84);
+            
+            // 3. Re-generate follower trajectories
+            InputData input_data;
+            json input_json_copy = input_json; // Make a copy because loadData takes non-const ref
+            if (this->loadData(input_data, input_json_copy)) {
+                 try {
+                    json plane_array = this->generateFollowerTrajectories(input_json_copy, input_data, this->Trajectory_ENU, Trajectory_WGS84);
+                    output_json["uav_plane1"] = plane_array;
+                    std::cerr << "AltitudeOptimizer: updated output_json with new trajectories.\n";
+                } catch (const std::exception &e) {
+                    std::cerr << "AltitudeOptimizer: failed to update follower trajectories: " << e.what() << std::endl;
+                }
+            } else {
+                 std::cerr << "AltitudeOptimizer: failed to parse input_json for follower update.\n";
+            }
+
             return true;
         } else {
             std::cerr << "AltitudeOptimizer: optimization failed\n";
@@ -520,7 +556,7 @@ bool UavPathPlanner::loadElevationData(const std::string &path)
   elev_valid_ = true;
   std::cerr << "ElevationMap: finished reading raster (width=" << elev_width_ << " height=" << elev_height_ << ")" << std::endl;
   // print a short summary of the map
-  printElevationInfo();
+//   printElevationInfo();
   return true;
 #else
   cerr << "ElevationMap: GDAL not available at build time. Cannot load TIFF.\n";
@@ -764,9 +800,23 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
     double wy = waypoints[i](1);
     double elev = 0.0;
     bool has_elev = false;
+    float celev;
     
-    if (this->getElevationAt(wx, wy, elev)) {
+    // Try CostMap first (which is now in ENU)
+    if (this->getCostAt(wx, wy, celev)) {
+        elev = static_cast<double>(celev);
         has_elev = true;
+    } else {
+        // Fallback to ElevationMap (need to convert ENU wx,wy to WGS84)
+        ENUPoint enu_pt;
+        enu_pt.east = wx;
+        enu_pt.north = wy;
+        enu_pt.up = 0.0;
+        WGS84Point wgs_pt = this->enuToWGS84(enu_pt, this->origin_);
+        
+        if (this->getElevationAt(wgs_pt.lon, wgs_pt.lat, elev)) {
+            has_elev = true;
+        }
     }
 
     if (has_elev) {
@@ -823,12 +873,27 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
   for (size_t i = 0; i < n; ++i) {
       double wx = waypoints[i](0);
       double wy = waypoints[i](1);
-      double elev;
-      if (this->getElevationAt(wx, wy, elev)) {
-          double min_h = elev + p.uav_R;
-          if (out_z[i] < min_h) {
-              out_z[i] = min_h;
+      float celev;
+      double min_h = -std::numeric_limits<double>::infinity();
+      
+      if (this->getCostAt(wx, wy, celev)) {
+          min_h = static_cast<double>(celev) + p.uav_R;
+      } else {
+          double elev;
+          // Fallback to ElevationMap (need to convert ENU wx,wy to WGS84)
+          ENUPoint enu_pt;
+          enu_pt.east = wx;
+          enu_pt.north = wy;
+          enu_pt.up = 0.0;
+          WGS84Point wgs_pt = this->enuToWGS84(enu_pt, this->origin_);
+
+          if (this->getElevationAt(wgs_pt.lon, wgs_pt.lat, elev)) {
+              min_h = elev + p.uav_R;
           }
+      }
+      
+      if (min_h > -std::numeric_limits<double>::infinity() && out_z[i] < min_h) {
+          out_z[i] = min_h;
       }
   }
 
@@ -1331,4 +1396,104 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
         std::cout << "high_list is empty." << std::endl;
     }
     return true;
+}
+
+// CostMap implementation merged into UavPathPlanner
+void UavPathPlanner::createCostMap(int width, int height, double resolution, double origin_x, double origin_y)
+{
+  cost_width_ = width; 
+  cost_height_ = height; 
+  cost_resolution_ = resolution; 
+  cost_origin_x_ = origin_x; 
+  cost_origin_y_ = origin_y;
+  cost_data_.assign(cost_width_ * cost_height_, -std::numeric_limits<float>::infinity());
+}
+
+void UavPathPlanner::setCost(int x, int y, float c)
+{
+  if (x < 0 || y < 0 || x >= cost_width_ || y >= cost_height_) return;
+  cost_data_[y * cost_width_ + x] = c;
+}
+
+float UavPathPlanner::getCost(int x, int y) const
+{
+  if (x < 0 || y < 0 || x >= cost_width_ || y >= cost_height_) return -std::numeric_limits<float>::infinity();
+  return cost_data_[y * cost_width_ + x];
+}
+
+bool UavPathPlanner::getCostAt(double x, double y, float &val) const
+{
+  // Assume top-left origin, x increases right, y decreases down (standard map)
+  int c = static_cast<int>(floor((x - cost_origin_x_) / cost_resolution_));
+  int r = static_cast<int>(floor((cost_origin_y_ - y) / cost_resolution_));
+  
+  if (c < 0 || c >= cost_width_ || r < 0 || r >= cost_height_) return false;
+  val = cost_data_[r * cost_width_ + c];
+  return true;
+}
+
+void UavPathPlanner::buildLocalENUCostMap(double margin, double resolution)
+{
+  if (!elev_valid_ || Trajectory_ENU.empty()) return;
+
+  // 1. Determine bounding box of the trajectory in ENU
+  double min_e = std::numeric_limits<double>::infinity();
+  double max_e = -std::numeric_limits<double>::infinity();
+  double min_n = std::numeric_limits<double>::infinity();
+  double max_n = -std::numeric_limits<double>::infinity();
+
+  for (const auto& p : Trajectory_ENU) {
+      if (p.east < min_e) min_e = p.east;
+      if (p.east > max_e) max_e = p.east;
+      if (p.north < min_n) min_n = p.north;
+      if (p.north > max_n) max_n = p.north;
+  }
+
+  // Add margin
+  min_e -= margin;
+  max_e += margin;
+  min_n -= margin;
+  max_n += margin;
+
+  // 2. Create CostMap grid in ENU
+  int w = static_cast<int>(std::ceil((max_e - min_e) / resolution));
+  int h = static_cast<int>(std::ceil((max_n - min_n) / resolution));
+  
+  // Ensure at least 1x1
+  if (w <= 0) w = 1;
+  if (h <= 0) h = 1;
+
+  createCostMap(w, h, resolution, min_e, max_n); // Origin is top-left (min_e, max_n)
+
+  std::cerr << "Building local ENU CostMap: " << w << "x" << h 
+            << " res=" << resolution 
+            << " origin=(" << min_e << "," << max_n << ")" << std::endl;
+
+  // 3. Fill CostMap by sampling ElevationMap
+  // Iterate over CostMap pixels (ENU), convert to WGS84, query ElevationMap
+  for (int r = 0; r < h; ++r) {
+      for (int c = 0; c < w; ++c) {
+          // Center of pixel in ENU
+          double enu_e = min_e + (c + 0.5) * resolution;
+          double enu_n = max_n - (r + 0.5) * resolution; // Y decreases down
+          
+          ENUPoint enu_pt;
+          enu_pt.east = enu_e;
+          enu_pt.north = enu_n;
+          enu_pt.up = 0.0; // Height doesn't matter for conversion to LatLon
+
+          WGS84Point wgs_pt = this->enuToWGS84(enu_pt, this->origin_);
+          
+          double elev_val = -std::numeric_limits<double>::infinity();
+          // Query ElevationMap (which is in WGS84)
+          // Note: getElevationAt expects x,y in the ElevationMap's CRS (WGS84 Lon/Lat)
+          if (this->getElevationAt(wgs_pt.lon, wgs_pt.lat, elev_val)) {
+              setCost(c, r, static_cast<float>(elev_val));
+          } else {
+              // If out of bounds of elevation map, set to -inf or some default
+              setCost(c, r, -std::numeric_limits<float>::infinity());
+          }
+      }
+  }
+  std::cerr << "Local ENU CostMap built." << std::endl;
 }
