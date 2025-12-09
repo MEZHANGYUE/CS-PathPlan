@@ -9,11 +9,23 @@
 #include <vector>
 #include<iostream>
 #include "math_util/minimum_snap.hpp"
-#include "math_util/altitude_optimizer.hpp"
+// #include "math_util/altitude_optimizer.hpp"
 #include <algorithm>
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
+
 using namespace std;
 using json = nlohmann::json;
 using namespace math_util;
+
+struct GeoTransform {
+  double origin_x; // top-left X
+  double pixel_w;  // pixel width (x resolution)
+  double rot_x;    // rotation
+  double origin_y; // top-left Y
+  double rot_y;
+  double pixel_h;  // pixel height (negative if north-up)
+};
 
 struct InputData
 {
@@ -115,6 +127,11 @@ public:
     WGS84Point enuToWGS84(const ENUPoint& enu, const WGS84Point& reference);
     std::vector<ENUPoint> wgs84ToENU_Batch(const std::vector<WGS84Point>& targets, const WGS84Point& reference);
     std::vector<WGS84Point> enuToWGS84_Batch(const std::vector<ENUPoint>& targets, const WGS84Point& reference);
+    WGS84Point ecefToWGS84(const ECEFPoint& ecef);
+    std::array<std::array<double, 3>, 3> computeENURotationMatrix(double lat_rad, double lon_rad);
+    std::array<std::array<double, 3>, 3> computeENURotationMatrixInverse(double lat_rad, double lon_rad);
+    ENUPoint ecefToENU(const ECEFPoint& delta_ecef, double ref_lat_rad, double ref_lon_rad);
+    ECEFPoint enuToECEF(const ENUPoint& enu, double ref_lat_rad, double ref_lon_rad);
 
     // 保存 JSON
     static inline bool saveJsonToFile(const json &j, const std::string &filename) {
@@ -144,12 +161,35 @@ private:
     // 内部辅助：从 JSON 读取 ENU 路径与 distance
     std::vector<ENUPoint> getENUFromJSON(const json& j, const std::string& key);
     double getDistanceFromJSON(const json& j, const std::string& key);
-    // 低级坐标辅助函数（封装到类内）
-    static ECEFPoint wgs84ToECEF(const WGS84Point& lla);
-    static WGS84Point ecefToWGS84(const ECEFPoint& ecef);
-    static std::array<std::array<double, 3>, 3> computeENURotationMatrix(double lat_rad, double lon_rad);
-    static std::array<std::array<double, 3>, 3> computeENURotationMatrixInverse(double lat_rad, double lon_rad);
-    static ENUPoint ecefToENU(const ECEFPoint& delta_ecef, double ref_lat_rad, double ref_lon_rad);
-    static ECEFPoint enuToECEF(const ENUPoint& enu, double ref_lat_rad, double ref_lon_rad);
+
+    // Altitude Optimization Params
+    struct AltitudeParams {
+        double lambda_smooth = 1.0; // smoothing weight
+        double lambda_follow = 10.0; // follow terrain weight (aim for z ~= elev + uav_R)
+        double max_climb_rate = 2.0; // max vertical change per horizontal meter (m/m)
+        double uav_R = 0.5; // UAV effective radius/height clearance (meters)
+    };
+
+    // Elevation Map Data
+    int elev_width_ = 0;
+    int elev_height_ = 0;
+    std::vector<float> elev_data_; // row-major, top-left origin
+    GeoTransform elev_geo_;
+    bool elev_valid_ = false;
+
+    // Helpers for elevation
+    bool performDownsampling(void* poDS_ptr, int full_w, int full_h, uint64_t bytes_needed, uint64_t target_bytes, const std::string& path);
+    bool getElevationAt(double x, double y, double &elev) const;
+    bool optimizeHeights(const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
+
+    // ECEF转经纬度（迭代法）
+    ECEFPoint wgs84ToECEF(const WGS84Point& lla);
+
+    // Altitude Optimization methods
+    bool loadElevationData(const std::string &path);
+    
+    // Elevation Map Info
+    void printElevationInfo() const;
+    bool isElevationValid() const { return elev_valid_; }
 };
 #endif

@@ -22,7 +22,6 @@ add_library(math_util
     math_util/linear_interpolation.cpp
     math_util/math_utils.cpp
     math_util/minimum_snap.cpp
-    math_util/altitude_optimizer.cpp
     )
 
 # minimum_snap.cpp now contains trajectory-generator and planner implementations
@@ -31,8 +30,8 @@ target_sources(math_util PRIVATE math_util/minimum_snap.cpp)
 target_link_libraries(algo math_util)
 target_link_libraries(math_util yaml-cpp)
 if (GDAL_FOUND)
-    target_include_directories(math_util PUBLIC ${GDAL_INCLUDE_DIRS})
-    target_link_libraries(math_util ${GDAL_LIBRARIES})
+    target_include_directories(algo PUBLIC ${GDAL_INCLUDE_DIRS})
+    target_link_libraries(algo ${GDAL_LIBRARIES})
     add_definitions(-DHAVE_GDAL)
 endif()
 

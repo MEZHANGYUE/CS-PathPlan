@@ -3,6 +3,8 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <chrono>
+#include <yaml-cpp/yaml.h>
 #include "uavPathPlanning.hpp"
 #include "math_util/minimum_snap.hpp"
 int main(int argc, char *argv[])
@@ -75,16 +77,51 @@ int main(int argc, char *argv[])
         std::cerr << "Failed to plan!" << std::endl;
     }
 
-    // if (!planner.runAltitudeOptimization("../data/neimeng.tif.ovr"))
-    // {
-    //     std::cerr << "Failed to Altitude Optimization!" << std::endl;
-    // }
-    // else
-    // {
-    //     std::cout << "output:" << std::endl;
-    //     std::string out_string = result_json.dump();
-    //     std::cout << out_string << std::endl;
-    // }
+    // Load configuration
+    std::string config_path = "../config.yaml";
+    bool altitude_opt_enabled = false;
+    std::string elevation_file;
+
+    try {
+        if (std::filesystem::exists(config_path)) {
+            YAML::Node config = YAML::LoadFile(config_path);
+            if (config["altitude_optimization"]) {
+                if (config["altitude_optimization"]["enabled"]) {
+                    altitude_opt_enabled = config["altitude_optimization"]["enabled"].as<bool>();
+                    std::cout << "altitude_opt_enabled: " << altitude_opt_enabled << std::endl;
+                }
+                if (config["altitude_optimization"]["elevation_file"]) {
+                    elevation_file = config["altitude_optimization"]["elevation_file"].as<std::string>();
+                } else {
+                    std::cerr << "Warning: 'elevation_file' parameter missing in " << config_path << std::endl;
+                }
+            }
+            std::cout << "Loaded config from " << config_path << std::endl;
+        } else {
+             std::cout << "Config file " << config_path << " not found." << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Warning: Failed to load config.yaml (" << e.what() << ")" << std::endl;
+    }
+
+    if (altitude_opt_enabled) {
+        if (!elevation_file.empty()) {
+            std::cout << "Running Altitude Optimization with file: " << elevation_file << std::endl;
+            auto start_time = std::chrono::high_resolution_clock::now();
+            if (!planner.runAltitudeOptimization(elevation_file))
+            {
+                std::cerr << "Failed to Altitude Optimization!" << std::endl;
+            }
+            auto end_time = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double> elapsed = end_time - start_time;
+            std::cout << "Altitude optimization time: " << elapsed.count() << "s" << std::endl;
+        } else {
+             std::cerr << "Altitude optimization enabled but no elevation file specified." << std::endl;
+        }
+    } else {
+        std::cout << "Altitude optimization skipped." << std::endl;
+    }
+
     // 保存到自动推断的输出路径
     planner.saveJsonToFile(result_json, output_path);
     

@@ -1,0 +1,3 @@
+altitude_optimization:
+  enabled: true
+  elevation_file: "../data/neimeng.tif"
