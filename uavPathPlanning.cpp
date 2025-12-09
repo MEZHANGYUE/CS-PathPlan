@@ -10,6 +10,7 @@
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
 #include <sys/stat.h>
+#include <iomanip> // Added for std::setprecision
 
 #ifdef HAVE_GDAL
 #include <gdal_priv.h>
@@ -308,7 +309,7 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
         // Instead of copying the whole map (which is in WGS84), we build a local ENU costmap
         // around the trajectory. This solves the coordinate system mismatch.
         // Use a reasonable resolution (e.g. 10m) and margin (e.g. 200m)
-        this->buildLocalENUCostMap(200.0, 10.0);
+        this->buildLocalENUCostMap(500.0, 10.0);
 
         // build waypoint vector for optimizer from member Trajectory_ENU
         std::vector<Eigen::Vector3d> wpts;
@@ -318,14 +319,62 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
             wpts.emplace_back(p.east, p.north, p.up);
         }
 
-        AltitudeParams params; // use defaults
+        AltitudeParams params;
+        // Try to load from config.yaml
+        std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
+        bool config_loaded = false;
+        for (const auto& config_path : config_paths) {
+            struct stat buffer;
+            if (stat(config_path.c_str(), &buffer) == 0) {
+                 try {
+                    YAML::Node config = YAML::LoadFile(config_path);
+                    if (config["altitude_optimization"]) {
+                        auto alt_conf = config["altitude_optimization"];
+                        if (alt_conf["uav_R"]) params.uav_R = alt_conf["uav_R"].as<double>();
+                        if (alt_conf["safe_distance"]) params.safe_distance = alt_conf["safe_distance"].as<double>();
+                        if (alt_conf["lambda_follow"]) params.lambda_follow = alt_conf["lambda_follow"].as<double>();
+                        if (alt_conf["lambda_smooth"]) params.lambda_smooth = alt_conf["lambda_smooth"].as<double>();
+                        if (alt_conf["max_climb_rate"]) params.max_climb_rate = alt_conf["max_climb_rate"].as<double>();
+                        std::cerr << "AltitudeOptimizer: loaded params from " << config_path << "\n";
+                        config_loaded = true;
+                        break;
+                    }
+                 } catch (const std::exception &e) {
+                     std::cerr << "AltitudeOptimizer: failed to parse " << config_path << ": " << e.what() << std::endl;
+                 }
+            }
+        }
+        
+        if (!config_loaded) {
+             std::cerr << "AltitudeOptimizer: config.yaml not found or invalid, using defaults.\n";
+        }
 
         std::vector<double> out_z;
         if (this->optimizeHeights(wpts, params, out_z)) {
+            // First pass applied to Trajectory_ENU
             for (size_t i = 0; i < out_z.size() && i < this->Trajectory_ENU.size(); ++i) {
                 this->Trajectory_ENU[i].up = out_z[i];
             }
-            std::cerr << "AltitudeOptimizer: optimized heights applied (" << out_z.size() << " points)\n";
+            std::cerr << "AltitudeOptimizer: first pass optimized heights applied (" << out_z.size() << " points)\n";
+
+            // Second pass: Global Smoothing
+            std::cerr << "AltitudeOptimizer: running second pass (global smoothing)...\n";
+            std::vector<double> out_z_smooth;
+            
+            // Adjust params for second pass
+            AltitudeParams params_smooth = params;
+            params_smooth.lambda_smooth *= 10.0; // Increase smoothing weight
+            params_smooth.max_climb_rate *= 0.5; // Stricter climb rate
+            
+            if (this->optimizeHeightsGlobalSmooth(out_z, wpts, params_smooth, out_z_smooth)) {
+                 out_z = out_z_smooth;
+                 for (size_t i = 0; i < out_z.size() && i < this->Trajectory_ENU.size(); ++i) {
+                    this->Trajectory_ENU[i].up = out_z[i];
+                 }
+                 std::cerr << "AltitudeOptimizer: second pass completed and applied.\n";
+            } else {
+                 std::cerr << "AltitudeOptimizer: second pass failed, keeping first pass results.\n";
+            }
 
             std::cout << "--- Optimized Trajectory Heights ---" << std::endl;
             for (size_t i = 0; i < out_z.size(); ++i) {
@@ -773,12 +822,6 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
   // For interior points i=1..n-2, add lambda_smooth * (L^T L) contributions
   if (n >= 3 && p.lambda_smooth > 0.0) {
     for (size_t i = 1; i + 1 < n; ++i) {
-      // entries for L^T L at rows/cols i-1,i,i+1
-      // contribution: [1 -2 1]^T * [1 -2 1] scaled by lambda
-      // which yields a 3x3 block:
-      // [1 -2 1]
-      // [-2 4 -2]
-      // [1 -2 1]
       double s = p.lambda_smooth;
       trips.emplace_back(i-1, i-1, s * 1.0);
       trips.emplace_back(i-1, i,   s * -2.0);
@@ -822,7 +865,11 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
     if (has_elev) {
       double s = p.lambda_follow;
       // follow target is terrain + UAV clearance (uav_R)
-      double target = elev + p.uav_R;
+      // If original height is already safe (higher than elev + safe_distance), use original height as target
+      // to avoid pulling the drone down unnecessarily.
+      double safe_h = elev + p.safe_distance;
+      double target = std::max(waypoints[i](2), safe_h);
+      
       trips.emplace_back(i, i, s);
       b(i) += s * target;
     }
@@ -877,7 +924,7 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
       double min_h = -std::numeric_limits<double>::infinity();
       
       if (this->getCostAt(wx, wy, celev)) {
-          min_h = static_cast<double>(celev) + p.uav_R;
+          min_h = static_cast<double>(celev) + p.safe_distance;
       } else {
           double elev;
           // Fallback to ElevationMap (need to convert ENU wx,wy to WGS84)
@@ -888,7 +935,7 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
           WGS84Point wgs_pt = this->enuToWGS84(enu_pt, this->origin_);
 
           if (this->getElevationAt(wgs_pt.lon, wgs_pt.lat, elev)) {
-              min_h = elev + p.uav_R;
+              min_h = elev + p.safe_distance;
           }
       }
       
@@ -898,6 +945,120 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
   }
 
   return true;
+}
+
+bool UavPathPlanner::optimizeHeightsGlobalSmooth(const std::vector<double> &input_z,
+                                                 const std::vector<Eigen::Vector3d> &waypoints,
+                                                 const AltitudeParams &p,
+                                                 std::vector<double> &out_z)
+{
+    auto start_time = std::chrono::high_resolution_clock::now();
+    size_t n = input_z.size();
+    if (n == 0 || waypoints.size() != n) return false;
+
+    // Iterative approach to handle inequality constraint z >= input_z
+    // We solve unconstrained (w.r.t inequality) first, then add penalties for violations
+    
+    std::vector<double> current_z = input_z; // Start with input
+    std::vector<bool> active_constraints(n, false);
+    
+    // Max iterations
+    int max_iter = 10;
+    
+    for (int iter = 0; iter < max_iter; ++iter) {
+        Eigen::SparseMatrix<double> H(n, n);
+        std::vector<Eigen::Triplet<double>> trips;
+        Eigen::VectorXd b = Eigen::VectorXd::Zero(n);
+
+        // 1. Smoothing term (minimize 2nd derivative)
+        if (n >= 3 && p.lambda_smooth > 0.0) {
+            for (size_t i = 1; i + 1 < n; ++i) {
+                double s = p.lambda_smooth;
+                trips.emplace_back(i-1, i-1, s * 1.0);
+                trips.emplace_back(i-1, i,   s * -2.0);
+                trips.emplace_back(i-1, i+1, s * 1.0);
+
+                trips.emplace_back(i, i-1,   s * -2.0);
+                trips.emplace_back(i, i,     s * 4.0);
+                trips.emplace_back(i, i+1,   s * -2.0);
+
+                trips.emplace_back(i+1, i-1, s * 1.0);
+                trips.emplace_back(i+1, i,   s * -2.0);
+                trips.emplace_back(i+1, i+1, s * 1.0);
+            }
+        }
+
+        // 2. Climb rate term (minimize 1st derivative)
+        if (p.max_climb_rate > 0.0) {
+            for (size_t i = 0; i + 1 < n; ++i) {
+                double x0 = waypoints[i](0), y0 = waypoints[i](1);
+                double x1 = waypoints[i+1](0), y1 = waypoints[i+1](1);
+                double dist = std::hypot(x1 - x0, y1 - y0);
+                if (dist <= 1e-9) continue;
+                double denom = (dist * p.max_climb_rate);
+                if (denom <= 1e-12) continue;
+                double w = 1.0 / (denom * denom); 
+                trips.emplace_back(i, i,     w);
+                trips.emplace_back(i, i+1,  -w);
+                trips.emplace_back(i+1, i,  -w);
+                trips.emplace_back(i+1, i+1, w);
+            }
+        }
+
+        // 3. Fix start and end points (Hard constraints via penalty or direct elimination)
+        // Here using very large penalty to approximate hard constraint
+        double fix_weight = 1e10;
+        trips.emplace_back(0, 0, fix_weight);
+        b(0) += fix_weight * input_z[0];
+        
+        trips.emplace_back(n-1, n-1, fix_weight);
+        b(n-1) += fix_weight * input_z[n-1];
+
+        // 4. Inequality constraints (z >= input_z) via penalty for active set
+        double constraint_weight = 1e8;
+        for (size_t i = 1; i < n - 1; ++i) {
+            if (active_constraints[i]) {
+                trips.emplace_back(i, i, constraint_weight);
+                b(i) += constraint_weight * input_z[i];
+            }
+        }
+
+        // Regularization
+        for (size_t i = 0; i < n; ++i) trips.emplace_back(i, i, 1e-8);
+
+        H.setFromTriplets(trips.begin(), trips.end());
+        
+        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+        solver.compute(H);
+        if (solver.info() != Eigen::Success) return false;
+        Eigen::VectorXd z = solver.solve(b);
+        if (solver.info() != Eigen::Success) return false;
+
+        // Check violations
+        bool violation = false;
+        for (size_t i = 0; i < n; ++i) {
+            current_z[i] = z(i);
+            if (current_z[i] < input_z[i] - 1e-3) { // Tolerance
+                if (!active_constraints[i]) {
+                    active_constraints[i] = true;
+                    violation = true;
+                }
+            }
+        }
+
+        if (!violation) break; // Converged
+    }
+
+    // Final check to ensure strictly >= input_z
+    for (size_t i = 0; i < n; ++i) {
+        if (current_z[i] < input_z[i]) current_z[i] = input_z[i];
+    }
+    
+    out_z = current_z;
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    std::cerr << "AltitudeOptimizer: second pass (global smoothing) took " << elapsed.count() << "s\n";
+    return true;
 }
 
 
@@ -1338,7 +1499,7 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
     }
     if (input_json["ready_zone"].size() != 0)
     {
-        auto value = input_json["ready_zone"];
+               auto value = input_json["ready_zone"];
         for (const auto &iter : value)
         {
             input_data.ready_zone.emplace_back(WGS84Coord(iter[0], iter[1], 0.0));
@@ -1432,7 +1593,7 @@ bool UavPathPlanner::getCostAt(double x, double y, float &val) const
   return true;
 }
 
-void UavPathPlanner::buildLocalENUCostMap(double margin, double resolution)
+void UavPathPlanner::buildLocalENUCostMap(double margin, double resolution)//margin:边距参数,扩大局部地图覆盖范围
 {
   if (!elev_valid_ || Trajectory_ENU.empty()) return;
 
@@ -1465,9 +1626,13 @@ void UavPathPlanner::buildLocalENUCostMap(double margin, double resolution)
 
   createCostMap(w, h, resolution, min_e, max_n); // Origin is top-left (min_e, max_n)
 
-  std::cerr << "Building local ENU CostMap: " << w << "x" << h 
+  std::cerr << std::fixed << std::setprecision(15)
+            << "Building local ENU CostMap: " << w << "x" << h 
             << " res=" << resolution 
-            << " origin=(" << min_e << "," << max_n << ")" << std::endl;
+            << " origin=(" << min_e << "," << max_n << ")" 
+            << " Ref(Lon,Lat)=(" << this->origin_.lon << "," << this->origin_.lat << ")"
+            << std::endl;
+  std::cerr.unsetf(std::ios::fixed);
 
   // 3. Fill CostMap by sampling ElevationMap
   // Iterate over CostMap pixels (ENU), convert to WGS84, query ElevationMap

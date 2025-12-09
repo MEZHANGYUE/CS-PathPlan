@@ -42,25 +42,22 @@ def setup_chinese_font():
         plt.rcParams['font.family'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 
 
-def load_tiff_elevation(path, target_size=(200, 200)):
-    """Load TIFF elevation data, downsample, and extract extent from GeoTIFF tags."""
+def load_tiff_elevation(path, max_dim=2000):
+    """Load TIFF elevation data, optionally downsample if too large, and extract extent."""
     try:
         img = Image.open(path)
         
         # Extract GeoTIFF tags
-        # 33550: ModelPixelScaleTag (ScaleX, ScaleY, ScaleZ)
-        # 33922: ModelTiepointTag (I, J, K, X, Y, Z)
         tags = img.tag_v2
         extent = None
         if 33550 in tags and 33922 in tags:
             scale = tags[33550]
             tiepoint = tags[33922]
             
-            # tiepoint format: (I, J, K, X, Y, Z)
             origin_x = tiepoint[3]
             origin_y = tiepoint[4]
             pixel_w = scale[0]
-            pixel_h = -scale[1] # Y axis is usually inverted in images
+            pixel_h = -scale[1] 
             
             w, h = img.size
             xmin = origin_x
@@ -68,17 +65,22 @@ def load_tiff_elevation(path, target_size=(200, 200)):
             ymin = origin_y + pixel_h * h
             ymax = origin_y 
             
-            # Ensure ymin < ymax
             if ymin > ymax:
                 ymin, ymax = ymax, ymin
                 
             extent = [xmin, xmax, ymin, ymax]
-            print(f"Loaded TIFF elevation with extent: {extent}")
+            print(f"Loaded TIFF elevation with extent: {extent}, original size: {w}x{h}")
             
-        # Resize image for 3D plotting performance
-        img_resized = img.resize(target_size, Image.BILINEAR)
-        data = np.array(img_resized)
-        
+        # Resize if too large to save memory/time
+        w, h = img.size
+        if w > max_dim or h > max_dim:
+            ratio = min(max_dim / w, max_dim / h)
+            new_w = int(w * ratio)
+            new_h = int(h * ratio)
+            img = img.resize((new_w, new_h), Image.BILINEAR)
+            print(f"Resized elevation data to {new_w}x{new_h}")
+            
+        data = np.array(img)
         return data, extent
     except Exception as e:
         print(f"Error loading TIFF elevation: {e}")
@@ -295,19 +297,79 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
         ax = fig.add_subplot(111, projection='3d')
         
         # 绘制3D高程地形
-        # if elevation_data is not None and elevation_extent is not None:
-        #     try:
-        #         xmin, xmax, ymin, ymax = elevation_extent
-        #         h, w = elevation_data.shape
-        #         x = np.linspace(xmin, xmax, w)
-        #         y = np.linspace(ymax, ymin, h)
-        #         X, Y = np.meshgrid(x, y)
+        if elevation_data is not None and elevation_extent is not None:
+            try:
+                xmin, xmax, ymin, ymax = elevation_extent
+                h, w = elevation_data.shape
                 
-        #         # 使用 terrain colormap
-        #         ax.plot_surface(X, Y, elevation_data, cmap='terrain', alpha=0.5, linewidth=0, antialiased=False, zorder=0)
-        #         print("Plotted 3D elevation surface")
-        #     except Exception as e:
-        #         print(f"Warning: failed to plot 3D elevation: {e}")
+                # 计算轨迹包围盒
+                all_coords = []
+                if waypoints: all_coords.extend(waypoints)
+                if leader_traj: all_coords.extend(leader_traj)
+                if plane_trajs:
+                    for _, pts in plane_trajs:
+                        all_coords.extend(pts)
+                
+                crop_xmin, crop_xmax, crop_ymin, crop_ymax = xmin, xmax, ymin, ymax
+                
+                if all_coords:
+                    xs = [p[0] for p in all_coords]
+                    ys = [p[1] for p in all_coords]
+                    if xs and ys:
+                        t_xmin, t_xmax = min(xs), max(xs)
+                        t_ymin, t_ymax = min(ys), max(ys)
+                        # 增加 10% 边距
+                        # pad_x = max((t_xmax - t_xmin) * 0.1, 0.002)
+                        # pad_y = max((t_ymax - t_ymin) * 0.1, 0.002)
+                        pad_x = (t_xmax - t_xmin)*0.8
+                        pad_y = (t_ymax - t_ymin)*0.8
+                        # 与地图范围求交集
+                        crop_xmin = max(xmin, t_xmin - pad_x)
+                        crop_xmax = min(xmax, t_xmax + pad_x)
+                        crop_ymin = max(ymin, t_ymin - pad_y)
+                        crop_ymax = min(ymax, t_ymax + pad_y)
+
+                if crop_xmax > crop_xmin and crop_ymax > crop_ymin:
+                    # 计算对应的索引范围
+                    # X: xmin -> xmax
+                    ix_start = int((crop_xmin - xmin) / (xmax - xmin) * w)
+                    ix_end = int((crop_xmax - xmin) / (xmax - xmin) * w)
+                    
+                    # Y: ymax -> ymin (图像行索引 0 对应 ymax)
+                    iy_start = int((ymax - crop_ymax) / (ymax - ymin) * h)
+                    iy_end = int((ymax - crop_ymin) / (ymax - ymin) * h)
+                    
+                    # 限制索引范围并确保至少 2x2
+                    ix_start = max(0, min(w - 2, ix_start))
+                    ix_end = max(ix_start + 2, min(w, ix_end))
+                    
+                    iy_start = max(0, min(h - 2, iy_start))
+                    iy_end = max(iy_start + 2, min(h, iy_end))
+                    
+                    # 重新计算实际的 crop 范围，以匹配调整后的索引
+                    real_crop_xmin = xmin + (ix_start / w) * (xmax - xmin)
+                    real_crop_xmax = xmin + (ix_end / w) * (xmax - xmin)
+                    real_crop_ymax = ymax - (iy_start / h) * (ymax - ymin)
+                    real_crop_ymin = ymax - (iy_end / h) * (ymax - ymin)
+
+                    if ix_end > ix_start and iy_end > iy_start:
+                        sub_data = elevation_data[iy_start:iy_end, ix_start:ix_end]
+                        
+                        # 生成网格
+                        sub_x = np.linspace(real_crop_xmin, real_crop_xmax, ix_end - ix_start)
+                        sub_y = np.linspace(real_crop_ymax, real_crop_ymin, iy_end - iy_start)
+                        X, Y = np.meshgrid(sub_x, sub_y)
+                        
+                        # 使用 terrain colormap
+                        ax.plot_surface(X, Y, sub_data, cmap='terrain', alpha=0.5, linewidth=0, antialiased=False, zorder=0)
+                        print(f"Plotted 3D elevation surface (grid: {sub_data.shape}, range: x[{real_crop_xmin:.4f}, {real_crop_xmax:.4f}], y[{real_crop_ymin:.4f}, {real_crop_ymax:.4f}])")
+                    else:
+                        print("Warning: Cropped elevation area is empty.")
+                else:
+                    print("Warning: Trajectory is outside elevation map extent.")
+
+            except Exception as e:
+                print(f"Warning: failed to plot 3D elevation: {e}")
                 
     else:
         ax = fig.add_subplot(111)

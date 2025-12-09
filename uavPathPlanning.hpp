@@ -197,9 +197,10 @@ private:
     // Altitude Optimization Params
     struct AltitudeParams {
         double lambda_smooth = 1.0; // smoothing weight
-        double lambda_follow = 10.0; // follow terrain weight (aim for z ~= elev + uav_R)
+        double lambda_follow = 0.0; // follow terrain weight (aim for z ~= elev + uav_R)
         double max_climb_rate = 2.0; // max vertical change per horizontal meter (m/m)
-        double uav_R = 0.5; // UAV effective radius/height clearance (meters)
+        double uav_R = 2.0; // UAV effective radius/height clearance (meters)
+        double safe_distance = 50.0; // Safe distance from terrain (meters)
     };
 
     // Elevation Map Data
@@ -221,6 +222,7 @@ private:
     bool performDownsampling(void* poDS_ptr, int full_w, int full_h, uint64_t bytes_needed, uint64_t target_bytes, const std::string& path);
     bool getElevationAt(double x, double y, double &elev) const;
     bool optimizeHeights(const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
+    bool optimizeHeightsGlobalSmooth(const std::vector<double> &input_z, const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
 
     // ECEF转经纬度（迭代法）
     ECEFPoint wgs84ToECEF(const WGS84Point& lla);

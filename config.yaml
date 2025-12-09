@@ -1,3 +1,8 @@
 altitude_optimization:
   enabled: true
   elevation_file: "../data/neimeng.tif"
+  lambda_smooth: 1.0
+  lambda_follow: 1.0
+  max_climb_rate: 0.5
+  uav_R: 2.0
+  safe_distance: 50.0
