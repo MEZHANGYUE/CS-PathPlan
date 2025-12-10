@@ -321,8 +321,8 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
                         # 增加 10% 边距
                         # pad_x = max((t_xmax - t_xmin) * 0.1, 0.002)
                         # pad_y = max((t_ymax - t_ymin) * 0.1, 0.002)
-                        pad_x = (t_xmax - t_xmin)*0.8
-                        pad_y = (t_ymax - t_ymin)*0.8
+                        pad_x = (t_xmax - t_xmin)*0.1
+                        pad_y = (t_ymax - t_ymin)*0.1
                         # 与地图范围求交集
                         crop_xmin = max(xmin, t_xmin - pad_x)
                         crop_xmax = min(xmax, t_xmax + pad_x)
@@ -536,12 +536,28 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
     except Exception:
         pass
 
-    # 3D 不支持 axis('equal') 的通用实现，这里仅在 2D 时使用
+    # 设置比例尺
     if not need_3d:
         try:
             ax.set_aspect('equal', 'box')
         except Exception:
             pass
+    else:
+        try:
+            # 获取当前的坐标轴范围
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            
+            x_range = abs(xlim[1] - xlim[0])
+            y_range = abs(ylim[1] - ylim[0])
+            
+            # 设置 Box Aspect，使 X 和 Y 轴的比例与数据范围一致
+            # Z 轴设置为 X 和 Y 范围的较小值，以保持适当的视觉高度
+            # 这样可以保证经纬度的比例尺一致，即 X 和 Y 轴单位长度代表的物理距离（度数）在视觉上相等
+            if x_range > 0 and y_range > 0:
+                ax.set_box_aspect((x_range, y_range, min(x_range, y_range)))
+        except Exception as e:
+            print(f"Warning: failed to set 3D aspect ratio: {e}")
 
     plt.tight_layout()
     # 如果指定了保存路径，先保存图像
@@ -621,7 +637,7 @@ def auto_detect_files(base_path):
     
     return input_file, output_file
 
-def main(file_path):
+def main(file_path, mode='both'):
     """主函数，智能匹配输入输出文件"""
     
     # 设置中文字体（在绘图前调用）
@@ -678,16 +694,7 @@ def main(file_path):
     # 从文件名中提取 UAV 编号用于标题
     uav_id = os.path.basename(file_path).split('_')[0]
 
-    # 可视化
-    print("Generating visualization...")
-    # 默认把图像保存到与输出 JSON 同名的 PNG 文件
-    try:
-        save_path = os.path.splitext(output_file)[0] + '.png'
-    except Exception:
-        save_path = None
-    if save_path:
-        print(f"Will save plot to: {save_path}")
-    # 尝试加载 data 目录下的 neimeng 高程 PGM，并解析 aux.xml 获取 GeoTransform
+    # 准备高程数据
     bg_img = None
     bg_extent = None
     elevation_data = None
@@ -701,14 +708,42 @@ def main(file_path):
     # Load .tif.ovr for 3D elevation
     ovr_path = os.path.join(data_dir, 'neimeng.tif.ovr')
     if os.path.exists(ovr_path):
-        print(f"Loading 3D elevation data from: {ovr_path}")
+        print(f"Loading elevation data from: {ovr_path}")
         elevation_data, elevation_extent = load_tiff_elevation(ovr_path)
-    
-    # PGM loading disabled to use OVR for 2D background
-    # pgm_path = os.path.join(data_dir, 'neimeng.tif.band1.pgm')
-    # ... (PGM loading logic removed)
 
-    plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path, bg_img=bg_img, bg_extent=bg_extent, elevation_data=elevation_data, elevation_extent=elevation_extent)
+    # 确定要生成的模式
+    tasks = []
+    if mode == 'both':
+        tasks.append(('2d', False))
+        tasks.append(('3d', True))
+    elif mode == '2d':
+        tasks.append(('2d', False))
+    elif mode == '3d':
+        tasks.append(('3d', True))
+    else:
+        # 默认 fallback
+        tasks.append(('2d', False))
+        tasks.append(('3d', True))
+
+    base_save_path = os.path.splitext(output_file)[0]
+
+    for suffix, is_3d in tasks:
+        print(f"\nGenerating {suffix.upper()} visualization...")
+        save_path = f"{base_save_path}_{suffix}.png"
+        print(f"Will save plot to: {save_path}")
+        
+        plot_path_and_trajectory(
+            waypoints=waypoints, 
+            leader_traj=leader_traj if leader_traj else None, 
+            plane_trajs=plane_trajs, 
+            title=f"{uav_id} Path Planning and Execution Trajectory ({suffix.upper()})", 
+            save_path=save_path, 
+            plot_3d=is_3d, 
+            bg_img=bg_img, 
+            bg_extent=bg_extent, 
+            elevation_data=elevation_data, 
+            elevation_extent=elevation_extent
+        )
 
 def analyze_data_structure(filename):
     """分析JSON文件数据结构（用于调试）"""
@@ -750,7 +785,7 @@ def print_usage():
 
 if __name__ == "__main__":
     # 支持可选的第二个参数来强制 3D/2D：
-    #   python3 visible.py <file>            -> 自动检测 2D/3D
+    #   python3 visible.py <file>            -> 生成 2D 和 3D
     #   python3 visible.py <file> 3d|--3d    -> 强制 3D
     #   python3 visible.py <file> 2d|--2d    -> 强制 2D
     if len(sys.argv) < 2 or len(sys.argv) > 3:
@@ -759,67 +794,14 @@ if __name__ == "__main__":
         sys.exit(1)
 
     file_path = sys.argv[1]
-    force_3d = None
+    mode = 'both'
     if len(sys.argv) == 3:
         flag = sys.argv[2].lower()
         if flag in ('3d', '--3d'):
-            force_3d = True
+            mode = '3d'
         elif flag in ('2d', '--2d'):
-            force_3d = False
+            mode = '2d'
         else:
-            print(f"Warning: unknown flag '{sys.argv[2]}', ignoring and using auto-detect")
-            force_3d = None
-
-    # 如果不强制指定，则直接使用 main 的自动检测流程
-    if force_3d is None:
-        # 如果需要分析数据结构，取消下面的注释
-        # analyze_data_structure(f"{file_path}_input.json")
-        # analyze_data_structure(f"{file_path}_output.json")
-        main(file_path)
-    else:
-        # 强制 3D/2D：读取同 main 的文件并传入 plot_3d 标志
-        setup_chinese_font()
-        input_file, output_file = auto_detect_files(file_path)
-        if not input_file:
-            print("Error: Input file not found")
-            print_usage()
-            sys.exit(1)
-        if not output_file:
-            print("Error: Output file not found")
-            sys.exit(1)
-
-        input_data = read_json_file(input_file)
-        output_data = read_json_file(output_file)
-        waypoints = extract_coordinates(input_data, "leader_midway_point_wgs84")
-        leader_traj = extract_coordinates(output_data, "uav_leader_plane1")
-        plane_trajs = extract_all_plane_trajectories(output_data)
-
-        uav_id = os.path.basename(file_path).split('_')[0]
-        try:
-            save_path = os.path.splitext(output_file)[0] + '.png'
-        except Exception:
-            save_path = None
-
-        # Load elevation data if needed (especially for 3D)
-        elevation_data = None
-        elevation_extent = None
-        bg_img = None
-        bg_extent = None
-        
-        data_dir = os.path.join(os.path.dirname(__file__), 'data')
-        if not os.path.isdir(data_dir):
-            data_dir = './data'
-            
-        # Always load OVR for both 2D and 3D
-        ovr_path = os.path.join(data_dir, 'neimeng.tif.ovr')
-        if os.path.exists(ovr_path):
-            print(f"Loading elevation data from: {ovr_path}")
-            elevation_data, elevation_extent = load_tiff_elevation(ovr_path)
-        
-        # PGM loading disabled
-        # pgm_path = os.path.join(data_dir, 'neimeng.tif.band1.pgm')
-        # if os.path.exists(pgm_path):
-        #      bg_img = load_pgm_image(pgm_path)
-
-        print(f"Generating {'3D' if force_3d else '2D'} visualization (forced)...")
-        plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path, plot_3d=force_3d, elevation_data=elevation_data, elevation_extent=elevation_extent)
+            print(f"Warning: unknown flag '{sys.argv[2]}', ignoring and using 'both'")
+    
+    main(file_path, mode=mode)

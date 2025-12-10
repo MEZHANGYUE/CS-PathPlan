@@ -187,6 +187,23 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
         }
     }
 
+    // 计算最大爬升/下降率
+    double max_climb_rate = 0.0;
+    for (size_t i = 0; i < samples.size() - 1; ++i) {
+        double dx = samples[i+1](0) - samples[i](0);
+        double dy = samples[i+1](1) - samples[i](1);
+        double dz = std::abs(samples[i+1](2) - samples[i](2));
+        double horizontal_dist = std::sqrt(dx*dx + dy*dy);
+
+        if (horizontal_dist > 1e-6) {
+            double rate = dz / horizontal_dist;
+            if (rate > max_climb_rate) {
+                max_climb_rate = rate;
+            }
+        }
+    }
+    std::cout << "Trajectory Max Climb/Descent Rate: " << max_climb_rate << std::endl;
+
     // 转换为矩阵输出
     Eigen::MatrixXd out(samples.size(), 3);
     for (size_t i = 0; i < samples.size(); ++i) {
