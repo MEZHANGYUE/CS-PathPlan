@@ -101,7 +101,21 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
 
 
     // 调用闭式解求解多项式系数
-    Eigen::MatrixXd polyCoeff = SolveQPClosedForm(order, Path, Vel, Acc, Time, path_weight, vel_zero_weight);
+    Eigen::MatrixXd polyCoeff;
+    double max_dev = 0.0;
+    int max_iter = 10;
+    int iter = 0;
+    while (true) {
+        polyCoeff = SolveQPClosedForm(order, Path, Vel, Acc, Time, path_weight, vel_zero_weight, &max_dev);
+        if (max_dev > 2000.0 && iter < max_iter) {
+            if (vel_zero_weight < 1e-6) vel_zero_weight = 0.01;
+            else vel_zero_weight *= 2.0;
+            std::cout << "Iteration " << iter+1 << ": max_dev=" << max_dev << " > 2000. Increasing vel_zero_weight to " << vel_zero_weight << std::endl;
+            iter++;
+        } else {
+            break;
+        }
+    }
 
     // 多项式次数与每段系数个数
     const int p_order = 2 * order - 1;
@@ -207,7 +221,8 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
         const Eigen::MatrixXd &Acc,
     const Eigen::VectorXd &Time,
     double path_weight,
-    double vel_zero_weight) {
+    double vel_zero_weight,
+    double *max_deviation) {
 
     const int p_order = 2 * order - 1;//多项式的最高次数 p^(p_order)t^(p_order) + ...
     const int p_num1d = p_order + 1;//每一段轨迹的变量个数，对于五阶多项式为：p5, p4, ... p0
@@ -412,10 +427,6 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
                     best_t = tt;
                 }
             }
-
-            // 输出该段的最远距离（以米为单位），便于调试
-            // std::cout << "segment " << k << " max deviation (m): " << std::sqrt(best_dist2) << std::endl;
-
             // construct Phi at best_t and add sample-based penalty
             Eigen::VectorXd phi_best(p_num1d);
             for (int i = 0; i < p_num1d; ++i) phi_best(i) = std::pow(best_t, p_order - i);
@@ -449,9 +460,6 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
 
     // 打印 path_weight, 原始 Q 矩阵（Q_original）与添加的 A 矩阵
     std::cout << "path_weight: " << path_weight << std::endl;
-    // std::cout << "Q_original: \n" << Q_original << std::endl;
-    // std::cout << "A (added block, may be zero if path_weight==0): \n" << A << std::endl;
-
     // 速度软惩罚（将路径点处速度压向0）：如果设定了 vel_zero_weight，则构造速度惩罚矩阵 V 并加入 Q
     MatrixXd V = MatrixXd::Zero(number_coefficients, number_coefficients);
     if (vel_zero_weight > 0.0) {
@@ -574,6 +582,7 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
     }
 
     // 在得到最终的 Px,Py,Pz 后，评估并打印每段在之前记录的 t* 处的最终偏差
+    double current_max_dev = 0.0;
     for (int k = 0; k < number_segments; ++k) {
         double best_t = 0.0;
         if (k < (int)seg_best_t.size()) best_t = seg_best_t[k];
@@ -590,12 +599,14 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
         double T = Time(k);
         Eigen::Vector3d Lbest = P0 + (best_t / T) * (P1 - P0);
         double dist_after = std::sqrt((Eigen::Vector3d(x_final,y_final,z_final) - Lbest).squaredNorm());
+        if (dist_after > current_max_dev) current_max_dev = dist_after;
         double dist_before = 0.0;
         if (k < (int)seg_best_dist2_before.size()) dist_before = std::sqrt(seg_best_dist2_before[k]);
 
         std::cout << "segment " << k << " max deviation before(m): " << dist_before
                   << ", after(m): " << dist_after << std::endl;
     }
+    if (max_deviation) *max_deviation = current_max_dev;
 
     for (int i = 0; i < number_segments; ++i) {
         for (int j = 0; j < 3; ++j) {

@@ -22,7 +22,8 @@ public:
             const Eigen::MatrixXd &Acc,
         const Eigen::VectorXd &Time,
         double path_weight = 0.0,
-        double vel_zero_weight = 0.0);
+        double vel_zero_weight = 0.0,
+        double *max_deviation = nullptr);
 
     // 生成完整轨迹并返回采样点矩阵 (N x 3)。
     // Path: (M x 3) 路径点矩阵
