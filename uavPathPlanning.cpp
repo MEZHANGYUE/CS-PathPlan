@@ -299,6 +299,8 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
             return false;
         }
 
+        // Filter Trajectory_ENU logic removed as per request (filtering input points instead)
+
         if (!this->loadElevationData(elev_file)) {
             std::cerr << "AltitudeOptimizer: failed to load elevation file: " << elev_file << "\n";
             return false;
@@ -358,7 +360,7 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
             std::cerr << "AltitudeOptimizer: first pass optimized heights applied (" << out_z.size() << " points)\n";
 
             // Second pass: Global Smoothing
-            std::cerr << "AltitudeOptimizer: running second pass (global smoothing)...\n";
+            // std::cerr << "AltitudeOptimizer: running second pass (global smoothing)...\n";
             std::vector<double> out_z_smooth;
             
             // Adjust params for second pass
@@ -371,16 +373,16 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
                  for (size_t i = 0; i < out_z.size() && i < this->Trajectory_ENU.size(); ++i) {
                     this->Trajectory_ENU[i].up = out_z[i];
                  }
-                 std::cerr << "AltitudeOptimizer: second pass completed and applied.\n";
+                //  std::cerr << "AltitudeOptimizer: second pass completed and applied.\n";
             } else {
                  std::cerr << "AltitudeOptimizer: second pass failed, keeping first pass results.\n";
             }
 
-            std::cout << "--- Optimized Trajectory Heights ---" << std::endl;
-            for (size_t i = 0; i < out_z.size(); ++i) {
-                std::cout << "Point " << i << ": " << out_z[i] << " m" << std::endl;
-            }
-            std::cout << "------------------------------------" << std::endl;
+            // std::cout << "--- Optimized Trajectory Heights ---" << std::endl;
+            // for (size_t i = 0; i < out_z.size(); ++i) {
+            //     std::cout << "Point " << i << ": " << out_z[i] << " m" << std::endl;
+            // }
+            // std::cout << "------------------------------------" << std::endl;
 
             // Update output_json
             // 1. Convert updated ENU trajectory to WGS84
@@ -1143,6 +1145,33 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D)
         std::cerr << "Successfully load intput json data." << std::endl;
     }
     Enu_waypoint = this->getENUFromJSON(input_json,"leader_midway_point_wgs84"); //
+
+    // Filter Enu_waypoint to remove points too close to the next one
+    if (Enu_waypoint.size() > 1) {
+        std::vector<ENUPoint> filtered_wpts;
+        filtered_wpts.reserve(Enu_waypoint.size());
+        double min_dist = 200.0; // Minimum distance in meters for waypoints
+
+        for (size_t i = 0; i < Enu_waypoint.size() - 1; ++i) {
+            const auto& p1 = Enu_waypoint[i];
+            const auto& p2 = Enu_waypoint[i+1];
+            double dist2d = std::hypot(p1.east - p2.east, p1.north - p2.north);
+            
+            if (dist2d > min_dist) {
+                filtered_wpts.push_back(p1);
+            } else {
+                std::cerr << "getPlan: merging waypoint " << i << " to next (dist=" << dist2d << "m)\n";
+            }
+        }
+        filtered_wpts.push_back(Enu_waypoint.back()); // Always keep the last point
+        
+        if (filtered_wpts.size() < Enu_waypoint.size()) {
+            std::cerr << "getPlan: filtered waypoints from " << Enu_waypoint.size() 
+                      << " to " << filtered_wpts.size() << " points.\n";
+            Enu_waypoint = filtered_wpts;
+        }
+    }
+
     distance  = this->getDistanceFromJSON(input_json,"distance_points");
     // 支持从输入 JSON 中指定平均速度（key: "leader_speed"），兼容旧键 "V_avg" / "v_avg"
     double leader_speed = -1.0;
@@ -1627,9 +1656,9 @@ void UavPathPlanner::buildLocalENUCostMap(double margin, double resolution)//mar
   createCostMap(w, h, resolution, min_e, max_n); // Origin is top-left (min_e, max_n)
 
   std::cerr << std::fixed << std::setprecision(15)
-            << "Building local ENU CostMap: " << w << "x" << h 
-            << " res=" << resolution 
-            << " origin=(" << min_e << "," << max_n << ")" 
+            // << "Building local ENU CostMap: " << w << "x" << h 
+            // << " res=" << resolution 
+            // << " origin=(" << min_e << "," << max_n << ")" 
             << " Ref(Lon,Lat)=(" << this->origin_.lon << "," << this->origin_.lat << ")"
             << std::endl;
   std::cerr.unsetf(std::ios::fixed);

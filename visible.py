@@ -375,16 +375,84 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
         ax = fig.add_subplot(111)
 
     # 绘制背景高程图（如果提供）
-    if bg_img is not None and bg_extent is not None and not need_3d:
-        try:
-            # 确保 bg_img 为二维数组
-            img = bg_img
-            if img.ndim == 3:
-                img = img[:, :, 0]
-            extent = bg_extent  # [xmin, xmax, ymin, ymax]
-            ax.imshow(img, cmap=bg_cmap, extent=extent, origin='upper', alpha=0.7, zorder=0)
-        except Exception as e:
-            print(f"Warning: failed to draw background elevation image: {e}")
+    # Modified: Use elevation_data (OVR) if available and crop to path range for 2D
+    if not need_3d:
+        img_to_plot = None
+        extent_to_plot = None
+        
+        if elevation_data is not None and elevation_extent is not None:
+            img_to_plot = elevation_data
+            extent_to_plot = elevation_extent
+        elif bg_img is not None and bg_extent is not None:
+            img_to_plot = bg_img
+            extent_to_plot = bg_extent
+            
+        if img_to_plot is not None and extent_to_plot is not None:
+            try:
+                # Ensure 2D array
+                if img_to_plot.ndim == 3:
+                    img_to_plot = img_to_plot[:, :, 0]
+
+                xmin, xmax, ymin, ymax = extent_to_plot
+                h, w = img_to_plot.shape
+                
+                # Calculate trajectory bounding box
+                all_coords = []
+                if waypoints: all_coords.extend(waypoints)
+                if leader_traj: all_coords.extend(leader_traj)
+                if plane_trajs:
+                    for _, pts in plane_trajs:
+                        all_coords.extend(pts)
+                
+                crop_xmin, crop_xmax, crop_ymin, crop_ymax = xmin, xmax, ymin, ymax
+                
+                if all_coords:
+                    xs = [p[0] for p in all_coords]
+                    ys = [p[1] for p in all_coords]
+                    if xs and ys:
+                        t_xmin, t_xmax = min(xs), max(xs)
+                        t_ymin, t_ymax = min(ys), max(ys)
+                        # Add 20% padding
+                        pad_x = (t_xmax - t_xmin) * 0.2
+                        pad_y = (t_ymax - t_ymin) * 0.2
+                        if pad_x == 0: pad_x = 0.01
+                        if pad_y == 0: pad_y = 0.01
+                        
+                        # Intersect with map extent
+                        crop_xmin = max(xmin, t_xmin - pad_x)
+                        crop_xmax = min(xmax, t_xmax + pad_x)
+                        crop_ymin = max(ymin, t_ymin - pad_y)
+                        crop_ymax = min(ymax, t_ymax + pad_y)
+
+                if crop_xmax > crop_xmin and crop_ymax > crop_ymin:
+                    # Calculate indices
+                    ix_start = int((crop_xmin - xmin) / (xmax - xmin) * w)
+                    ix_end = int((crop_xmax - xmin) / (xmax - xmin) * w)
+                    
+                    iy_start = int((ymax - crop_ymax) / (ymax - ymin) * h)
+                    iy_end = int((ymax - crop_ymin) / (ymax - ymin) * h)
+                    
+                    ix_start = max(0, min(w - 1, ix_start))
+                    ix_end = max(ix_start + 1, min(w, ix_end))
+                    iy_start = max(0, min(h - 1, iy_start))
+                    iy_end = max(iy_start + 1, min(h, iy_end))
+                    
+                    real_crop_xmin = xmin + (ix_start / w) * (xmax - xmin)
+                    real_crop_xmax = xmin + (ix_end / w) * (xmax - xmin)
+                    real_crop_ymax = ymax - (iy_start / h) * (ymax - ymin)
+                    real_crop_ymin = ymax - (iy_end / h) * (ymax - ymin)
+
+                    if ix_end > ix_start and iy_end > iy_start:
+                        sub_data = img_to_plot[iy_start:iy_end, ix_start:ix_end]
+                        ax.imshow(sub_data, cmap=bg_cmap, extent=[real_crop_xmin, real_crop_xmax, real_crop_ymin, real_crop_ymax], origin='upper', alpha=0.7, zorder=0)
+                        print(f"Plotted cropped background (range: x[{real_crop_xmin:.4f}, {real_crop_xmax:.4f}], y[{real_crop_ymin:.4f}, {real_crop_ymax:.4f}])")
+                    else:
+                         print("Warning: Cropped area empty")
+                else:
+                    # Fallback
+                    ax.imshow(img_to_plot, cmap=bg_cmap, extent=extent_to_plot, origin='upper', alpha=0.7, zorder=0)
+            except Exception as e:
+                print(f"Warning: failed to draw background elevation image: {e}")
 
     # 绘制路径点
     if waypoints:
@@ -636,58 +704,9 @@ def main(file_path):
         print(f"Loading 3D elevation data from: {ovr_path}")
         elevation_data, elevation_extent = load_tiff_elevation(ovr_path)
     
-    pgm_path = os.path.join(data_dir, 'neimeng.tif.band1.pgm')
-    aux_path = os.path.join(data_dir, 'neimeng.tif.aux.xml')
-    if os.path.exists(pgm_path):
-        print(f"Loading elevation image from: {pgm_path}")
-        img = load_pgm_image(pgm_path)
-        if img is not None:
-            bg_img = img
-            gt = parse_aux_xml_for_geotransform(aux_path) if os.path.exists(aux_path) else None
-            h, w = img.shape
-            if gt is not None:
-                origin_x = gt[0]
-                pixel_w = gt[1]
-                origin_y = gt[3]
-                pixel_h = gt[5]
-                xmin = origin_x
-                xmax = origin_x + pixel_w * w
-                # 根据 pixel_h 正负计算 ymin/ymax
-                if pixel_h < 0:
-                    ymax = origin_y
-                    ymin = origin_y + pixel_h * h
-                else:
-                    ymin = origin_y
-                    ymax = origin_y + pixel_h * h
-                bg_extent = [xmin, xmax, ymin, ymax]
-                print(f"Parsed GeoTransform from aux: extent={bg_extent}")
-            else:
-                # 根据数据中的点范围来推断 extent（略放大一点）
-                all_coords = []
-                if waypoints:
-                    all_coords += [(p[0], p[1]) for p in waypoints]
-                if leader_traj:
-                    all_coords += [(p[0], p[1]) for p in leader_traj]
-                for (_id, pts) in plane_trajs:
-                    all_coords += [(p[0], p[1]) for p in pts]
-                if all_coords:
-                    xs = [c[0] for c in all_coords]
-                    ys = [c[1] for c in all_coords]
-                    xmin, xmax = min(xs), max(xs)
-                    ymin, ymax = min(ys), max(ys)
-                    # 扩展一些边距
-                    padx = max(1e-6, (xmax - xmin) * 0.1)
-                    pady = max(1e-6, (ymax - ymin) * 0.1)
-                    bg_extent = [xmin - padx, xmax + padx, ymin - pady, ymax + pady]
-                    print(f"Using coordinates-derived extent for background: {bg_extent}")
-                else:
-                    # 无法确定坐标系，使用像素坐标范围
-                    bg_extent = [0, w, 0, h]
-                    print("No trajectory coordinates found; using pixel coordinates for elevation extent")
-        else:
-            print(f"Warning: failed to load PGM image: {pgm_path}")
-    else:
-        print(f"Elevation PGM not found at {pgm_path}, skipping background image")
+    # PGM loading disabled to use OVR for 2D background
+    # pgm_path = os.path.join(data_dir, 'neimeng.tif.band1.pgm')
+    # ... (PGM loading logic removed)
 
     plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path, bg_img=bg_img, bg_extent=bg_extent, elevation_data=elevation_data, elevation_extent=elevation_extent)
 
@@ -791,16 +810,16 @@ if __name__ == "__main__":
         if not os.path.isdir(data_dir):
             data_dir = './data'
             
-        if force_3d:
-            ovr_path = os.path.join(data_dir, 'neimeng.tif.ovr')
-            if os.path.exists(ovr_path):
-                print(f"Loading 3D elevation data from: {ovr_path}")
-                elevation_data, elevation_extent = load_tiff_elevation(ovr_path)
+        # Always load OVR for both 2D and 3D
+        ovr_path = os.path.join(data_dir, 'neimeng.tif.ovr')
+        if os.path.exists(ovr_path):
+            print(f"Loading elevation data from: {ovr_path}")
+            elevation_data, elevation_extent = load_tiff_elevation(ovr_path)
         
-        # Also load PGM for 2D fallback or if needed
-        pgm_path = os.path.join(data_dir, 'neimeng.tif.band1.pgm')
-        if os.path.exists(pgm_path):
-             bg_img = load_pgm_image(pgm_path)
+        # PGM loading disabled
+        # pgm_path = os.path.join(data_dir, 'neimeng.tif.band1.pgm')
+        # if os.path.exists(pgm_path):
+        #      bg_img = load_pgm_image(pgm_path)
 
         print(f"Generating {'3D' if force_3d else '2D'} visualization (forced)...")
         plot_path_and_trajectory(waypoints=waypoints, leader_traj=leader_traj if leader_traj else None, plane_trajs=plane_trajs, title=f"{uav_id} Path Planning and Execution Trajectory", save_path=save_path, plot_3d=force_3d, elevation_data=elevation_data, elevation_extent=elevation_extent)
