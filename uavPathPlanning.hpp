@@ -9,7 +9,6 @@
 #include <vector>
 #include<iostream>
 #include "math_util/minimum_snap.hpp"
-// #include "math_util/altitude_optimizer.hpp"
 #include <algorithm>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
@@ -31,6 +30,7 @@ struct InputData
 {
     double distance_points;
     double leader_speed = 30.0; // m/s, average speed override read from input JSON (formerly V_avg)
+    double min_turning_radius = 0.0; // Minimum turning radius constraint
     double leader_fly_high;
     int formation_model;
     int formation_using;
@@ -110,9 +110,11 @@ public:
     // Minisnap 轨迹生成接口
     std::vector<ENUPoint> Minisnap_3D(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0);
     std::vector<ENUPoint> Minisnap_EN(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0);
+    // Bezier 轨迹生成接口
+    std::vector<ENUPoint> Bezier_3D(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0, double min_radius = 0.0);
 
     // 主规划接口
-    bool getPlan(json &input_json, json &output_json, bool use3D = true);
+    bool getPlan(json &input_json, json &output_json, bool use3D = true, std::string algorithm = "minimum_snap");
     //高度优化接口
     bool runAltitudeOptimization(const std::string &elev_file, json &output_json, const json &input_json);
     // 辅助函数
@@ -121,6 +123,22 @@ public:
     json generateFollowerTrajectories(const json &input_json, const InputData &input_data,
                                       const std::vector<ENUPoint> &Trajectory_ENU,
                                       const std::vector<WGS84Point> &Trajectory_WGS84);
+
+    // 计算轨迹最小转弯半径
+    double calculateMinTurningRadius(const std::vector<ENUPoint>& path);
+
+    // 生成 arc-line-arc（相切圆 - 直线 - 相切圆）路径
+    // p0: 起点, heading0: 起点初始朝向（弧度）
+    // p1: 终点（中间点），p2: 用于确定 p1 的朝向（p1->p2 的方向为切线方向）
+    // radius: 相切圆半径（来自 config.yaml -> path_planning.min_turning_radius）
+    // resolution: 采样距离（米）
+    std::vector<ENUPoint> generateArcLineArc(const ENUPoint &p0, double heading0,
+                                             const ENUPoint &p1, const ENUPoint &p2,
+                                             double radius, double resolution = 1.0);
+
+    // 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
+    void computeTransitionAndRotatePatrol(const ENUPoint& p0, double heading0, double minR, double resolution, 
+                                          const std::vector<ENUPoint>& Patrol_Path, json& output_json);
 
     // 坐标变换
     ENUPoint wgs84ToENU(const WGS84Point& target, const WGS84Point& reference);
@@ -191,7 +209,7 @@ private:
     // 现在只输入高程文件路径（例如 .tif），函数直接使用类成员 Trajectory_ENU 进行高度优化
     // bool runAltitudeOptimization(const std::string &elev_file);
     // 内部辅助：从 JSON 读取 ENU 路径与 distance
-    std::vector<ENUPoint> getENUFromJSON(const json& j, const std::string& key);
+    std::vector<ENUPoint> getENUFromJSON(const json& j, const std::string& key1, const std::string& key2);
     double getDistanceFromJSON(const json& j, const std::string& key);
 
     // Altitude Optimization Params
@@ -241,5 +259,19 @@ private:
     bool getCostAt(double x, double y, float &val) const;
     // void initCostMapFromElevation(); // Removed in favor of local ENU map
     void buildLocalENUCostMap(double margin, double resolution);
+
+    json generateVShapeTrajectories(const json &uavs_ids, const json &uav_starts, 
+                                    const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
+                                    const std::vector<Eigen::Vector2d> &leader_xy, 
+                                    const std::vector<double> &leader_headings,
+                                    const std::vector<ENUPoint> &Trajectory_ENU,
+                                    double safety_distance);
+
+    json generateLineShapeTrajectories(const json &uavs_ids, const json &uav_starts, 
+                                       const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
+                                       const std::vector<Eigen::Vector2d> &leader_xy, 
+                                       const std::vector<double> &leader_headings,
+                                       const std::vector<ENUPoint> &Trajectory_ENU,
+                                       double safety_distance);
 };
 #endif

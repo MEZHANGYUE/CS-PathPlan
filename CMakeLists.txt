@@ -22,6 +22,7 @@ add_library(math_util
     math_util/linear_interpolation.cpp
     math_util/math_utils.cpp
     math_util/minimum_snap.cpp
+    math_util/bezier.cpp
     )
 
 # minimum_snap.cpp now contains trajectory-generator and planner implementations

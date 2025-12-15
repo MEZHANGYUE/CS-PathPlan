@@ -107,15 +107,16 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
     int iter = 0;
     while (true) {
         polyCoeff = SolveQPClosedForm(order, Path, Vel, Acc, Time, path_weight, vel_zero_weight, &max_dev);
-        if (max_dev > 2000.0 && iter < max_iter) {
+        if (max_dev > 0.2 && iter < max_iter) {
             if (vel_zero_weight < 1e-6) vel_zero_weight = 0.01;
             else vel_zero_weight *= 2.0;
-            std::cout << "Iteration " << iter+1 << ": max_dev=" << max_dev << " > 2000. Increasing vel_zero_weight to " << vel_zero_weight << std::endl;
+            std::cout << "Iteration " << iter+1 << ": max_dev=" << max_dev << " > 0.2. Increasing vel_zero_weight to " << vel_zero_weight << std::endl;
             iter++;
         } else {
             break;
         }
     }
+    // polyCoeff = SolveQPClosedForm(order, Path, Vel, Acc, Time, path_weight, vel_zero_weight, &max_dev);
 
     // 多项式次数与每段系数个数
     const int p_order = 2 * order - 1;
@@ -147,7 +148,7 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
     bool has_last = false;
     Eigen::Vector3d prev_pt(0,0,0);
 
-    for (int seg = 0; seg < num_segments; ++seg) {
+    for (int seg = 0; seg < num_segments; ++seg) {  //最后一段加入了方向矫正 有重复轨迹段不需要记录
         double T = Time(seg);
         double dt = dt_default;
         if (dt > T/10.0) dt = T/10.0;    //每段至少取10个点
@@ -187,8 +188,10 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
         }
     }
 
-    // 计算最大爬升/下降率
+    // 计算最大爬升/下降率 和 最小转弯半径
     double max_climb_rate = 0.0;
+    double min_turn_radius = 1.0e12;
+
     for (size_t i = 0; i < samples.size() - 1; ++i) {
         double dx = samples[i+1](0) - samples[i](0);
         double dy = samples[i+1](1) - samples[i](1);
@@ -201,8 +204,23 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
                 max_climb_rate = rate;
             }
         }
+
+        if (i > 0) {
+            Eigen::Vector3d p0 = samples[i-1];
+            Eigen::Vector3d p1 = samples[i];
+            Eigen::Vector3d p2 = samples[i+1];
+            double a = (p1 - p0).norm();
+            double b = (p2 - p1).norm();
+            double c = (p2 - p0).norm();
+            double area = 0.5 * ((p1 - p0).cross(p2 - p0)).norm();
+            if (area > 1e-8) {
+                double R = (a * b * c) / (4.0 * area);
+                if (R < min_turn_radius) min_turn_radius = R;
+            }
+        }
     }
     std::cout << "Trajectory Max Climb/Descent Rate: " << max_climb_rate << std::endl;
+    std::cout << "Trajectory Min Turn Radius: " << min_turn_radius << std::endl;
 
     // 转换为矩阵输出
     Eigen::MatrixXd out(samples.size(), 3);
@@ -222,6 +240,9 @@ Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::M
  * @param Vel 航迹点对应的速度(中间点速度是待求的未知量)
  * @param Acc 航迹点对应的加速度(中间点加速度是待求的未知量)
  * @param Time 每段轨迹对应的时间周期
+ * @param vel_zero_weight 经过路径点减速为0的权重，越大表示越倾向于在路径点处速度为0
+ * @param path_weight 路径偏差惩罚权重，越大表示轨迹越贴近路径点连线
+ * @param max_deviation 如果不为nullptr，轨迹段与直线的最大偏离量会被写入该指针指向的变量
  * @return 轨迹x,y,z三个方向上的多项式系数
  *
  * 返回矩阵(PolyCoeff)的数据格式：每一行是一段轨迹，第一列是x方向上的多项式次数，越左次数越高
@@ -616,12 +637,17 @@ Eigen::MatrixXd TrajectoryGeneratorTool::SolveQPClosedForm(
         double T = Time(k);
         Eigen::Vector3d Lbest = P0 + (best_t / T) * (P1 - P0);
         double dist_after = std::sqrt((Eigen::Vector3d(x_final,y_final,z_final) - Lbest).squaredNorm());
-        if (dist_after > current_max_dev) current_max_dev = dist_after;
+        
+        double seg_len = (P1 - P0).norm();
+        double ratio = 0.0;
+        if (seg_len > 1e-6) ratio = dist_after / seg_len;
+
+        if (ratio > current_max_dev) current_max_dev = ratio;
         double dist_before = 0.0;
         if (k < (int)seg_best_dist2_before.size()) dist_before = std::sqrt(seg_best_dist2_before[k]);
 
         std::cout << "segment " << k << " max deviation before(m): " << dist_before
-                  << ", after(m): " << dist_after << std::endl;
+                  << ", after(m): " << dist_after << ", ratio: " << ratio << std::endl;
     }
     if (max_deviation) *max_deviation = current_max_dev;
 

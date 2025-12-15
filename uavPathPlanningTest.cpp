@@ -72,7 +72,7 @@ int main(int argc, char *argv[])
     std::cout << json_string << std::endl;
 
     UavPathPlanner planner;
-    if (!planner.getPlan(obj_total, result_json))
+    if (!planner.getPlan(obj_total, result_json,true,"minimum_snap"))
     {
         std::cerr << "Failed to plan!" << std::endl;
     }
@@ -103,7 +103,7 @@ int main(int argc, char *argv[])
     } catch (const std::exception& e) {
         std::cerr << "Warning: Failed to load config.yaml (" << e.what() << ")" << std::endl;
     }
-
+    //需要高度优化
     if (altitude_opt_enabled) {
         if (!elevation_file.empty()) {
             std::cout << "Running Altitude Optimization with file: " << elevation_file << std::endl;
@@ -121,6 +121,66 @@ int main(int argc, char *argv[])
     } else {
         std::cout << "Altitude optimization skipped." << std::endl;
     }
+
+    // 从输入 JSON 的 uav_leader_id 和 uavs_id 构建 using_uav_list（包含长机与僚机，去重）
+    result_json["using_uav_list"] = json::array();
+    if (obj_total.contains("uav_leader_id") && obj_total["uav_leader_id"].is_array()) {
+        for (const auto &id : obj_total["uav_leader_id"]) {
+            if (id.is_number()) result_json["using_uav_list"].push_back(id);
+        }
+    }
+    if (obj_total.contains("uavs_id") && obj_total["uavs_id"].is_array()) {
+        for (const auto &id : obj_total["uavs_id"]) {
+            if (!id.is_number()) continue;
+            bool found = false;
+            for (const auto &existing : result_json["using_uav_list"]) {
+                if (existing == id) { found = true; break; }
+            }
+            if (!found) result_json["using_uav_list"].push_back(id);
+        }
+    }
+    result_json["ready_id"] = json::array();
+    if (obj_total.contains("ready_id") && obj_total["ready_id"].is_array())
+    result_json["ready_id"] = obj_total["ready_id"];
+
+    result_json["leader_show_points"]= json::array();
+    if (obj_total.contains("leader_midway_point_wgs84") && obj_total["leader_midway_point_wgs84"].is_array())
+        result_json["leader_show_points"] = obj_total["leader_midway_point_wgs84"];
+    // 如果输入中包含 high_zhandou_point_wgs84，则将这些点追加到 leader_show_points，
+    // 并把高度设置为 leader_show_points 中最后一个点的高度（尝试常见字段名：z、altitude、height，或数组第3个元素）
+    if (obj_total.contains("high_zhandou_point_wgs84") && obj_total["high_zhandou_point_wgs84"].is_array()) {
+        double last_alt = 0.0;
+        if (result_json["leader_show_points"].is_array() && !result_json["leader_show_points"].empty()) {
+            auto last_pt = result_json["leader_show_points"].back();
+            if (last_pt.is_object()) {
+                if (last_pt.contains("z") && last_pt["z"].is_number()) last_alt = last_pt["z"].get<double>();
+                else if (last_pt.contains("altitude") && last_pt["altitude"].is_number()) last_alt = last_pt["altitude"].get<double>();
+                else if (last_pt.contains("height") && last_pt["height"].is_number()) last_alt = last_pt["height"].get<double>();
+            } else if (last_pt.is_array() && last_pt.size() >= 3 && last_pt[2].is_number()) {
+                last_alt = last_pt[2].get<double>();
+            }
+        }
+        for (const auto &pt : obj_total["high_zhandou_point_wgs84"]) {
+            if (pt.is_object()) {
+                json newpt = pt;
+                if (newpt.contains("z")) newpt["z"] = last_alt;
+                else if (newpt.contains("altitude")) newpt["altitude"] = last_alt;
+                else if (newpt.contains("height")) newpt["height"] = last_alt;
+                else newpt["z"] = last_alt;
+                result_json["leader_show_points"].push_back(newpt);
+            } else if (pt.is_array() && pt.size() >= 2) {
+                json newpt = pt;
+                if (pt.size() >= 3) {
+                    newpt[2] = last_alt;
+                } else {
+                    newpt.push_back(last_alt);
+                }
+                result_json["leader_show_points"].push_back(newpt);
+            }
+        }
+    }
+    
+    std::cout << "Constructed using_uav_list from input: " << result_json["using_uav_list"].dump() << std::endl;
 
     // 保存到自动推断的输出路径
     planner.saveJsonToFile(result_json, output_path);

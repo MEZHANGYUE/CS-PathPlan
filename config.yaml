@@ -6,3 +6,6 @@ altitude_optimization:
   max_climb_rate: 0.5
   uav_R: 2.0
   safe_distance: 50.0
+path_planning:
+  min_turning_radius: 300.0
+  safe_distance: 50.0

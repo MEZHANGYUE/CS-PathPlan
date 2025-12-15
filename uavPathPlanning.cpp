@@ -1,6 +1,6 @@
 #include "uavPathPlanning.hpp"
 #include "math_util/minimum_snap.hpp"
-// #include "math_util/altitude_optimizer.hpp"
+#include "math_util/bezier.hpp"
 #include <yaml-cpp/yaml.h>
 #include <cmath>
 #include <cpl_string.h>
@@ -289,6 +289,173 @@ std::vector<WGS84Point> UavPathPlanner::enuToWGS84_Batch(const std::vector<ENUPo
     return results;
 }
 
+// 生成 arc-line-arc（相切圆 - 直线 - 相切圆）路径实现
+std::vector<ENUPoint> UavPathPlanner::generateArcLineArc(const ENUPoint &p0, double heading0,
+                                                         const ENUPoint &p1, const ENUPoint &p2,
+                                                         double radius, double resolution)
+{
+    std::vector<ENUPoint> path;
+    if (radius <= 0.0) {
+        // no radius constraint, fallback to straight line
+        double dx = p1.east - p0.east;
+        double dy = p1.north - p0.north;
+        double dist = std::hypot(dx, dy);
+        int steps = std::max(1, (int)std::ceil(dist / resolution));
+        for (int i = 0; i <= steps; ++i) {
+            double t = (double)i / (double)steps;
+            ENUPoint q{p0.east + t * dx, p0.north + t * dy, p0.up + t * (p1.up - p0.up)};
+            path.push_back(q);
+        }
+        return path;
+    }
+
+    // headings
+    double h0 = heading0;
+    double h1 = std::atan2(p2.north - p1.north, p2.east - p1.east);
+
+    auto rotate90 = [](double ax, double ay, int sign)->std::pair<double,double>{
+        if (sign >= 0) return std::make_pair(-ay, ax); // +90
+        else return std::make_pair(ay, -ax); // -90
+    };
+
+    // Try combinations of left/right circle sides to find a feasible tangent
+    bool found = false;
+    std::pair<double,double> C1, C2; // centers
+    std::pair<double,double> T1, T2; // tangent points
+    int best_s0 = 0;
+    int best_s1 = 0;
+
+    auto tangent_at = [&](double theta, int sign)->std::pair<double,double>{
+        if (sign > 0) return std::make_pair(-sin(theta), cos(theta));
+        else return std::make_pair(sin(theta), -cos(theta));
+    };
+
+    // Determine which side p1 is relative to p0's heading
+    double dx_chk = p1.east - p0.east;
+    double dy_chk = p1.north - p0.north;
+    double cross_chk = std::cos(h0) * dy_chk - std::sin(h0) * dx_chk;
+    int forced_s0 = (cross_chk >= 0) ? 1 : -1;
+
+    for (int s0 : {forced_s0}) {
+        auto n0 = rotate90(std::cos(h0), std::sin(h0), s0);
+        std::pair<double,double> c1 = {p0.east + radius * n0.first, p0.north + radius * n0.second};
+        int s1 = s0;
+        {
+            auto n1 = rotate90(std::cos(h1), std::sin(h1), s1);
+            std::pair<double,double> c2 = {p1.east + radius * n1.first, p1.north + radius * n1.second};
+
+            double vx = c2.first - c1.first; double vy = c2.second - c1.second;
+            double d = std::hypot(vx, vy);
+            
+            if (d >= 1e-6) {
+                struct TangentLine { std::pair<double,double> t1, t2; };
+                std::vector<TangentLine> candidates;
+
+                // External tangents only (since s1 == s0)
+                for (int sign : {1, -1}) {
+                    auto vperp = rotate90(vx/d, vy/d, sign);
+                    candidates.push_back({ 
+                        {c1.first + radius * vperp.first, c1.second + radius * vperp.second},
+                        {c2.first + radius * vperp.first, c2.second + radius * vperp.second}
+                    });
+                }
+
+                for (const auto& line : candidates) {
+                     double lx = line.t2.first - line.t1.first;
+                     double ly = line.t2.second - line.t1.second;
+                     double l_len = std::hypot(lx, ly);
+                     if (l_len < 1e-6) continue;
+                     double l_dx = lx / l_len;
+                     double l_dy = ly / l_len;
+
+                     // Check alignment at T1
+                     double theta_t1 = std::atan2(line.t1.second - c1.second, line.t1.first - c1.first);
+                     auto tan1 = tangent_at(theta_t1, s0);
+                     if (tan1.first * l_dx + tan1.second * l_dy < 0.99) continue;
+
+                     // Check alignment at T2
+                     double theta_t2 = std::atan2(line.t2.second - c2.second, line.t2.first - c2.first);
+                     auto tan2 = tangent_at(theta_t2, s1);
+                     if (tan2.first * l_dx + tan2.second * l_dy < 0.99) continue;
+
+                     // Found valid
+                     found = true;
+                     C1 = c1; C2 = c2; T1 = line.t1; T2 = line.t2;
+                     best_s0 = s0; best_s1 = s1;
+                     break;
+                }
+            }
+        }
+        if (found) break;
+    }
+
+    if (!found) {
+        // fallback: straight line
+        double dx = p1.east - p0.east;
+        double dy = p1.north - p0.north;
+        double dist = std::hypot(dx, dy);
+        int steps = std::max(1, (int)std::ceil(dist / resolution));
+        for (int i = 0; i <= steps; ++i) {
+            double t = (double)i / (double)steps;
+            ENUPoint q{p0.east + t * dx, p0.north + t * dy, p0.up + t * (p1.up - p0.up)};
+            path.push_back(q);
+        }
+        return path;
+    }
+
+    // sample arc from p0 to T1 on circle C1
+    double theta0 = atan2(p0.north - C1.second, p0.east - C1.first);
+    double theta_t1 = atan2(T1.second - C1.second, T1.first - C1.first);
+    double delta0 = theta_t1 - theta0;
+    while (delta0 <= -M_PI) delta0 += 2*M_PI;
+    while (delta0 > M_PI) delta0 -= 2*M_PI;
+
+    // Fix direction based on best_s0
+    if (best_s0 > 0 && delta0 < 0) delta0 += 2*M_PI;
+    if (best_s0 < 0 && delta0 > 0) delta0 -= 2*M_PI;
+
+    double arc_len0 = std::fabs(delta0) * radius;
+    int steps0 = std::max(1, (int)std::ceil(arc_len0 / resolution));
+    for (int i = 0; i <= steps0; ++i) {
+        double t = (double)i / (double)steps0;
+        double theta = theta0 + delta0 * t;
+        ENUPoint q{C1.first + radius * cos(theta), C1.second + radius * sin(theta), p0.up + (p1.up - p0.up) * ( (double)i / steps0 * 0.1 )};
+        path.push_back(q);
+    }
+
+    // straight from T1 to T2
+    double lx = T2.first - T1.first; double ly = T2.second - T1.second;
+    double ldist = std::hypot(lx, ly);
+    int lsteps = std::max(1, (int)std::ceil(ldist / resolution));
+    for (int i = 1; i <= lsteps; ++i) {
+        double t = (double)i / (double)lsteps;
+        ENUPoint q{T1.first + t * lx, T1.second + t * ly, p0.up + t * (p1.up - p0.up)};
+        path.push_back(q);
+    }
+
+    // arc from T2 to p1
+    double theta_t2 = atan2(T2.second - C2.second, T2.first - C2.first);
+    double theta1 = atan2(p1.north - C2.second, p1.east - C2.first);
+    double delta1 = theta1 - theta_t2;
+    while (delta1 <= -M_PI) delta1 += 2*M_PI;
+    while (delta1 > M_PI) delta1 -= 2*M_PI;
+
+    // Fix direction based on best_s1
+    if (best_s1 > 0 && delta1 < 0) delta1 += 2*M_PI;
+    if (best_s1 < 0 && delta1 > 0) delta1 -= 2*M_PI;
+
+    double arc_len1 = std::fabs(delta1) * radius;
+    int steps1 = std::max(1, (int)std::ceil(arc_len1 / resolution));
+    for (int i = 1; i <= steps1; ++i) {
+        double t = (double)i / (double)steps1;
+        double theta = theta_t2 + delta1 * t;
+        ENUPoint q{C2.first + radius * cos(theta), C2.second + radius * sin(theta), p1.up};
+        path.push_back(q);
+    }
+
+    return path;
+}
+
 // UavPathPlanner::runAltitudeOptimization: 现在只接受一个高程文件路径参数 (.tif 或 PGM)
 bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json &output_json, const json &input_json)
 {
@@ -469,7 +636,7 @@ bool UavPathPlanner::loadElevationData(const std::string &path)
   const uint64_t bytes_needed = static_cast<uint64_t>(full_w) * static_cast<uint64_t>(full_h) * sizeof(float);
    // target maximum bytes after downsampling: 1 GB (user request)
    const uint64_t TARGET_BYTES = 200ULL * 1024ULL * 1024ULL;
-   std::cerr << "ElevationMap: estimated memory for full raster (bytes): " << bytes_needed << " target_bytes=" << TARGET_BYTES << std::endl;
+//    std::cerr << "ElevationMap: estimated memory for full raster (bytes): " << bytes_needed << " target_bytes=" << TARGET_BYTES << std::endl;
 
   // Check for existing overviews first
   GDALRasterBand *band = poDS->GetRasterBand(1);
@@ -580,7 +747,7 @@ bool UavPathPlanner::loadElevationData(const std::string &path)
         break;
       }
     }
-    std::cerr << "ElevationMap: existing overviews count=" << existing_ov << " chosen overview index=" << use_ov_index << std::endl;
+    // std::cerr << "ElevationMap: existing overviews count=" << existing_ov << " chosen overview index=" << use_ov_index << std::endl;
   }
 
   // If we didn't pick an overview, read full resolution
@@ -1068,33 +1235,97 @@ bool UavPathPlanner::optimizeHeightsGlobalSmooth(const std::vector<double> &inpu
 // 读取JSON文件中的路径点并直接返回东北天坐标
 // 从JSON对象中读取路径点并直接返回东北天坐标
 
-std::vector<ENUPoint> UavPathPlanner::getENUFromJSON(const json& j, const std::string& key) 
+std::vector<ENUPoint> UavPathPlanner::getENUFromJSON(const json& j, const std::string& key1, const std::string& key2) 
 {
     std::vector<ENUPoint> enu_path;
     
     try {
         // 检查键是否存在
-        if (!j.contains(key)) {
-            throw std::runtime_error("JSON中未找到键: " + key);
+        if (!j.contains(key1)) {
+            throw std::runtime_error("JSON中未找到键: " + key1);
         }
-        
-        auto points_array = j[key];
-        if (points_array.empty()) {
-            return enu_path;
+        if (!j.contains(key2)) {
+            throw std::runtime_error("JSON中未找到键: " + key2);
         }
-        
-        // 读取所有WGS84点
+
+        auto points_array = j[key1];
+        auto add_points_array = j[key2];
+
+        double last_alt = 0.0;
         std::vector<WGS84Point> wgs84_points;
-        for (const auto& point_array : points_array) {
-            if (point_array.size() >= 3) {
-                WGS84Point point;
-                point.lon = point_array[0].get<double>();
-                point.lat = point_array[1].get<double>();
-                point.alt = point_array[2].get<double>();
-                wgs84_points.push_back(point);
+        if (!points_array.empty())         
+        {// 读取所有WGS84点
+            
+            for (const auto& point_array : points_array) {
+                if (point_array.size() >= 3) {
+                    WGS84Point point;
+                    point.lon = point_array[0].get<double>();
+                    point.lat = point_array[1].get<double>();
+                    point.alt = point_array[2].get<double>();
+                    last_alt = point.alt;
+                    wgs84_points.push_back(point);
+                }
             }
         }
         
+        // //准备区的边界点需要排序,第一个点距离上次保存的最后一个点最近,然后由方向判断顺时针还是逆时针排序
+        std::vector<WGS84Point> add_wgs84_points;
+        if (!add_points_array.empty()) {
+            // 读取所有WGS84点
+            for (const auto& add_point_array : add_points_array) {
+                if (add_point_array.size() >= 2) {
+                    WGS84Point point;
+                    point.lon = add_point_array[0].get<double>();
+                    point.lat = add_point_array[1].get<double>();
+                    point.alt = last_alt;
+                    add_wgs84_points.push_back(point);
+                }
+            }
+        }
+        // wgs84_points.push_back(add_wgs84_points[0]); // Close the loop
+        if (!wgs84_points.empty() && !add_wgs84_points.empty()) {
+            WGS84Point last_pt = wgs84_points.back();
+            
+            // Find closest point
+            int min_idx = -1;
+            double min_dist = 1.79769e+308;
+            
+            for (size_t i = 0; i < add_wgs84_points.size(); ++i) {
+                ENUPoint enu = this->wgs84ToENU(add_wgs84_points[i], last_pt);
+                double dist = enu.east * enu.east + enu.north * enu.north + enu.up * enu.up;
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    min_idx = i;
+                }
+            }
+            
+            if (min_idx != -1) {
+                // Rotate to make min_idx the first element
+                std::rotate(add_wgs84_points.begin(), add_wgs84_points.begin() + min_idx, add_wgs84_points.end());
+                
+                // Determine direction (CW or CCW)
+                if (wgs84_points.size() >= 2 && add_wgs84_points.size() >= 2) {
+                    WGS84Point prev_pt = wgs84_points[wgs84_points.size() - 2];
+                    ENUPoint vec_in = this->wgs84ToENU(last_pt, prev_pt); 
+                    
+                    ENUPoint vec_next = this->wgs84ToENU(add_wgs84_points[1], last_pt);
+                    ENUPoint vec_prev = this->wgs84ToENU(add_wgs84_points.back(), last_pt);
+                    
+                    double dot_next = vec_in.east * vec_next.east + vec_in.north * vec_next.north;
+                    double dot_prev = vec_in.east * vec_prev.east + vec_in.north * vec_prev.north;
+                    
+                    if (dot_prev > dot_next) {
+                        std::reverse(add_wgs84_points.begin() + 1, add_wgs84_points.end());
+                    }
+                }
+                // add_wgs84_points.push_back(add_wgs84_points[0]); // Close the loop
+                // add_wgs84_points.push_back(add_wgs84_points[1]); //规划保持结束点的朝向,适应循环飞行
+            }
+        }
+        
+        wgs84_points.insert(wgs84_points.end(), add_wgs84_points.begin(), add_wgs84_points.end());
+        
+
         if (wgs84_points.empty()) {
             return enu_path;
         }
@@ -1108,6 +1339,7 @@ std::vector<ENUPoint> UavPathPlanner::getENUFromJSON(const json& j, const std::s
     }
     return enu_path;
 }
+
 double UavPathPlanner::getDistanceFromJSON(const json& j, const std::string& key) 
 {
     double distance_;
@@ -1131,9 +1363,11 @@ double UavPathPlanner::getDistanceFromJSON(const json& j, const std::string& key
 
 //
 
-bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D)
+bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, std::string algorithm)
 {
     std::vector<ENUPoint> Enu_waypoint;
+    int midwaypoint_num=0;
+    int zhandoupoint_num=0;
     double distance;
     InputData input_data;
     if (!loadData(input_data, input_json))
@@ -1144,15 +1378,27 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D)
     {
         std::cerr << "Successfully load intput json data." << std::endl;
     }
-    Enu_waypoint = this->getENUFromJSON(input_json,"leader_midway_point_wgs84"); //
+    //记录路径点和区域边界点数量, 用不同的路径优化方法规划
+    if (input_json.contains("leader_midway_point_wgs84")) {
+        midwaypoint_num = input_json["leader_midway_point_wgs84"].size();
+        std::cout << "leader_midway_point_wgs84 count: " << input_json["leader_midway_point_wgs84"].size() << std::endl;
+    }
+    if (input_json.contains("high_zhandou_point_wgs84")) {
+        zhandoupoint_num = input_json["high_zhandou_point_wgs84"].size();
+        std::cout << "high_zhandou_point_wgs84 count: " << input_json["high_zhandou_point_wgs84"].size() << std::endl;
+    }
 
+    //Enu_waypoint包含了路径点和区域边界点
+    Enu_waypoint = this->getENUFromJSON(input_json,"leader_midway_point_wgs84","high_zhandou_point_wgs84"); //
+    
+    //增加打印leader_midway_point_wgs84点数和high_zhandou_point_wgs84点数
     // Filter Enu_waypoint to remove points too close to the next one
     if (Enu_waypoint.size() > 1) {
         std::vector<ENUPoint> filtered_wpts;
         filtered_wpts.reserve(Enu_waypoint.size());
         double min_dist = 200.0; // Minimum distance in meters for waypoints
-
-        for (size_t i = 0; i < Enu_waypoint.size() - 1; ++i) {
+        //只过滤路径点的间距,不影响区域边界点
+        for (size_t i = 0; i < midwaypoint_num - 1; ++i) {
             const auto& p1 = Enu_waypoint[i];
             const auto& p2 = Enu_waypoint[i+1];
             double dist2d = std::hypot(p1.east - p2.east, p1.north - p2.north);
@@ -1162,11 +1408,16 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D)
             } else {
                 std::cerr << "getPlan: merging waypoint " << i << " to next (dist=" << dist2d << "m)\n";
             }
+               }
+        // filtered_wpts.push_back(Enu_waypoint.back()); // Always keep the last point
+        // 将剩余的点（包括最后一个 midway 点和所有 zhandou 点）加入
+        int start_idx = (midwaypoint_num > 0) ? (midwaypoint_num - 1) : 0;
+        for (size_t i = start_idx; i < Enu_waypoint.size(); ++i) {
+            filtered_wpts.push_back(Enu_waypoint[i]);
         }
-        filtered_wpts.push_back(Enu_waypoint.back()); // Always keep the last point
         
-        if (filtered_wpts.size() < Enu_waypoint.size()) {
-            std::cerr << "getPlan: filtered waypoints from " << Enu_waypoint.size() 
+        if (filtered_wpts.size() < midwaypoint_num) {
+            std::cerr << "getPlan: filtered waypoints from " << midwaypoint_num 
                       << " to " << filtered_wpts.size() << " points.\n";
             Enu_waypoint = filtered_wpts;
         }
@@ -1184,10 +1435,28 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D)
     if (leader_speed > 0) input_data.leader_speed = leader_speed;
 
     
-    if (use3D) {
-        Trajectory_ENU = this->Minisnap_3D(Enu_waypoint, distance, input_data.leader_speed);
+    // 提取用于轨迹生成的点（排除末尾的 zhandou points）
+    std::vector<ENUPoint> planning_waypoints;
+    if (Enu_waypoint.size() >= zhandoupoint_num) {
+        planning_waypoints.assign(Enu_waypoint.begin(), Enu_waypoint.end() - zhandoupoint_num );
     } else {
-        Trajectory_ENU = this->Minisnap_EN(Enu_waypoint, distance, input_data.leader_speed);
+        planning_waypoints = Enu_waypoint;
+    }
+
+    if (algorithm == "minimum_snap") {
+        if (use3D) {
+            Trajectory_ENU = this->Minisnap_3D(planning_waypoints, distance, input_data.leader_speed);
+        } else {
+            Trajectory_ENU = this->Minisnap_EN(planning_waypoints, distance, input_data.leader_speed);
+        }
+    } else if (algorithm == "bspline") {
+        std::cerr << "bspline algorithm not implemented yet." << std::endl;
+        return false;
+    } else if (algorithm == "bezier") {
+        Trajectory_ENU = this->Bezier_3D(planning_waypoints, distance, input_data.leader_speed, input_data.min_turning_radius);
+    } else {
+        std::cerr << "Unknown algorithm: " << algorithm << ". Please use one of: minimum_snap, bspline, bezier" << std::endl;
+        return false;
     }
     // Altitude optimization is no longer performed automatically here.
     // Use UavPathPlanner::runAltitudeOptimization(elev_file) externally to run
@@ -1200,6 +1469,30 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D)
     // uav_plane1 用于保存编队（followers）列表，每个子数组以 follower id 开头后跟点列表
     json plane_array = json::array();
 
+    // 计算并输出最小转弯半径
+    double min_radius = this->calculateMinTurningRadius(Trajectory_ENU);
+    if (min_radius > 0) {
+        std::cout << "Minimum turning radius: " << min_radius << " m" << std::endl;
+    } else {
+        std::cout << "Minimum turning radius: N/A (Straight line or insufficient points)" << std::endl;
+    }
+
+    // 计算 Trajectory_ENU 最终点的朝向
+    double final_heading = 0.0;
+    if (Trajectory_ENU.size() >= 2) {
+        const auto& p_last = Trajectory_ENU.back();
+        const auto& p_prev = Trajectory_ENU[Trajectory_ENU.size() - 2];
+        final_heading = std::atan2(p_last.north - p_prev.north, p_last.east - p_prev.east);
+    } else if (!planning_waypoints.empty()) {
+        // 如果轨迹点不足，尝试使用规划点的最后两个点
+        if (planning_waypoints.size() >= 2) {
+             const auto& p_last = planning_waypoints.back();
+             const auto& p_prev = planning_waypoints[planning_waypoints.size() - 2];
+             final_heading = std::atan2(p_last.north - p_prev.north, p_last.east - p_prev.east);
+        }
+    }
+    // std::cout << "Final heading: " << final_heading << " rad (" << rad2deg(final_heading) << " deg)" << std::endl;
+
     // 生成并写入跟随者轨迹
     try {
         json plane_array = this->generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
@@ -1207,6 +1500,83 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D)
     } catch (const std::exception &e) {
         std::cerr << "调用 generateFollowerTrajectories 出错: " << e.what() << std::endl;
     }
+
+    std::vector<ENUPoint> Patrol_Path; // 提升作用域以供第二段轨迹计算使用
+
+/*                   第三段段任务区域巡逻轨迹计算               */
+if(input_json["high_zhandou_point_wgs84"].size()!=0)   //存在高战斗区域点且有前序轨迹
+{
+    std::cout<<"开始计算第三段任务区域巡逻轨迹"<<std::endl;
+    
+    // 提取用于区域边界点的点（仅包含 zhandou points）
+    std::vector<ENUPoint> Patrol_waypoints={};
+    if (Enu_waypoint.size() >= zhandoupoint_num) {
+        Patrol_waypoints.assign(Enu_waypoint.end() - zhandoupoint_num ,Enu_waypoint.end());
+    } 
+    Patrol_waypoints.push_back(Patrol_waypoints[0]); //闭合巡逻路径
+
+    // 为了保证闭合处的切向连续（即第一个点和最后一个点的朝向相同），
+    // 我们在末尾再多加一个点（即第二个点），使路径变为 P0 -> P1 -> ... -> P0 -> P1
+    // 然后截取 P0 -> ... -> P0 部分
+    if (Patrol_waypoints.size() > 2) {
+        Patrol_waypoints.push_back(Patrol_waypoints[1]);
+    }
+
+    std::vector<ENUPoint> Patrol_Path_Full = Minisnap_3D(Patrol_waypoints, distance, input_data.leader_speed);
+    
+    if (Patrol_waypoints.size() > 2 && !Patrol_Path_Full.empty()) {
+        // 目标截断点是倒数第二个航点 (P0)
+        ENUPoint target_p = Patrol_waypoints[Patrol_waypoints.size() - 2];
+        
+        // 从后往前搜索最接近 target_p 的点
+        // 限制搜索范围为后半段，避免匹配到起点的 P0
+        size_t best_idx = Patrol_Path_Full.size() - 1;
+        double min_dist = std::numeric_limits<double>::max();
+        size_t search_start = Patrol_Path_Full.size() / 2;
+        
+        for (size_t i = Patrol_Path_Full.size() - 1; i >= search_start; --i) {
+            double dx = Patrol_Path_Full[i].east - target_p.east;
+            double dy = Patrol_Path_Full[i].north - target_p.north;
+            double dz = Patrol_Path_Full[i].up - target_p.up;
+            double d = dx*dx + dy*dy + dz*dz;
+            
+            if (d < min_dist) {
+                min_dist = d;
+                best_idx = i;
+            }
+        }
+        
+        // 截取到 best_idx
+        if (best_idx < Patrol_Path_Full.size()) {
+            Patrol_Path.assign(Patrol_Path_Full.begin(), Patrol_Path_Full.begin() + best_idx + 1);
+        } else {
+            Patrol_Path = Patrol_Path_Full;
+        }
+    } else {
+        Patrol_Path = Patrol_Path_Full;
+    }
+    Patrol_Path.push_back(Patrol_Path[0]); //闭合巡逻路径
+    std::vector<WGS84Point> Patrol_Path_WGS84 = this->enuToWGS84_Batch(Patrol_Path,this->origin_);
+    this->putWGS84ToJson(output_json, "uav_leader_plane3", Patrol_Path_WGS84);
+
+}
+
+
+/*                   第二段任务区域过渡轨迹计算      input_json["high_zhandou_point_wgs84"].size()           */
+if(input_json["high_zhandou_point_wgs84"].size()!=0 && !Trajectory_ENU.empty() && !Patrol_Path.empty())   //存在高战斗区域点且有前序轨迹
+{
+    std::cout<<"开始计算第二段任务区域过渡轨迹 (切圆切入优化)"<<std::endl;
+    ENUPoint p0 = Trajectory_ENU.back(); // 起点 ENU
+    double heading0 = final_heading; // 起点朝向
+
+    // 计算并更新跟随者轨迹
+    json plane_array = this->generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
+    output_json["uav_plane1"] = plane_array;
+
+    // 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
+    computeTransitionAndRotatePatrol(p0, heading0, input_data.min_turning_radius, distance, Patrol_Path, output_json);
+}
+
 
     return true;
 }
@@ -1240,6 +1610,10 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
                                   const std::vector<WGS84Point> &Trajectory_WGS84) {
     json plane_array = json::array();
 
+    if (input_data.formation_using != 1) {
+        return plane_array;
+    }
+
     if (!(input_json.contains("uavs_id") && input_json.contains("uav_start_point_wgs84"))) {
         return plane_array; // empty
     }
@@ -1270,33 +1644,121 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
     std::vector<Eigen::Vector2d> leader_xy; leader_xy.reserve(N);
     for (const auto &p : Trajectory_ENU) leader_xy.emplace_back(p.east, p.north);
 
+    // 预计算并平滑航向角，避免转弯时编队变形或冲突
+    std::vector<double> leader_headings(N);
+    for (size_t t = 0; t < N; ++t) {
+        double dx = 0.0, dy = 0.0;
+        if (t == 0) {
+            if (N > 1) {
+                dx = leader_xy[1].x() - leader_xy[0].x();
+                dy = leader_xy[1].y() - leader_xy[0].y();
+            } else {
+                dx = cos(leader_initial_heading);
+                dy = sin(leader_initial_heading);
+            }
+        } else if (t == N - 1) {
+            dx = leader_xy[N - 1].x() - leader_xy[N - 2].x();
+            dy = leader_xy[N - 1].y() - leader_xy[N - 2].y();
+        } else {
+            // 使用中心差分计算切线方向，比前向差分更平滑
+            dx = leader_xy[t + 1].x() - leader_xy[t - 1].x();
+            dy = leader_xy[t + 1].y() - leader_xy[t - 1].y();
+        }
+        leader_headings[t] = atan2(dy, dx);
+    }
+
+    // 对航向角进行滑动窗口平滑
+    if (N > 5) {
+        std::vector<double> smoothed = leader_headings;
+        int window = 10; // 窗口大小可调整
+        for (size_t t = 0; t < N; ++t) {
+            double sum_sin = 0.0, sum_cos = 0.0;
+            int count = 0;
+            for (int k = -window; k <= window; ++k) {
+                int idx = (int)t + k;
+                if (idx >= 0 && idx < (int)N) {
+                    sum_sin += sin(leader_headings[idx]);
+                    sum_cos += cos(leader_headings[idx]);
+                    count++;
+                }
+            }
+            if (count > 0) {
+                smoothed[t] = atan2(sum_sin, sum_cos);
+            }
+        }
+        leader_headings = smoothed;
+    }
+
+    // 获取安全距离
+    double safety_distance = 50.0; // 默认值
+    if (input_json.contains("safety_distance")) {
+        safety_distance = input_json["safety_distance"].get<double>();
+    }
+
+    // std::cout << "Formation Model: " << input_data.formation_model << std::endl;
+
+    if (input_data.formation_model == 1) {
+        std::cout << "Formation Model: 人字形编队" << std::endl;
+        plane_array = generateVShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, safety_distance);
+    } else if (input_data.formation_model == 2) {
+        std::cout << "Formation Model: 一字形编队" << std::endl;
+        plane_array = generateLineShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, safety_distance);
+    } else {
+        // 默认使用人字形 (V-shape)
+        std::cout << "Formation Model: 人字形编队" << std::endl;
+        plane_array = generateVShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, safety_distance);
+    }
+
+    return plane_array;
+}
+
+json UavPathPlanner::generateVShapeTrajectories(const json &uavs_ids, const json &uav_starts, 
+                                                const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
+                                                const std::vector<Eigen::Vector2d> &leader_xy, 
+                                                const std::vector<double> &leader_headings,
+                                                const std::vector<ENUPoint> &Trajectory_ENU,
+                                                double safety_distance) {
+    json plane_array = json::array();
+    size_t N = Trajectory_ENU.size();
+
     for (size_t idx = 0; idx < uavs_ids.size(); ++idx) {
         int uid = uavs_ids[idx].get<int>();
         if (idx >= uav_starts.size()) break;
-        auto s = uav_starts[idx];
-        WGS84Point follower_start_wgs{s[0].get<double>(), s[1].get<double>(), s.size()>=3 ? s[2].get<double>() : 0.0};
-    ENUPoint follower_start_enu = this->wgs84ToENU(follower_start_wgs, this->origin_);
 
-        Eigen::Vector2d rel_global(follower_start_enu.east - leader_start_enu.east,
-                                   follower_start_enu.north - leader_start_enu.north);
-        double rel_up = follower_start_enu.up - leader_start_enu.up;
-        Eigen::Vector2d rel_body = R0.transpose() * rel_global;
+        // Get start point
+        auto s = uav_starts[idx];
+        WGS84Point start_wp;
+        start_wp.lon = s[0].get<double>();
+        start_wp.lat = s[1].get<double>();
+        start_wp.alt = s.size() >= 3 ? s[2].get<double>() : 0.0;
+        
+        // Hardcoded V-Shape Geometry
+        // Index 0: Left, Index 1: Right, Index 2: Left, ...
+        int row = (idx / 2) + 1;
+        int side = (idx % 2 == 0) ? 1 : -1; // 1 for Left, -1 for Right
+        
+        // 45 degree V-shape: dx = dy
+        double dx = -row * safety_distance; // Behind
+        double dy = side * row * safety_distance; // Lateral
+        
+        Eigen::Vector2d rel_body(dx, dy);
+        double rel_up = 0.0; // Same altitude
 
         // 构造 follower 的 entry
         json follower_entry = json::array();
         follower_entry.push_back(uid);
 
         for (size_t t = 0; t < N; ++t) {
-            double heading = 0.0;
-            if (t + 1 < N) {
-                Eigen::Vector2d diff = leader_xy[t+1] - leader_xy[t];
-                heading = atan2(diff.y(), diff.x());
-            } else if (t > 0) {
-                Eigen::Vector2d diff = leader_xy[t] - leader_xy[t-1];
-                heading = atan2(diff.y(), diff.x());
-            } else {
-                heading = leader_initial_heading;
+            if (t == 0) {
+                json pa = json::array();
+                pa.push_back(start_wp.lon);
+                pa.push_back(start_wp.lat);
+                pa.push_back(start_wp.alt);
+                follower_entry.push_back(pa);
+                continue;
             }
+
+            double heading = leader_headings[t];
             double c = cos(heading);
             double s_ = sin(heading);
             Eigen::Matrix2d Rt; Rt << c, -s_, s_, c;
@@ -1317,7 +1779,75 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
 
         plane_array.push_back(follower_entry);
     }
+    return plane_array;
+}
 
+json UavPathPlanner::generateLineShapeTrajectories(const json &uavs_ids, const json &uav_starts, 
+                                                   const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
+                                                   const std::vector<Eigen::Vector2d> &leader_xy, 
+                                                   const std::vector<double> &leader_headings,
+                                                   const std::vector<ENUPoint> &Trajectory_ENU,
+                                                   double safety_distance) {
+    json plane_array = json::array();
+    size_t N = Trajectory_ENU.size();
+
+    for (size_t idx = 0; idx < uavs_ids.size(); ++idx) {
+        int uid = uavs_ids[idx].get<int>();
+        if (idx >= uav_starts.size()) break;
+
+        // Get start point
+        auto s = uav_starts[idx];
+        WGS84Point start_wp;
+        start_wp.lon = s[0].get<double>();
+        start_wp.lat = s[1].get<double>();
+        start_wp.alt = s.size() >= 3 ? s[2].get<double>() : 0.0;
+        
+        // Hardcoded Line-Shape (Abreast) Geometry
+        // Left and Right of leader.
+        int row = (idx / 2) + 1;
+        int side = (idx % 2 == 0) ? 1 : -1; // 1 for Left, -1 for Right
+        
+        double dx = 0.0; // Abreast
+        double dy = side * row * safety_distance; // Lateral
+        
+        Eigen::Vector2d rel_body(dx, dy);
+        double rel_up = 0.0;
+
+        // 构造 follower 的 entry
+        json follower_entry = json::array();
+        follower_entry.push_back(uid);
+
+        for (size_t t = 0; t < N; ++t) {
+            if (t == 0) {
+                json pa = json::array();
+                pa.push_back(start_wp.lon);
+                pa.push_back(start_wp.lat);
+                pa.push_back(start_wp.alt);
+                follower_entry.push_back(pa);
+                continue;
+            }
+
+            double heading = leader_headings[t];
+            double c = cos(heading);
+            double s_ = sin(heading);
+            Eigen::Matrix2d Rt; Rt << c, -s_, s_, c;
+            Eigen::Vector2d offset_global = Rt * rel_body;
+
+            ENUPoint fp;
+            fp.east = leader_xy[t].x() + offset_global.x();
+            fp.north = leader_xy[t].y() + offset_global.y();
+            fp.up = Trajectory_ENU[t].up + rel_up;
+
+            WGS84Point wp = this->enuToWGS84(fp, this->origin_);
+            json pa = json::array();
+            pa.push_back(wp.lon);
+            pa.push_back(wp.lat);
+            pa.push_back(wp.alt);
+            follower_entry.push_back(pa);
+        }
+
+        plane_array.push_back(follower_entry);
+    }
     return plane_array;
 }
 // Minisnap_EN: 仅在平面上(东/北)进行轨迹优化，忽略高度(将高度固定为起点高度)
@@ -1440,6 +1970,42 @@ std::vector<ENUPoint> UavPathPlanner::Minisnap_3D(std::vector<ENUPoint> Enu_wayp
     }
 
     std::cout << "Generated 3D trajectory point number:" << result.size() << std::endl;
+    return result;
+}
+
+// Bezier_3D: 贝塞尔曲线轨迹生成
+std::vector<ENUPoint> UavPathPlanner::Bezier_3D(std::vector<ENUPoint> Enu_waypoint_, double distance_, double V_avg_override, double min_radius) //转弯半径无效
+{
+    std::vector<ENUPoint> result{};
+    int dot_num = Enu_waypoint_.size();
+    if (dot_num < 2) return result;
+
+    Eigen::MatrixXd route(dot_num, 3);
+    for (int i = 0; i < dot_num; i++) {
+        route(i, 0) = Enu_waypoint_[i].east;
+        route(i, 1) = Enu_waypoint_[i].north;
+        route(i, 2) = Enu_waypoint_[i].up;
+    }
+
+    math_util::Bezier bezier;
+    math_util::BezierConfig config;
+    if (min_radius > 0) {
+        config.min_radius = 300;
+    }
+    bezier.SetConfig(config);
+
+    // yaml_path is not used by Bezier currently, pass empty string or dummy
+    Eigen::MatrixXd sampled = bezier.GenerateTrajectoryMatrix(route, "", distance_, V_avg_override);
+
+    for (int i = 0; i < sampled.rows(); ++i) {
+        ENUPoint enu_point;
+        enu_point.east = sampled(i, 0);
+        enu_point.north = sampled(i, 1);
+        enu_point.up = sampled(i, 2);
+        result.push_back(enu_point);
+    }
+
+    std::cout << "Generated Bezier 3D trajectory point number:" << result.size() << std::endl;
     return result;
 }
 
@@ -1585,6 +2151,38 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
     {
         std::cout << "high_list is empty." << std::endl;
     }
+    if (input_json.contains("min_turning_radius"))
+    {
+        input_data.min_turning_radius = input_json["min_turning_radius"];
+    }
+    else
+    {
+        // std::cout << "min_turning_radius is empty." << std::endl;
+    }
+    // Load config from yaml if available to set min_turning_radius if not provided in input
+    std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
+    for (const auto& config_path : config_paths) {
+        struct stat buffer;
+        if (stat(config_path.c_str(), &buffer) == 0) {
+             try {
+                YAML::Node config = YAML::LoadFile(config_path);
+                if (config["path_planning"]) {
+                    auto pp_conf = config["path_planning"];
+                    if (pp_conf["min_turning_radius"]) {
+                        double r = pp_conf["min_turning_radius"].as<double>();
+                        if (input_data.min_turning_radius <= 0.0) {
+                             input_data.min_turning_radius = r;
+                             std::cerr << "Loaded min_turning_radius from " << config_path << ": " << r << std::endl;
+                        }
+                    }
+                }
+             } catch (const std::exception &e) {
+                 std::cerr << "Failed to parse " << config_path << ": " << e.what() << std::endl;
+             }
+             break; 
+        }
+    }
+
     return true;
 }
 
@@ -1690,4 +2288,212 @@ void UavPathPlanner::buildLocalENUCostMap(double margin, double resolution)//mar
       }
   }
   std::cerr << "Local ENU CostMap built." << std::endl;
+}
+
+// 计算轨迹最小转弯半径
+double UavPathPlanner::calculateMinTurningRadius(const std::vector<ENUPoint>& path) {
+    if (path.size() < 3) {
+        return -1.0; // Not enough points
+    }
+
+    double min_radius = std::numeric_limits<double>::max();
+
+    for (size_t i = 0; i < path.size() - 2; ++i) {
+        const auto& p1 = path[i];
+        const auto& p2 = path[i+1];
+        const auto& p3 = path[i+2];
+
+        double a = std::sqrt(std::pow(p2.east - p3.east, 2) + std::pow(p2.north - p3.north, 2) + std::pow(p2.up - p3.up, 2));
+        double b = std::sqrt(std::pow(p1.east - p3.east, 2) + std::pow(p1.north - p3.north, 2) + std::pow(p1.up - p3.up, 2));
+        double c = std::sqrt(std::pow(p1.east - p2.east, 2) + std::pow(p1.north - p2.north, 2) + std::pow(p1.up - p2.up, 2));
+
+        if (a < 1e-3 || b < 1e-3 || c < 1e-3) continue; // Skip if points are too close
+
+        double s = (a + b + c) / 2.0;
+        double area_sq = s * (s - a) * (s - b) * (s - c);
+        
+        if (area_sq < 1e-6) continue; // Collinear or nearly collinear
+
+        double radius = (a * b * c) / (4.0 * std::sqrt(area_sq));
+        if (radius < min_radius) {
+            min_radius = radius;
+        }
+    }
+
+    if (min_radius == std::numeric_limits<double>::max()) {
+        return -1.0; // Could not calculate (e.g. straight line)
+    }
+
+    return min_radius;
+}
+
+// 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
+void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double heading0, double minR, double resolution, 
+                                                      const std::vector<ENUPoint>& Patrol_Path, json& output_json)
+{
+    std::cout<<"开始计算第二段任务区域过渡轨迹 (切圆切入优化)"<<std::endl;
+
+    // 3. 寻找最佳切入点 (遍历左右转弯及所有巡逻点)
+    double best_score = std::numeric_limits<double>::max();
+    size_t best_idx = 0;
+    double best_arc_len = 0;
+    double best_line_len = 0;
+    double best_theta_end = 0;
+    int best_s = 0;
+    double best_cx = 0;
+    double best_cy = 0;
+    double best_theta_start = 0;
+    bool found_any = false;
+
+    // 尝试左右两种转弯方向，寻找最优解
+    for (int s : {1, -1}) {
+        // 计算切圆圆心
+        // 左转(s=1): (-sin, cos); 右转(s=-1): (sin, -cos)
+        double cx = p0.east - s * minR * std::sin(heading0);
+        double cy = p0.north + s * minR * std::cos(heading0);
+        double theta_start = std::atan2(p0.north - cy, p0.east - cx);
+
+        for(size_t i = 0; i < Patrol_Path.size(); ++i) {
+            const auto& pt = Patrol_Path[i];
+            // 计算该点处的巡逻方向 (指向下一点)
+            const auto& next_pt = Patrol_Path[(i + 1) % Patrol_Path.size()];
+            double patrol_dx = next_pt.east - pt.east;
+            double patrol_dy = next_pt.north - pt.north;
+            double patrol_len = std::hypot(patrol_dx, patrol_dy);
+            if(patrol_len < 1e-3) continue;
+            patrol_dx /= patrol_len;
+            patrol_dy /= patrol_len;
+
+            // 计算从圆心到目标点的向量及距离
+            double v_cx = pt.east - cx;
+            double v_cy = pt.north - cy;
+            double dist_cp = std::hypot(v_cx, v_cy);
+            
+            if(dist_cp <= minR) continue; // 目标点在圆内，无法做切线
+
+            // 计算切点
+            // 我们需要的是“沿圆弧运动方向”飞出的切线
+            double alpha = std::atan2(v_cy, v_cx);
+            double beta = std::acos(minR / dist_cp);
+            
+            // 两个可能的切点角度
+            double candidates[2] = {alpha + beta, alpha - beta};
+            for(double theta : candidates) {
+                // 切点坐标
+                double tx = cx + minR * std::cos(theta);
+                double ty = cy + minR * std::sin(theta);
+                
+                // 切线向量 (T -> P)
+                double lx = pt.east - tx;
+                double ly = pt.north - ty;
+                double l_len = std::hypot(lx, ly);
+                if(l_len < 1e-3) continue;
+                double l_dx = lx / l_len;
+                double l_dy = ly / l_len;
+
+                // 圆在该切点处的切线方向 (运动方向)
+                double tan_x = -s * std::sin(theta);
+                double tan_y = s * std::cos(theta);
+
+                // 检查1: 直线方向必须与圆的切线方向一致 (cos theta > 0)
+                if(tan_x * l_dx + tan_y * l_dy < 0.99) continue; 
+
+                // 检查2: 切入角度与巡逻方向的对齐程度
+                double alignment = l_dx * patrol_dx + l_dy * patrol_dy;
+                // 严格限制切入角度，例如必须小于 36 度 (cos > 0.8)
+                if(alignment < 0.8) continue;
+
+                // 计算弧长
+                double d_theta = theta - theta_start;
+                if (s > 0) { // Left, CCW
+                    while (d_theta <= 0) d_theta += 2 * M_PI;
+                    while (d_theta > 2 * M_PI) d_theta -= 2 * M_PI;
+                } else { // Right, CW
+                    while (d_theta >= 0) d_theta -= 2 * M_PI;
+                    while (d_theta < -2 * M_PI) d_theta += 2 * M_PI;
+                }
+                double arc_len = std::abs(d_theta) * minR;
+                
+                // 评分: 路径长度 + 角度惩罚
+                // 角度惩罚权重: 使得算法更倾向于切向切入 (alignment -> 1)
+                // 假设 1000m 的惩罚系数，意味着 10度偏差 (cos~0.985, 1-cos~0.015) => 15m 惩罚
+                double penalty = 1000.0 * (1.0 - alignment);
+                double total_cost = arc_len + l_len + penalty;
+                
+                if(total_cost < best_score) {
+                    best_score = total_cost;
+                    best_idx = i;
+                    best_arc_len = arc_len;
+                    best_line_len = l_len;
+                    best_theta_end = theta;
+                    best_s = s;
+                    best_cx = cx;
+                    best_cy = cy;
+                    best_theta_start = theta_start;
+                    found_any = true;
+                }
+            }
+        }
+    }
+
+    std::vector<ENUPoint> Transition_Path;
+    if(found_any) {
+        // 生成圆弧部分
+        int steps_arc = std::max(1, (int)std::ceil(best_arc_len / resolution));
+        double d_theta_total = (best_s > 0) ? (best_arc_len / minR) : -(best_arc_len / minR);
+        
+        for(int i=0; i<=steps_arc; ++i) {
+            double t = (double)i / steps_arc;
+            double ang = best_theta_start + d_theta_total * t;
+            ENUPoint pt;
+            pt.east = best_cx + minR * std::cos(ang);
+            pt.north = best_cy + minR * std::sin(ang);
+            // 高度线性插值
+            pt.up = p0.up + (Patrol_Path[best_idx].up - p0.up) * (t * best_arc_len / (best_arc_len + best_line_len));
+            Transition_Path.push_back(pt);
+        }
+
+        // 生成直线部分
+        ENUPoint T_end = Transition_Path.back();
+        ENUPoint P_target = Patrol_Path[best_idx];
+        int steps_line = std::max(1, (int)std::ceil(best_line_len / resolution));
+        for(int i=1; i<=steps_line; ++i) {
+            double t = (double)i / steps_line;
+            ENUPoint pt;
+            pt.east = T_end.east + t * (P_target.east - T_end.east);
+            pt.north = T_end.north + t * (P_target.north - T_end.north);
+            pt.up = T_end.up + t * (P_target.up - T_end.up);
+            Transition_Path.push_back(pt);
+        }
+        
+        // 关键步骤: 重新调整巡逻路径 (Plane 3) 的起点，使其从 best_idx 开始
+        // 这样无人机飞完 Plane 2 后能无缝衔接 Plane 3
+        std::vector<ENUPoint> Rotated_Patrol;
+        Rotated_Patrol.reserve(Patrol_Path.size());
+        for(size_t i=0; i<Patrol_Path.size(); ++i) {
+            Rotated_Patrol.push_back(Patrol_Path[(best_idx + i) % Patrol_Path.size()]);
+        }
+        // 闭合
+        Rotated_Patrol.push_back(Rotated_Patrol[0]);
+        
+        std::vector<WGS84Point> Rotated_Patrol_WGS84 = this->enuToWGS84_Batch(Rotated_Patrol, this->origin_);
+        this->putWGS84ToJson(output_json, "uav_leader_plane3", Rotated_Patrol_WGS84);
+        
+    } else {
+        std::cerr << "Warning: Failed to find valid tangent transition, falling back to straight line." << std::endl;
+        // Fallback: 直接连线到最近点
+        ENUPoint p1 = Patrol_Path[0];
+        double dx = p1.east - p0.east;
+        double dy = p1.north - p0.north;
+        double dist = std::hypot(dx, dy);
+        int steps = std::max(1, (int)std::ceil(dist / resolution));
+        for (int i = 0; i <= steps; ++i) {
+            double t = (double)i / steps;
+            ENUPoint q{p0.east + t * dx, p0.north + t * dy, p0.up + t * (p1.up - p0.up)};
+            Transition_Path.push_back(q);
+        }
+    }
+
+    std::vector<WGS84Point> Transition_Path_WGS84 = this->enuToWGS84_Batch(Transition_Path,this->origin_);
+    this->putWGS84ToJson(output_json, "uav_leader_plane2", Transition_Path_WGS84);
 }

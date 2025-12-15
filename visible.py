@@ -268,6 +268,22 @@ def extract_all_plane_trajectories(data, prefix_regex=r'^uav_plane'):
 
     return plane_trajs
 
+def extract_all_leader_trajectories(data, prefix_regex=r'^uav_leader_plane'):
+    """解析 JSON 中所有以 uav_leader_plane 开头的键，返回列表 [(id, [(lon,lat), ...]), ...]
+    """
+    leader_trajs = []
+    if not isinstance(data, dict):
+        return leader_trajs
+
+    for key, val in data.items():
+        if re.match(prefix_regex, key):
+            # 假设 value 是点列表
+            pts = extract_coordinates(data, key)
+            if pts:
+                leader_trajs.append((key, pts))
+
+    return leader_trajs
+
 def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True, plot_3d=None, bg_img=None, bg_extent=None, bg_cmap='gray', elevation_data=None, elevation_extent=None):
     """绘制路径点、leader 轨迹（可选）以及多条 plane 轨迹（plane_trajs 为 [(id, [(lon,lat),...]), ...]）。
 
@@ -305,7 +321,13 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
                 # 计算轨迹包围盒
                 all_coords = []
                 if waypoints: all_coords.extend(waypoints)
-                if leader_traj: all_coords.extend(leader_traj)
+                if leader_traj:
+                    # Check if it is a list of points or list of (id, points)
+                    if len(leader_traj) > 0 and isinstance(leader_traj[0], (list, tuple)) and len(leader_traj[0]) >= 2 and isinstance(leader_traj[0][0], (int, float)):
+                        all_coords.extend(leader_traj)
+                    else:
+                        for _, pts in leader_traj:
+                            all_coords.extend(pts)
                 if plane_trajs:
                     for _, pts in plane_trajs:
                         all_coords.extend(pts)
@@ -399,7 +421,13 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
                 # Calculate trajectory bounding box
                 all_coords = []
                 if waypoints: all_coords.extend(waypoints)
-                if leader_traj: all_coords.extend(leader_traj)
+                if leader_traj:
+                    # Check if it is a list of points or list of (id, points)
+                    if len(leader_traj) > 0 and isinstance(leader_traj[0], (list, tuple)) and len(leader_traj[0]) >= 2 and isinstance(leader_traj[0][0], (int, float)):
+                        all_coords.extend(leader_traj)
+                    else:
+                        for _, pts in leader_traj:
+                            all_coords.extend(pts)
                 if plane_trajs:
                     for _, pts in plane_trajs:
                         all_coords.extend(pts)
@@ -481,19 +509,40 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
 
     # 绘制 leader 轨迹（优先用蓝色）
     if leader_traj:
-        try:
-            if need_3d:
-                traj_x = [p[0] for p in leader_traj]
-                traj_y = [p[1] for p in leader_traj]
-                traj_z = [p[2] if len(p) >= 3 else 0 for p in leader_traj]
-                ax.scatter(traj_x, traj_y, traj_z, c='blue', s=30, marker='.', alpha=0.6, label='Leader Trajectory')
-                ax.plot(traj_x, traj_y, traj_z, 'b-', alpha=0.8, linewidth=1.5)
-            else:
-                traj_x, traj_y = zip(*[(p[0], p[1]) for p in leader_traj])
-                ax.scatter(traj_x, traj_y, c='blue', s=30, marker='.', alpha=0.6, label='Leader Trajectory')
-                ax.plot(traj_x, traj_y, 'b-', alpha=0.8, linewidth=1.5)
-        except Exception:
-            pass
+        # 兼容单条轨迹（点列表）和多条轨迹（[(id, points), ...]）
+        trajs_to_draw = []
+        is_single_traj = False
+        if isinstance(leader_traj, list) and len(leader_traj) > 0:
+            elem = leader_traj[0]
+            # 如果元素是坐标点 (x, y, [z])
+            if isinstance(elem, (list, tuple)) and len(elem) >= 2 and isinstance(elem[0], (int, float)):
+                is_single_traj = True
+        
+        if is_single_traj:
+            trajs_to_draw.append(('Leader Trajectory', leader_traj))
+        elif isinstance(leader_traj, list):
+            trajs_to_draw = leader_traj
+
+        for label, pts in trajs_to_draw:
+            try:
+                if need_3d:
+                    traj_x = [p[0] for p in pts]
+                    traj_y = [p[1] for p in pts]
+                    traj_z = [p[2] if len(p) >= 3 else 0 for p in pts]
+                    ax.scatter(traj_x, traj_y, traj_z, c='blue', s=30, marker='.', alpha=0.6, label=label)
+                    ax.plot(traj_x, traj_y, traj_z, 'b-', alpha=0.8, linewidth=1.5)
+                else:
+                    traj_x, traj_y = zip(*[(p[0], p[1]) for p in pts])
+                    ax.scatter(traj_x, traj_y, c='blue', s=30, marker='.', alpha=0.6, label=label)
+                    ax.plot(traj_x, traj_y, 'b-', alpha=0.8, linewidth=1.5)
+                    # 标注 ID
+                    if label != 'Leader Trajectory':
+                        try:
+                            ax.annotate(f'{label}', (traj_x[0], traj_y[0]), xytext=(4, 4), textcoords='offset points', fontsize=8, color='blue')
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
     # 绘制 plane_trajs（多条），使用 colormap 区分
     if plane_trajs:
@@ -676,12 +725,12 @@ def main(file_path, mode='both'):
         return
 
     # 提取路径点（leader 中的中间航点）
-    waypoints = extract_coordinates(input_data, "leader_midway_point_wgs84")
+    waypoints = extract_coordinates(output_data, "leader_show_points")
     print(f"Found {len(waypoints)} waypoints")
 
     # 提取 leader 轨迹（如果存在）
-    leader_traj = extract_coordinates(output_data, "uav_leader_plane1")
-    print(f"Found {len(leader_traj)} leader trajectory points")
+    leader_traj = extract_all_leader_trajectories(output_data)
+    print(f"Found {len(leader_traj)} leader trajectories")
 
     # 提取所有 uav_plane* 的轨迹（支持多条，每条带 id）
     plane_trajs = extract_all_plane_trajectories(output_data)

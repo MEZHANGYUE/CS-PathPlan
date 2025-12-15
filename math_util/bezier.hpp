@@ -4,6 +4,8 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
+#include <Eigen/Dense>
+#include <string>
 
 namespace math_util
 {
@@ -12,43 +14,58 @@ struct C_Point
 {
   double x;        ///< x_value
   double y;        ///< y value
+  double z;        ///< z value
   double heading;  ///< rad
   C_Point()
   {
     x = 0.0;
     y = 0.0;
+    z = 0.0;
     heading = 0.0;
+  }
+  C_Point(const double & _x, const double & _y, const double & _z, const double & _heading)
+  {
+    x = _x;
+    y = _y;
+    z = _z;
+    heading = _heading;
   }
   C_Point(const double & _x, const double & _y, const double & _heading)
   {
     x = _x;
     y = _y;
+    z = 0.0;
     heading = _heading;
   }
   C_Point(const double & _x, const double & _y)
   {
     x = _x;
     y = _y;
+    z = 0.0;
     heading = 0.0;
   }
-  void Set(const double & _x, const double & _y, const double & _heading)
+  void Set(const double & _x, const double & _y, const double & _z, const double & _heading)
   {
     x = _x;
     y = _y;
+    z = _z;
     heading = _heading;
   }
   void SetX(const double & _x) { x = _x; }
   void SetY(const double & _y) { y = _y; }
+  void SetZ(const double & _z) { z = _z; }
   void SetHeading(const double & _heading) { heading = _heading; }
 
   double GetX() { return x; }
   double GetY() { return y; }
+  double GetZ() { return z; }
   double GetHeading() { return heading; }
 
   void operator=(const C_Point & p)
   {
     x = p.x;
     y = p.y;
+    z = p.z;
     heading = p.heading;
   }
   C_Point operator-(const C_Point & p)
@@ -56,6 +73,7 @@ struct C_Point
     C_Point tmp;
     tmp.x = x - p.x;
     tmp.y = y - p.y;
+    tmp.z = z - p.z;
     tmp.heading = heading - p.heading;
     return tmp;
   }
@@ -64,6 +82,7 @@ struct C_Point
     C_Point tmp;
     tmp.x = x + p.x;
     tmp.y = y + p.y;
+    tmp.z = z + p.z;
     tmp.heading = heading + p.heading;
     return tmp;
   }
@@ -85,6 +104,10 @@ public:
   int GeneratePath();
   bool GetResult();
   std::vector<C_Point> GetResultPath() { return result_path_; }
+
+  // Generate trajectory from a list of waypoints (Nx3 matrix)
+  // Returns sampled trajectory points (Mx3 matrix)
+  Eigen::MatrixXd GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path, double sample_distance_override = -1.0, double v_avg_override = -1.0);
 
 private:
   BezierConfig config_;
