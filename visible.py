@@ -220,6 +220,55 @@ def extract_coordinates(data, path_key):
     return coordinates
 
 
+def extract_prohibited_zones(data):
+    """从数据中提取禁飞区信息
+    返回: [{'polygon': [[lon,lat],...], 'height_range': [min, max]}, ...]
+    """
+    zones = []
+    if isinstance(data, dict) and 'prohibited_zone_wgs84' in data:
+        raw_zones = data['prohibited_zone_wgs84']
+        if isinstance(raw_zones, list):
+            for zone in raw_zones:
+                poly_pts = []
+                h_min, h_max = 0, 1000 # 默认值
+
+                # Case 1: Dict format
+                if isinstance(zone, dict) and 'polygon' in zone and 'height_range' in zone:
+                    poly = zone['polygon']
+                    h_range = zone['height_range']
+                    
+                    if isinstance(poly, list):
+                        for p in poly:
+                            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                                poly_pts.append((p[0], p[1]))
+                            elif isinstance(p, dict):
+                                if 'lat' in p and 'lng' in p:
+                                    poly_pts.append((p['lng'], p['lat']))
+                                elif 'latitude' in p and 'longitude' in p:
+                                    poly_pts.append((p['longitude'], p['latitude']))
+                    
+                    if isinstance(h_range, (list, tuple)) and len(h_range) >= 2:
+                        h_min, h_max = h_range[0], h_range[1]
+
+                # Case 2: List format (points..., height_range)
+                elif isinstance(zone, list) and len(zone) >= 2:
+                    h_range = zone[-1]
+                    poly = zone[:-1]
+                    
+                    for p in poly:
+                        if isinstance(p, (list, tuple)) and len(p) >= 2:
+                            poly_pts.append((p[0], p[1]))
+                    
+                    if isinstance(h_range, (list, tuple)) and len(h_range) >= 2:
+                        h_min, h_max = h_range[0], h_range[1]
+                
+                if poly_pts:
+                    zones.append({
+                        'polygon': poly_pts,
+                        'height_range': [h_min, h_max]
+                    })
+    return zones
+
 def extract_all_plane_trajectories(data, prefix_regex=r'^uav_plane'):
     """解析 JSON 中所有以 uav_plane 开头的键，返回列表 [(id, [(lon,lat), ...]), ...]
 
@@ -284,12 +333,13 @@ def extract_all_leader_trajectories(data, prefix_regex=r'^uav_leader_plane'):
 
     return leader_trajs
 
-def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True, plot_3d=None, bg_img=None, bg_extent=None, bg_cmap='gray', elevation_data=None, elevation_extent=None):
+def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, prohibited_zones=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True, plot_3d=None, bg_img=None, bg_extent=None, bg_cmap='gray', elevation_data=None, elevation_extent=None):
     """绘制路径点、leader 轨迹（可选）以及多条 plane 轨迹（plane_trajs 为 [(id, [(lon,lat),...]), ...]）。
 
     - waypoints: 列表 [(lon,lat), ...]
     - leader_traj: 列表 [(lon,lat), ...]
     - plane_trajs: 列表 [(id, [(lon,lat), ...]), ...]
+    - prohibited_zones: 列表 [{'polygon': [[lon,lat],...], 'height_range': [min, max]}, ...]
     """
     # 自动检测是否需要 3D 绘图：如果任何坐标包含第三维度，则切换为 3D
     need_3d = False
@@ -357,7 +407,7 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
                     ix_start = int((crop_xmin - xmin) / (xmax - xmin) * w)
                     ix_end = int((crop_xmax - xmin) / (xmax - xmin) * w)
                     
-                    # Y: ymax -> ymin (图像行索引 0 对应 ymax)
+                    #
                     iy_start = int((ymax - crop_ymax) / (ymax - ymin) * h)
                     iy_end = int((ymax - crop_ymin) / (ymax - ymin) * h)
                     
@@ -395,6 +445,64 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
                 
     else:
         ax = fig.add_subplot(111)
+
+    # 绘制禁飞区
+    if prohibited_zones:
+        from matplotlib.patches import Polygon
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+        
+        added_label = False
+        for zone in prohibited_zones:
+            poly_points = zone['polygon']
+            height_range = zone['height_range']
+            min_h, max_h = height_range[0], height_range[1]
+            
+            pts = []
+            for p in poly_points:
+                if isinstance(p, (list, tuple)) and len(p) >= 2:
+                    pts.append((p[0], p[1]))
+            
+            if not pts: continue
+            
+            label = 'Prohibited Zone' if not added_label else None
+            
+            if need_3d:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                
+                # Bottom face
+                verts_bottom = [list(zip(xs, ys, [min_h]*len(xs)))]
+                # Top face
+                verts_top = [list(zip(xs, ys, [max_h]*len(xs)))]
+                
+                # Side faces
+                verts_sides = []
+                for i in range(len(pts)):
+                    p1 = pts[i]
+                    p2 = pts[(i+1)%len(pts)]
+                    verts_sides.append([
+                        (p1[0], p1[1], min_h),
+                        (p2[0], p2[1], min_h),
+                        (p2[0], p2[1], max_h),
+                        (p1[0], p1[1], max_h)
+                    ])
+                
+                # Plot faces
+                ax.add_collection3d(Poly3DCollection(verts_bottom, facecolors='red', linewidths=0.5, edgecolors='r', alpha=0.1))
+                ax.add_collection3d(Poly3DCollection(verts_top, facecolors='red', linewidths=0.5, edgecolors='r', alpha=0.1))
+                ax.add_collection3d(Poly3DCollection(verts_sides, facecolors='red', linewidths=0.5, edgecolors='r', alpha=0.1))
+                
+            else:
+                poly = Polygon(pts, closed=True, facecolor='red', edgecolor='red', alpha=0.2, label=label)
+                ax.add_patch(poly)
+                added_label = True
+                
+                # Add text label
+                cx = sum(p[0] for p in pts)/len(pts)
+                cy = sum(p[1] for p in pts)/len(pts)
+                try:
+                    ax.text(cx, cy, "No Fly", color='red', ha='center', va='center', fontsize=8, fontweight='bold')
+                except: pass
 
     # 绘制背景高程图（如果提供）
     # Modified: Use elevation_data (OVR) if available and crop to path range for 2D
@@ -443,69 +551,64 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
                         # Add 20% padding
                         pad_x = (t_xmax - t_xmin) * 0.2
                         pad_y = (t_ymax - t_ymin) * 0.2
-                        if pad_x == 0: pad_x = 0.01
-                        if pad_y == 0: pad_y = 0.01
-                        
-                        # Intersect with map extent
-                        crop_xmin = max(xmin, t_xmin - pad_x)
-                        crop_xmax = min(xmax, t_xmax + pad_x)
-                        crop_ymin = max(ymin, t_ymin - pad_y)
-                        crop_ymax = min(ymax, t_ymax + pad_y)
+                        if pad_x == 0 and pad_y == 0:
+                            crop_xmin = xmin
+                            crop_xmax = xmax
+                            crop_ymin = ymin
+                            crop_ymax = ymax
+                        elif pad_x == 0:
+                            crop_ymin = max(ymin, t_ymin - pad_y)
+                            crop_ymax = min(ymax, t_ymax + pad_y)
+                        elif pad_y == 0:
+                            crop_xmin = max(xmin, t_xmin - pad_x)
+                            crop_xmax = min(xmax, t_xmax + pad_x)
+                        else:
+                            crop_xmin = max(xmin, t_xmin - pad_x)
+                            crop_xmax = min(xmax, t_xmax + pad_x)
+                            crop_ymin = max(ymin, t_ymin - pad_y)
+                            crop_ymax = min(ymax, t_ymax + pad_y)
 
                 if crop_xmax > crop_xmin and crop_ymax > crop_ymin:
-                    # Calculate indices
+                    # 计算对应的索引范围
+                    # X: xmin -> xmax
                     ix_start = int((crop_xmin - xmin) / (xmax - xmin) * w)
                     ix_end = int((crop_xmax - xmin) / (xmax - xmin) * w)
                     
+                    # Y: ymax -> ymin (图像行索引 0 对应 ymax)
                     iy_start = int((ymax - crop_ymax) / (ymax - ymin) * h)
                     iy_end = int((ymax - crop_ymin) / (ymax - ymin) * h)
                     
-                    ix_start = max(0, min(w - 1, ix_start))
-                    ix_end = max(ix_start + 1, min(w, ix_end))
-                    iy_start = max(0, min(h - 1, iy_start))
-                    iy_end = max(iy_start + 1, min(h, iy_end))
+                    # 限制索引范围并确保至少 2x2
+                    ix_start = max(0, min(w - 2, ix_start))
+                    ix_end = max(ix_start + 2, min(w, ix_end))
                     
+                    iy_start = max(0, min(h - 2, iy_start))
+                    iy_end = max(iy_start + 2, min(h, iy_end))
+                    
+                    # 重新计算实际的 crop 范围，以匹配调整后的索引
                     real_crop_xmin = xmin + (ix_start / w) * (xmax - xmin)
                     real_crop_xmax = xmin + (ix_end / w) * (xmax - xmin)
                     real_crop_ymax = ymax - (iy_start / h) * (ymax - ymin)
                     real_crop_ymin = ymax - (iy_end / h) * (ymax - ymin)
 
                     if ix_end > ix_start and iy_end > iy_start:
-                        sub_data = img_to_plot[iy_start:iy_end, ix_start:ix_end]
-                        ax.imshow(sub_data, cmap=bg_cmap, extent=[real_crop_xmin, real_crop_xmax, real_crop_ymin, real_crop_ymax], origin='upper', alpha=0.7, zorder=0)
-                        print(f"Plotted cropped background (range: x[{real_crop_xmin:.4f}, {real_crop_xmax:.4f}], y[{real_crop_ymin:.4f}, {real_crop_ymax:.4f}])")
+                        sub_data = elevation_data[iy_start:iy_end, ix_start:ix_end]
+                        
+                        # 生成网格
+                        sub_x = np.linspace(real_crop_xmin, real_crop_xmax, ix_end - ix_start)
+                        sub_y = np.linspace(real_crop_ymax, real_crop_ymin, iy_end - iy_start)
+                        X, Y = np.meshgrid(sub_x, sub_y)
+                        
+                        # 使用 terrain colormap
+                        ax.imshow(sub_data, cmap='terrain', extent=(real_crop_xmin, real_crop_xmax, real_crop_ymin, real_crop_ymax), alpha=0.5, origin='upper', zorder=0)
+                        print(f"Plotted 2D elevation image (range: x[{real_crop_xmin:.4f}, {real_crop_xmax:.4f}], y[{real_crop_ymin:.4f}, {real_crop_ymax:.4f}])")
                     else:
-                         print("Warning: Cropped area empty")
+                        print("Warning: Cropped elevation area is empty.")
                 else:
-                    # Fallback
-                    ax.imshow(img_to_plot, cmap=bg_cmap, extent=extent_to_plot, origin='upper', alpha=0.7, zorder=0)
-            except Exception as e:
-                print(f"Warning: failed to draw background elevation image: {e}")
+                    print("Warning: Trajectory is outside elevation map extent.")
 
-    # 绘制路径点
-    if waypoints:
-        # 支持 (x,y) 或 (x,y,z)
-        if need_3d:
-            wp_x = [p[0] for p in waypoints]
-            wp_y = [p[1] for p in waypoints]
-            wp_z = [p[2] if len(p) >= 3 else 0 for p in waypoints]
-            ax.scatter(wp_x, wp_y, wp_z, c='red', s=80, marker='o', label='Waypoints', zorder=5)
-            ax.plot(wp_x, wp_y, wp_z, 'r--', alpha=0.7, linewidth=2, label='Planned Path')
-            for i, (x, y, *rest) in enumerate(waypoints):
-                z = rest[0] if rest else 0
-                try:
-                    ax.text(x, y, z, f'{i}', fontsize=8, color='red')
-                except Exception:
-                    pass
-        else:
-            wp_x, wp_y = zip(*[(p[0], p[1]) for p in waypoints])
-            ax.scatter(wp_x, wp_y, c='red', s=80, marker='o', label='Waypoints', zorder=5)
-            ax.plot(wp_x, wp_y, 'r--', alpha=0.7, linewidth=2, label='Planned Path')
-            for i, (x, y, z) in enumerate(waypoints):  #高度不用,但需要读取
-                try:
-                    ax.annotate(f'{i}', (x, y), xytext=(5, 5), textcoords='offset points', fontsize=8, color='red')
-                except Exception:
-                    pass
+            except Exception as e:
+                print(f"Warning: failed to plot 2D elevation: {e}")
 
     # 绘制 leader 轨迹（优先用蓝色）
     if leader_traj:
@@ -736,6 +839,10 @@ def main(file_path, mode='both'):
     plane_trajs = extract_all_plane_trajectories(output_data)
     print(f"Found {len(plane_trajs)} plane trajectories (uav_plane*)")
 
+    # 提取禁飞区信息
+    prohibited_zones = extract_prohibited_zones(input_data)
+    print(f"Found {len(prohibited_zones)} prohibited zones")
+
     if not waypoints and not leader_traj and not plane_trajs:
         print("No valid waypoint or trajectory data found")
         return
@@ -785,6 +892,7 @@ def main(file_path, mode='both'):
             waypoints=waypoints, 
             leader_traj=leader_traj if leader_traj else None, 
             plane_trajs=plane_trajs, 
+            prohibited_zones=prohibited_zones, 
             title=f"{uav_id} Path Planning and Execution Trajectory ({suffix.upper()})", 
             save_path=save_path, 
             plot_3d=is_3d, 

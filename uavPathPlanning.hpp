@@ -9,6 +9,7 @@
 #include <vector>
 #include<iostream>
 #include "math_util/minimum_snap.hpp"
+#include "math_util/polygon2d.hpp"
 #include <algorithm>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
@@ -24,6 +25,11 @@ struct GeoTransform {
   double origin_y; // top-left Y
   double rot_y;
   double pixel_h;  // pixel height (negative if north-up)
+};
+
+struct ProhibitedZone {
+    std::vector<WGS84Coord> polygon;
+    std::pair<double, double> height_range;
 };
 
 struct InputData
@@ -42,6 +48,8 @@ struct InputData
     std::vector<WGS84Coord> ready_zone;
     WGS84Coord uav_leader_start_point_wgs84 = {0.0, 0.0, 0.0};
     std::pair<int, std::pair<int, int>> uavs_plane_data;
+    bool has_prohibited_zone = false;
+    std::vector<ProhibitedZone> prohibited_zones;
 };
 
 struct OutputData
@@ -140,6 +148,9 @@ public:
     void computeTransitionAndRotatePatrol(const ENUPoint& p0, double heading0, double minR, double resolution, 
                                           const std::vector<ENUPoint>& Patrol_Path, json& output_json);
 
+    // 避障处理
+    std::vector<ENUPoint> avoidProhibitedZones(const std::vector<ENUPoint>& path);
+
     // 坐标变换
     ENUPoint wgs84ToENU(const WGS84Point& target, const WGS84Point& reference);
     WGS84Point enuToWGS84(const ENUPoint& enu, const WGS84Point& reference);
@@ -205,6 +216,7 @@ private:
     // 内部状态
     TrajectoryGeneratorTool generator_;
     WGS84Point origin_;
+    InputData input_data_; // 存储解析后的输入数据，避免重复解析
     // 提取的高度优化器函数仍在 cpp 中实现为私有方法
     // 现在只输入高程文件路径（例如 .tif），函数直接使用类成员 Trajectory_ENU 进行高度优化
     // bool runAltitudeOptimization(const std::string &elev_file);

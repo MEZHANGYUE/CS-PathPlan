@@ -11,6 +11,9 @@
 #include <Eigen/SparseCholesky>
 #include <sys/stat.h>
 #include <iomanip> // Added for std::setprecision
+#include <queue>
+#include <map>
+#include "math_util/polygon2d.hpp"
 
 #ifdef HAVE_GDAL
 #include <gdal_priv.h>
@@ -559,18 +562,12 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
             this->putWGS84ToJson(output_json, "uav_leader_plane1", Trajectory_WGS84);
             
             // 3. Re-generate follower trajectories
-            InputData input_data;
-            json input_json_copy = input_json; // Make a copy because loadData takes non-const ref
-            if (this->loadData(input_data, input_json_copy)) {
-                 try {
-                    json plane_array = this->generateFollowerTrajectories(input_json_copy, input_data, this->Trajectory_ENU, Trajectory_WGS84);
-                    output_json["uav_plane1"] = plane_array;
-                    std::cerr << "AltitudeOptimizer: updated output_json with new trajectories.\n";
-                } catch (const std::exception &e) {
-                    std::cerr << "AltitudeOptimizer: failed to update follower trajectories: " << e.what() << std::endl;
-                }
-            } else {
-                 std::cerr << "AltitudeOptimizer: failed to parse input_json for follower update.\n";
+            try {
+                json plane_array = this->generateFollowerTrajectories(input_json, this->input_data_, this->Trajectory_ENU, Trajectory_WGS84);
+                output_json["uav_plane1"] = plane_array;
+                std::cerr << "AltitudeOptimizer: updated output_json with new trajectories.\n";
+            } catch (const std::exception &e) {
+                std::cerr << "AltitudeOptimizer: failed to update follower trajectories: " << e.what() << std::endl;
             }
 
             return true;
@@ -1369,8 +1366,8 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     int midwaypoint_num=0;
     int zhandoupoint_num=0;
     double distance;
-    InputData input_data;
-    if (!loadData(input_data, input_json))
+    // InputData input_data; // Removed local variable
+    if (!loadData(this->input_data_, input_json)) // Use member variable
     {
         std::cerr << "Failed to load intput json data." << std::endl;
     }
@@ -1432,7 +1429,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         }
     } catch(...) { leader_speed = -1.0; }
     // 将 leader_speed 写回 input_data 以便其他函数使用
-    if (leader_speed > 0) input_data.leader_speed = leader_speed;
+    if (leader_speed > 0) this->input_data_.leader_speed = leader_speed;
 
     
     // 提取用于轨迹生成的点（排除末尾的 zhandou points）
@@ -1443,17 +1440,23 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         planning_waypoints = Enu_waypoint;
     }
 
+    // 避障处理
+    if (this->input_data_.has_prohibited_zone) {
+        std::cout << "Applying prohibited zone avoidance..." << std::endl;
+        planning_waypoints = this->avoidProhibitedZones(planning_waypoints);
+    }
+
     if (algorithm == "minimum_snap") {
         if (use3D) {
-            Trajectory_ENU = this->Minisnap_3D(planning_waypoints, distance, input_data.leader_speed);
+            Trajectory_ENU = this->Minisnap_3D(planning_waypoints, distance, this->input_data_.leader_speed);
         } else {
-            Trajectory_ENU = this->Minisnap_EN(planning_waypoints, distance, input_data.leader_speed);
+            Trajectory_ENU = this->Minisnap_EN(planning_waypoints, distance, this->input_data_.leader_speed);
         }
     } else if (algorithm == "bspline") {
         std::cerr << "bspline algorithm not implemented yet." << std::endl;
         return false;
     } else if (algorithm == "bezier") {
-        Trajectory_ENU = this->Bezier_3D(planning_waypoints, distance, input_data.leader_speed, input_data.min_turning_radius);
+        Trajectory_ENU = this->Bezier_3D(planning_waypoints, distance, this->input_data_.leader_speed, this->input_data_.min_turning_radius);
     } else {
         std::cerr << "Unknown algorithm: " << algorithm << ". Please use one of: minimum_snap, bspline, bezier" << std::endl;
         return false;
@@ -1495,7 +1498,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
 
     // 生成并写入跟随者轨迹
     try {
-        json plane_array = this->generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
+        json plane_array = this->generateFollowerTrajectories(input_json, this->input_data_, Trajectory_ENU, Trajectory_WGS84);
         output_json["uav_plane1"] = plane_array;
     } catch (const std::exception &e) {
         std::cerr << "调用 generateFollowerTrajectories 出错: " << e.what() << std::endl;
@@ -1522,7 +1525,7 @@ if(input_json["high_zhandou_point_wgs84"].size()!=0)   //存在高战斗区域�
         Patrol_waypoints.push_back(Patrol_waypoints[1]);
     }
 
-    std::vector<ENUPoint> Patrol_Path_Full = Minisnap_3D(Patrol_waypoints, distance, input_data.leader_speed);
+    std::vector<ENUPoint> Patrol_Path_Full = Minisnap_3D(Patrol_waypoints, distance, this->input_data_.leader_speed);
     
     if (Patrol_waypoints.size() > 2 && !Patrol_Path_Full.empty()) {
         // 目标截断点是倒数第二个航点 (P0)
@@ -1569,12 +1572,13 @@ if(input_json["high_zhandou_point_wgs84"].size()!=0 && !Trajectory_ENU.empty() &
     ENUPoint p0 = Trajectory_ENU.back(); // 起点 ENU
     double heading0 = final_heading; // 起点朝向
 
-    // 计算并更新跟随者轨迹
-    json plane_array = this->generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
-    output_json["uav_plane1"] = plane_array;
+    //僚机和长机巡逻区域不一样,所以注释掉
+    // // 计算并更新跟随者轨迹
+    // json plane_array = this->generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
+    // output_json["uav_plane1"] = plane_array;
 
     // 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
-    computeTransitionAndRotatePatrol(p0, heading0, input_data.min_turning_radius, distance, Patrol_Path, output_json);
+    computeTransitionAndRotatePatrol(p0, heading0, this->input_data_.min_turning_radius, distance, Patrol_Path, output_json);
 }
 
 
@@ -1691,6 +1695,22 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
 
     // 获取安全距离
     double safety_distance = 50.0; // 默认值
+
+    // 尝试从 config.yaml 读取
+    std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
+    for (const auto& path : config_paths) {
+        try {
+            YAML::Node config = YAML::LoadFile(path);
+            if (config["path_planning"] && config["path_planning"]["safe_distance"]) {
+                safety_distance = config["path_planning"]["safe_distance"].as<double>();
+                std::cout << "Loaded safe_distance from " << path << ": " << safety_distance << std::endl;
+                break; 
+            }
+        } catch (...) {
+            // ignore
+        }
+    }
+
     if (input_json.contains("safety_distance")) {
         safety_distance = input_json["safety_distance"].get<double>();
     }
@@ -1761,7 +1781,8 @@ json UavPathPlanner::generateVShapeTrajectories(const json &uavs_ids, const json
             double heading = leader_headings[t];
             double c = cos(heading);
             double s_ = sin(heading);
-            Eigen::Matrix2d Rt; Rt << c, -s_, s_, c;
+            Eigen::Matrix2d Rt; Rt << c, -s_,
+                                      s_,  c;
             Eigen::Vector2d offset_global = Rt * rel_body;
 
             ENUPoint fp;
@@ -1830,7 +1851,8 @@ json UavPathPlanner::generateLineShapeTrajectories(const json &uavs_ids, const j
             double heading = leader_headings[t];
             double c = cos(heading);
             double s_ = sin(heading);
-            Eigen::Matrix2d Rt; Rt << c, -s_, s_, c;
+            Eigen::Matrix2d Rt; Rt << c, -s_,
+                                      s_,  c;
             Eigen::Vector2d offset_global = Rt * rel_body;
 
             ENUPoint fp;
@@ -2125,6 +2147,38 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
     {
         std::cout << "uavs_plane_data is empty." << std::endl;
     }
+
+    if (input_json.contains("prohibited_zone_wgs84") && !input_json["prohibited_zone_wgs84"].empty())
+    {
+        auto zones = input_json["prohibited_zone_wgs84"];
+        input_data.has_prohibited_zone = true;
+        for (const auto& zone : zones) {
+            ProhibitedZone p_zone;
+            if (zone.size() < 2) continue; 
+
+            // The last element is height range
+            auto height_range_json = zone.back();
+            if (height_range_json.size() == 2) {
+                p_zone.height_range = {height_range_json[0], height_range_json[1]};
+            } else {
+                p_zone.height_range = {0.0, 0.0};
+            }
+
+            // The rest are polygon points
+            for (size_t i = 0; i < zone.size() - 1; ++i) {
+                auto point_json = zone[i];
+                if (point_json.size() >= 2) {
+                    p_zone.polygon.emplace_back(WGS84Coord(point_json[0], point_json[1], 0.0));
+                }
+            }
+            input_data.prohibited_zones.push_back(p_zone);
+        }
+    }
+    else
+    {
+        input_data.has_prohibited_zone = false;
+        std::cout << "prohibited_zone_wgs84 is empty or missing." << std::endl;
+    }
     if (input_json["uav_leader_id"].size() != 0)
     {
         auto value = input_json["uav_leader_id"];
@@ -2387,7 +2441,7 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
                 double lx = pt.east - tx;
                 double ly = pt.north - ty;
                 double l_len = std::hypot(lx, ly);
-                if(l_len < 1e-3) continue;
+                if (l_len < 1e-3) continue;
                 double l_dx = lx / l_len;
                 double l_dy = ly / l_len;
 
@@ -2396,12 +2450,12 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
                 double tan_y = s * std::cos(theta);
 
                 // 检查1: 直线方向必须与圆的切线方向一致 (cos theta > 0)
-                if(tan_x * l_dx + tan_y * l_dy < 0.99) continue; 
+                if (tan_x * l_dx + tan_y * l_dy < 0.99) continue; 
 
                 // 检查2: 切入角度与巡逻方向的对齐程度
                 double alignment = l_dx * patrol_dx + l_dy * patrol_dy;
                 // 严格限制切入角度，例如必须小于 36 度 (cos > 0.8)
-                if(alignment < 0.8) continue;
+                if (alignment < 0.8) continue;
 
                 // 计算弧长
                 double d_theta = theta - theta_start;
@@ -2496,4 +2550,207 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
 
     std::vector<WGS84Point> Transition_Path_WGS84 = this->enuToWGS84_Batch(Transition_Path,this->origin_);
     this->putWGS84ToJson(output_json, "uav_leader_plane2", Transition_Path_WGS84);
+}
+
+std::vector<ENUPoint> UavPathPlanner::avoidProhibitedZones(const std::vector<ENUPoint>& path) {
+    if (input_data_.prohibited_zones.empty() || path.size() < 2) {
+        return path;
+    }
+
+    // Pre-process zones to ENU polygons
+    struct ENUZone {
+        Polygon2d poly;
+        double min_h, max_h;
+    };
+    std::vector<ENUZone> enu_zones;
+    for (const auto& zone : input_data_.prohibited_zones) {
+        std::vector<Vec2d> points;
+        for (const auto& p : zone.polygon) {
+            WGS84Point pt_wgs84;
+            pt_wgs84.lon = p.lon;
+            pt_wgs84.lat = p.lat;
+            pt_wgs84.alt = p.alt;
+            ENUPoint enu = wgs84ToENU(pt_wgs84, origin_);
+            points.emplace_back(enu.east, enu.north);
+        }
+        if (points.size() < 3) continue;
+        enu_zones.push_back({Polygon2d(points), zone.height_range.first, zone.height_range.second});
+    }
+
+    std::vector<ENUPoint> current_path = path;
+    bool collision_found = true;
+    int max_iterations = 5;
+    int iter = 0;
+
+    while (collision_found && iter < max_iterations) {
+        collision_found = false;
+        std::vector<ENUPoint> next_path;
+        next_path.push_back(current_path[0]);
+        iter++;
+        
+        // std::cout << "Avoidance iteration " << iter << ", path size: " << current_path.size() << std::endl;
+
+        for (size_t i = 0; i < current_path.size() - 1; ++i) {
+            ENUPoint p1 = next_path.back(); 
+            ENUPoint p2 = current_path[i+1];
+            
+            LineSegment2d segment(Vec2d(p1.east, p1.north), Vec2d(p2.east, p2.north));
+            double seg_min_h = std::min(p1.up, p2.up);
+            double seg_max_h = std::max(p1.up, p2.up);
+
+            int intersected_zone_idx = -1;
+            
+            for (size_t z = 0; z < enu_zones.size(); ++z) {
+                const auto& zone = enu_zones[z];
+                if (seg_max_h < zone.min_h || seg_min_h > zone.max_h) continue;
+
+                if (zone.poly.DistanceTo(segment) < 50) { //距离禁飞区距离小于10,判定为冲突
+                    intersected_zone_idx = z;
+                    break; 
+                }
+            }
+
+            if (intersected_zone_idx != -1) {
+                collision_found = true;
+                std::cout << "Avoidance: Segment intersects prohibited zone " << intersected_zone_idx << " (iter " << iter << ")" << std::endl;
+                const auto& zone = enu_zones[intersected_zone_idx];
+                
+                // --- 1. Calculate Horizontal Detour Cost ---
+                std::vector<Vec2d> nodes;
+                nodes.push_back(Vec2d(p1.east, p1.north)); // Node 0
+                nodes.push_back(Vec2d(p2.east, p2.north)); // Node 1
+                
+                Vec2d center(0,0);
+                for(const auto& pt : zone.poly.points()) center += pt;
+                center /= zone.poly.points().size();
+
+                for (const auto& pt : zone.poly.points()) {
+                    Vec2d dir = pt - center;
+                    dir.Normalize();
+                    nodes.push_back(pt + dir * 100.0); // Expand 100m for safety
+                }
+
+                int n = nodes.size();
+                std::vector<double> dist(n, std::numeric_limits<double>::max());
+                std::vector<int> parent(n, -1);
+                dist[0] = 0;
+                
+                std::priority_queue<std::pair<double, int>, std::vector<std::pair<double, int>>, std::greater<>> pq;
+                pq.push({0, 0});
+
+                while(!pq.empty()) {
+                    double d = pq.top().first;
+                    int u = pq.top().second;
+                    pq.pop();
+
+                    if (d > dist[u]) continue;
+                    if (u == 1) break; 
+
+                    for (int v = 0; v < n; ++v) {
+                        if (u == v) continue;
+                        
+                        Vec2d mid = (nodes[u] + nodes[v]) / 2.0;
+                        // Check if strictly inside
+                        if (zone.poly.IsPointIn(mid) && zone.poly.DistanceToBoundary(mid) > 0.1) continue; 
+
+                        double weight = nodes[u].DistanceTo(nodes[v]);
+                        if (dist[u] + weight < dist[v]) {
+                            dist[v] = dist[u] + weight;
+                            parent[v] = u;
+                            pq.push({dist[v], v});
+                        }
+                    }
+                }
+
+                double horizontal_cost = dist[1];
+                if (horizontal_cost != std::numeric_limits<double>::max()) {
+                    horizontal_cost += std::abs(p2.up - p1.up);
+                }
+
+                // --- 2. Calculate Vertical Avoidance Cost ---
+                double safe_alt = zone.max_h + 50.0; // 20m buffer
+                double target_h = std::max(safe_alt, std::max(p1.up, p2.up));
+                
+                Vec2d overlap_start, overlap_end;
+                bool has_overlap = zone.poly.GetOverlap(segment, &overlap_start, &overlap_end);
+                
+                double vertical_cost = std::numeric_limits<double>::max();
+                
+                if (has_overlap) {
+                    // Ensure start is closer to p1
+                    if (overlap_start.DistanceSquareTo(Vec2d(p1.east, p1.north)) > overlap_end.DistanceSquareTo(Vec2d(p1.east, p1.north))) {
+                        std::swap(overlap_start, overlap_end);
+                    }
+                    
+                    // Cost = p1 -> start_high -> end_high -> p2
+                    // We approximate the flight path distance
+                    double d1 = std::hypot(p1.east - overlap_start.x(), p1.north - overlap_start.y()); 
+                    double h1 = std::abs(target_h - p1.up);
+                    double leg1 = std::hypot(d1, h1); 
+                    
+                    double d2 = overlap_start.DistanceTo(overlap_end);
+                    double leg2 = d2; // at constant height target_h
+                    
+                    double d3 = std::hypot(p2.east - overlap_end.x(), p2.north - overlap_end.y());
+                    double h3 = std::abs(target_h - p2.up);
+                    double leg3 = std::hypot(d3, h3);
+                    
+                    vertical_cost = leg1 + leg2 + leg3;
+                } else {
+                    // Fallback if no strict overlap but close
+                    double dist_2d = std::hypot(p1.east - p2.east, p1.north - p2.north);
+                    vertical_cost = std::abs(target_h - p1.up) + dist_2d + std::abs(target_h - p2.up);
+                }
+
+                // --- 3. Choose Best Strategy ---
+                if (horizontal_cost != std::numeric_limits<double>::max() && horizontal_cost <= vertical_cost) {
+                    // Apply Horizontal Detour
+                    std::cout << "  Strategy: Horizontal Detour (Cost: " << horizontal_cost << " vs Vertical: " << vertical_cost << ")" << std::endl;
+                    std::vector<ENUPoint> detour;
+                    int curr = 1;
+                    while (curr != 0) {
+                        detour.push_back({nodes[curr].x(), nodes[curr].y(), 0.0}); 
+                        curr = parent[curr];
+                    }
+                    std::reverse(detour.begin(), detour.end());
+                    
+                    for (size_t k = 0; k < detour.size(); ++k) {
+                        if (k == detour.size() - 1) {
+                            detour[k].up = p2.up;
+                        } else {
+                            detour[k].up = p1.up;
+                        }
+                    }
+                    next_path.insert(next_path.end(), detour.begin(), detour.end());
+
+                } else {
+                    // Apply Vertical Avoidance
+                    std::cout << "  Strategy: Vertical Avoidance (Cost: " << vertical_cost << " vs Horizontal: " << horizontal_cost << ")" << std::endl;
+                    
+                    if (has_overlap) {
+                        // Ensure start is closer to p1 (re-check as swap was local to if block scope if I didn't use references, but here I used local vars)
+                        // Actually I swapped the local vars overlap_start/end, so they are correct now.
+                        
+                        next_path.push_back({overlap_start.x(), overlap_start.y(), target_h});
+                        next_path.push_back({overlap_end.x(), overlap_end.y(), target_h});
+                        next_path.push_back(p2);
+                    } else {
+                        next_path.push_back({p1.east, p1.north, target_h});
+                        next_path.push_back({p2.east, p2.north, target_h});
+                        next_path.push_back(p2);
+                    }
+                }
+
+            } else {
+                next_path.push_back(p2);
+            }
+        }
+        current_path = next_path;
+    }
+    
+    if (collision_found) {
+        std::cerr << "Avoidance: Max iterations reached, path might still intersect zones." << std::endl;
+    }
+
+    return current_path;
 }
