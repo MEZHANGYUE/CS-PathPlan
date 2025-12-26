@@ -148,6 +148,9 @@ public:
     void computeTransitionAndRotatePatrol(const ENUPoint& p0, double heading0, double minR, double resolution, 
                                           const std::vector<ENUPoint>& Patrol_Path, json& output_json);
 
+    // 将轨迹信息追加到 output_json 的 using_midway_lines 字段
+    void appendTrajectoryToOutput(json &output_json, int uav_id, int segment_id, const std::vector<WGS84Point> &traj);
+
     // 避障处理
     std::vector<ENUPoint> avoidProhibitedZones(const std::vector<ENUPoint>& path);
 

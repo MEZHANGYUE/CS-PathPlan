@@ -1407,7 +1407,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             }
                }
         // filtered_wpts.push_back(Enu_waypoint.back()); // Always keep the last point
-        // 将剩余的点（包括最后一个 midway 点和所有 zhandou 点）加入
+        // 将剩余的点（包括最后一个 midway 点和所有的 zhandou 点）添加到结果中
         int start_idx = (midwaypoint_num > 0) ? (midwaypoint_num - 1) : 0;
         for (size_t i = start_idx; i < Enu_waypoint.size(); ++i) {
             filtered_wpts.push_back(Enu_waypoint[i]);
@@ -1469,6 +1469,8 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     std::vector<WGS84Point> Trajectory_WGS84 = this->enuToWGS84_Batch(Trajectory_ENU,this->origin_);
     // 将经纬高路径写入 output_json —— leader
     this->putWGS84ToJson(output_json, "uav_leader_plane1", Trajectory_WGS84);
+    this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, 1, Trajectory_WGS84);
+
     // uav_plane1 用于保存编队（followers）列表，每个子数组以 follower id 开头后跟点列表
     json plane_array = json::array();
 
@@ -1500,6 +1502,21 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     try {
         json plane_array = this->generateFollowerTrajectories(input_json, this->input_data_, Trajectory_ENU, Trajectory_WGS84);
         output_json["uav_plane1"] = plane_array;
+        
+        // 将跟随者轨迹添加到 using_midway_lines
+        for (const auto& follower : plane_array) {
+            if (follower.empty()) continue;
+            int uid = follower[0].get<int>();
+            std::vector<WGS84Point> follower_traj;
+            for (size_t i = 1; i < follower.size(); ++i) {
+                follower_traj.push_back({
+                    follower[i][0].get<double>(),
+                    follower[i][1].get<double>(),
+                    follower[i][2].get<double>()
+                });
+            }
+            this->appendTrajectoryToOutput(output_json, uid, 1, follower_traj);
+        }
     } catch (const std::exception &e) {
         std::cerr << "调用 generateFollowerTrajectories 出错: " << e.what() << std::endl;
     }
@@ -1561,6 +1578,10 @@ if(input_json["high_zhandou_point_wgs84"].size()!=0)   //存在高战斗区域�
     Patrol_Path.push_back(Patrol_Path[0]); //闭合巡逻路径
     std::vector<WGS84Point> Patrol_Path_WGS84 = this->enuToWGS84_Batch(Patrol_Path,this->origin_);
     this->putWGS84ToJson(output_json, "uav_leader_plane3", Patrol_Path_WGS84);
+    
+    if (Trajectory_ENU.empty()) {
+        this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, 3, Patrol_Path_WGS84);
+    }
 
 }
 
@@ -2532,6 +2553,7 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
         
         std::vector<WGS84Point> Rotated_Patrol_WGS84 = this->enuToWGS84_Batch(Rotated_Patrol, this->origin_);
         this->putWGS84ToJson(output_json, "uav_leader_plane3", Rotated_Patrol_WGS84);
+        this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, 3, Rotated_Patrol_WGS84);
         
     } else {
         std::cerr << "Warning: Failed to find valid tangent transition, falling back to straight line." << std::endl;
@@ -2550,6 +2572,7 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
 
     std::vector<WGS84Point> Transition_Path_WGS84 = this->enuToWGS84_Batch(Transition_Path,this->origin_);
     this->putWGS84ToJson(output_json, "uav_leader_plane2", Transition_Path_WGS84);
+    this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, 2, Transition_Path_WGS84);
 }
 
 std::vector<ENUPoint> UavPathPlanner::avoidProhibitedZones(const std::vector<ENUPoint>& path) {
@@ -2753,4 +2776,24 @@ std::vector<ENUPoint> UavPathPlanner::avoidProhibitedZones(const std::vector<ENU
     }
 
     return current_path;
+}
+
+void UavPathPlanner::appendTrajectoryToOutput(json &output_json, int uav_id, int segment_id, const std::vector<WGS84Point> &traj) {
+    if (!output_json.contains("using_midway_lines")) {
+        output_json["using_midway_lines"] = json::array();
+    }
+
+    json segment_entry = json::array();
+    segment_entry.push_back(uav_id);
+    segment_entry.push_back(segment_id);
+
+    for (const auto& point : traj) {
+        json point_array = json::array();
+        point_array.push_back(point.lon);
+        point_array.push_back(point.lat);
+        point_array.push_back(point.alt);
+        segment_entry.push_back(point_array);
+    }
+
+    output_json["using_midway_lines"].push_back(segment_entry);
 }
