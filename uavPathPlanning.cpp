@@ -1675,19 +1675,24 @@ json UavPathPlanner::generateTriangleShapeTrajectories(const json &uavs_ids, con
         start_wp.lat = s[1].get<double>();
         start_wp.alt = s.size() >= 3 ? s[2].get<double>() : 0.0;
 
-        // Triangle layers: row 1 has 1 UAV, row 2 has 2 UAVs, ...
+        // Triangle (Delta) layers for followers:
+        // row 1: 2 UAVs at (-d, ±d)
+        // row 2: 3 UAVs at (-2d, -2d/0/+2d)
+        // ... row r: (r+1) UAVs
         int k = static_cast<int>(idx) + 1; // 1-based follower index
         int row = 1;
         int prev_count = 0;
-        while (prev_count + row < k) {
-            prev_count += row;
+        while (prev_count + (row + 1) < k) {
+            prev_count += (row + 1);
             row++;
         }
-        int pos_in_row = k - prev_count - 1; // 0..row-1
+        int pos_in_row = k - prev_count - 1; // 0..row
 
+        // Use body frame: +x forward, +y left
         double dx = -row * safety_distance;
-        double center = (row - 1) / 2.0;
-        double dy = (pos_in_row - center) * 2.0 * safety_distance;
+        double center = (double)row / 2.0;
+        // Make the first UAV on the left side (consistent with V-shape idx%2==0 => left)
+        double dy = (center - pos_in_row) * 2.0 * safety_distance;
 
         Eigen::Vector2d rel_body(dx, dy);
         double rel_up = 0.0;
