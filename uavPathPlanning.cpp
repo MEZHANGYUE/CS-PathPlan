@@ -1360,6 +1360,9 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
     // 编队距离：改用 formation_distance
     double formation_distance = 50.0; // 默认值（若 config.yaml/输入未提供，则沿用旧默认）
 
+    // 竖一字形编队：每一列最多支持的行数（无人机数量）
+    int uav_formation_max_row = 8; // 默认值，最小为 1
+
     // 编队距离下限约束：如果 formation_distance < (2*position_misalignment + uav_R)*1.41421 则自动扩大
     double position_misalignment = 0.0; // 无人机定位误差（米）
     double uav_R = 2.0;                 // 机体半径/安全包络（米）
@@ -1377,6 +1380,9 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
                 }
                 if (pp["position_misalignment"]) {
                     position_misalignment = pp["position_misalignment"].as<double>();
+                }
+                if (pp["uav_formation_max_row"]) {
+                    uav_formation_max_row = pp["uav_formation_max_row"].as<int>();
                 }
             }
             // uav_R 位于 altitude_optimization 配置段（与高度优化共用参数）
@@ -1404,6 +1410,11 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
     if (input_json.contains("uav_R")) {
         uav_R = input_json["uav_R"].get<double>();
     }
+    if (input_json.contains("uav_formation_max_row")) {
+        uav_formation_max_row = input_json["uav_formation_max_row"].get<int>();
+    }
+
+    if (uav_formation_max_row < 1) uav_formation_max_row = 1;
 
     const double min_formation_distance = (2.0 * position_misalignment + uav_R) * 1.41421;
     if (formation_distance < min_formation_distance) {
@@ -1423,7 +1434,7 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
         plane_array = generateLineShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, formation_distance);
     } else if (input_data.formation_model == 3) {
         std::cout << "Formation Model: 一字形编队(竖)" << std::endl;
-        plane_array = generateVerticalLineShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, formation_distance);
+        plane_array = generateVerticalLineShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, uav_formation_max_row, formation_distance);
     } else if (input_data.formation_model == 4) {
         std::cout << "Formation Model: 三角形编队" << std::endl;
         plane_array = generateTriangleShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, formation_distance);
@@ -1583,10 +1594,13 @@ json UavPathPlanner::generateVerticalLineShapeTrajectories(const json &uavs_ids,
                                                            const std::vector<Eigen::Vector2d> &leader_xy,
                                                            const std::vector<double> &leader_headings,
                                                            const std::vector<ENUPoint> &Trajectory_ENU,
+                                                           int uav_formation_max_row,
                                                            double safety_distance)
 {
     (void)leader_start_enu;
     (void)R0;
+
+    if (uav_formation_max_row < 1) uav_formation_max_row = 1;
 
     json plane_array = json::array();
     size_t N = Trajectory_ENU.size();
@@ -1603,9 +1617,34 @@ json UavPathPlanner::generateVerticalLineShapeTrajectories(const json &uavs_ids,
         start_wp.alt = s.size() >= 3 ? s[2].get<double>() : 0.0;
 
         // Vertical line (trail) geometry: behind leader along body -x
-        int row = static_cast<int>(idx) + 1;
-        double dx = -row * safety_distance;
+        // uav_formation_max_row 语义：每一列最多支持的“总行数”。主列(col=0)包含长机，因此主列最多容纳 (max_row-1) 架僚机。
+        // 超出则自动增加列数，后续列不含长机，每列最多 max_row 架僚机。
+        int max_row = uav_formation_max_row;
+        int cap_col0 = std::max(0, max_row - 1);
+        int col = 0;
+        int row_in_col = 0;
+
+        int follower_index = static_cast<int>(idx); // 0-based
+        if (cap_col0 > 0 && follower_index < cap_col0) {
+            col = 0;
+            row_in_col = follower_index; // 0..cap_col0-1
+        } else {
+            int rest = follower_index - cap_col0;
+            int cap_other = std::max(1, max_row); // 保底
+            col = 1 + rest / cap_other;           // 1,2,3...
+            row_in_col = rest % cap_other;        // 0..cap_other-1
+        }
+
+        // rows start from 1 step behind leader
+        double dx = -(row_in_col + 1) * safety_distance;
+
+        // columns expand laterally (body +y is left): col=0 -> 0, col=1 -> +1, col=2 -> -1, col=3 -> +2, ...
         double dy = 0.0;
+        if (col > 0) {
+            int side = (col % 2 == 1) ? 1 : -1; // odd -> left, even -> right
+            int level = (col + 1) / 2;          // 1,1,2,2,...
+            dy = side * level * safety_distance;
+        }
 
         Eigen::Vector2d rel_body(dx, dy);
         double rel_up = 0.0;

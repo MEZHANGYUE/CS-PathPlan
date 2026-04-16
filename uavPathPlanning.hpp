@@ -261,11 +261,13 @@ private:
                                        double safety_distance);
 
     // formation_model = 3: 一字形编队(竖) / trail
+    // uav_formation_max_row: 每一列最多支持的“总行数”（主列包含长机，因此主列最多容纳 max_row-1 架僚机；其余列每列最多 max_row 架僚机）。最小为 1。
     json generateVerticalLineShapeTrajectories(const json &uavs_ids, const json &uav_starts,
                                                const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
                                                const std::vector<Eigen::Vector2d> &leader_xy,
                                                const std::vector<double> &leader_headings,
                                                const std::vector<ENUPoint> &Trajectory_ENU,
+                                               int uav_formation_max_row,
                                                double safety_distance);
 
     // formation_model = 4: 三角形编队 / triangle
