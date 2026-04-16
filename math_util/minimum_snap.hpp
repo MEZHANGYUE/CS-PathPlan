@@ -5,6 +5,33 @@
 #include <vector>
 #include <string>
 
+// minimum-snap 配置（合并自 minimum_snap_config.ymal / config.yaml.minimum_snap）
+struct MinimumSnapConfig {
+    // 多项式导数阶数（d_order），min-snap 常用 order=3
+    int order = 3;
+
+    // 偏离直线段惩罚权重
+    double path_weight = 0.0;
+
+    // 每个路径点的 0 速度约束权重（经过路径点减速）
+    double vel_zero_weight = 0.0;
+
+    // 平均巡航速度 (m/s)
+    double V_avg = 5.0;
+
+    // 单段最小时长 (s)
+    double min_time_s = 0.1;
+
+    // 轨迹点采样间隔距离 (m)
+    double sample_distance = 1.0;
+
+    // 起始/终止速度与加速度（可选）
+    Eigen::Vector3d start_vel = Eigen::Vector3d::Zero();
+    Eigen::Vector3d end_vel = Eigen::Vector3d::Zero();
+    Eigen::Vector3d start_acc = Eigen::Vector3d::Zero();
+    Eigen::Vector3d end_acc = Eigen::Vector3d::Zero();
+};
+
 // Trajectory generator for minimum-snap / minimum-jerk closed-form solution
 class TrajectoryGeneratorTool {
 private:
@@ -27,11 +54,12 @@ public:
 
     // 生成完整轨迹并返回采样点矩阵 (N x 3)。
     // Path: (M x 3) 路径点矩阵
-    // yaml_path: 配置文件路径，包含 order, V_avg, min_time_s, sample_distance, start/end vel/acc
-    // 如果 sample_distance_override > 0 则覆盖 YAML 中的 sample_distance 值（单位：米）
-    // sample_distance_override: if >0 overrides YAML sample_distance
-    // v_avg_override: if >0 overrides YAML V_avg (average speed in m/s)
-    Eigen::MatrixXd GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path, double sample_distance_override = -1.0, double v_avg_override = -1.0);
+    // cfg: 最小 snap 配置（已从 config.yaml 读入）
+    // 如果 sample_distance_override > 0 则覆盖 cfg.sample_distance 值（单位：米）
+    // v_avg_override: if >0 overrides cfg.V_avg (average speed in m/s)
+    Eigen::MatrixXd GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const MinimumSnapConfig &cfg,
+                                            double sample_distance_override = -1.0, double v_avg_override = -1.0);
+
 };
 
 

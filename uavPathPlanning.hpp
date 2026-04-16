@@ -29,7 +29,7 @@ struct ProhibitedZone {
 
 struct InputData
 {
-    double distance_points;
+    double distance_points = 0.0;
     double leader_speed = 30.0; // m/s, average speed override read from input JSON (formerly V_avg)
     double min_turning_radius = 0.0; // Minimum turning radius constraint
     double leader_fly_high;
@@ -108,8 +108,42 @@ inline double rad2deg(double rad) {
 // UavPathPlanner: 将 uavPathPlanning 中的功能封装为类
 class UavPathPlanner {
 public:
+    struct PlannerConfig {
+        struct AltitudeOptimization {
+            bool enabled = false;
+            std::string elevation_file;
+            double lambda_smooth = 1.0;
+            double lambda_follow = 0.0;
+            double max_climb_rate = 2.0;
+            double uav_R = 2.0;
+            double safe_distance = 50.0;
+        } altitude_optimization;
+
+        struct PathPlanning {
+            double position_misalignment = 0.0;
+            double min_turning_radius = 0.0;
+            double patrol_width = 0.0;
+            std::string patrol_mode = "BOW";
+            double formation_distance = 50.0;
+            int uav_formation_max_row = 8;
+            double distance_points = 0.0; // config.yaml -> path_planning.Distance_Points (or distance_points)
+        } path_planning;
+
+        // minimum_snap 轨迹生成参数（config.yaml.minimum_snap）
+        MinimumSnapConfig minimum_snap;
+
+        bool loaded = false;
+        std::string loaded_from;
+        std::string load_error;
+    };
+
     UavPathPlanner();
     ~UavPathPlanner();
+
+    // 统一加载 config.yaml（只读一次，其他地方直接用 config() 取参数）
+    bool loadFromYAML(const std::string &config_path = "");
+    const PlannerConfig &config() const { return config_; }
+
     std::vector<ENUPoint> Trajectory_ENU={}; //单独优化高度时使用,非空时才能调用高度优化
     // Minisnap 轨迹生成接口
     std::vector<ENUPoint> Minisnap_3D(std::vector<ENUPoint> origin_waypoints, double distance_, double V_avg_override = -1.0);
@@ -215,6 +249,7 @@ private:
     // 内部状态
     TrajectoryGeneratorTool generator_;
     WGS84Point origin_;
+    PlannerConfig config_;
     InputData input_data_; // 存储解析后的输入数据，避免重复解析
     // 提取的高度优化器函数仍在 cpp 中实现为私有方法
     // 现在只输入高程文件路径（例如 .tif），函数直接使用类成员 Trajectory_ENU 进行高度优化

@@ -22,63 +22,128 @@
 
 // (moved into UavPathPlanner::generator_)
 
-// 配置命名空间：将时间分配相关默认值和 YAML 加载器内联到此文件中，避免使用单独的 _config.h
-namespace TimeAllocConfig {
-    inline double V_avg_default = 10.0;
+namespace {
+inline bool fileExists(const std::string &path) {
+    struct stat buffer;
+    return ::stat(path.c_str(), &buffer) == 0;
+}
 
-    inline double angle_threshold = 0.2;        // 弧度
-    inline double min_time_s = 40.0;            // 最小分配时间 s
-    inline double prev_influence = 0.5;         // 前一段影响系数
-
-    inline double base_pow = 0.65;
-    inline double base_divider = 50.0;
-
-    inline double long_threshold = 10.0;
-    inline double med_threshold = 3.0;
-    inline double small_threshold = 1.0;
-    inline double tiny_threshold = 0.1;
-
-    inline double long_adj = 0.7;
-    inline double med_adj = 1.0;
-    inline double small_adj = 1.1;
-    inline double tiny_adj = 1.3;
-
-    inline double min_alloc = 1.0;
-    inline double max_alloc = 300.0;
-
-    // 从 YAML 文件加载配置，若字段缺失则保留默认值
-    inline bool loadFromYAML(const std::string &yaml_path) {
-        try {
-            YAML::Node config = YAML::LoadFile(yaml_path);
-            if (config["V_avg_default"]) V_avg_default = config["V_avg_default"].as<double>();
-
-            if (config["angle_threshold"]) angle_threshold = config["angle_threshold"].as<double>();
-            if (config["min_time_s"]) min_time_s = config["min_time_s"].as<double>();
-            if (config["prev_influence"]) prev_influence = config["prev_influence"].as<double>();
-
-            if (config["base_pow"]) base_pow = config["base_pow"].as<double>();
-            if (config["base_divider"]) base_divider = config["base_divider"].as<double>();
-
-            if (config["long_threshold"]) long_threshold = config["long_threshold"].as<double>();
-            if (config["med_threshold"]) med_threshold = config["med_threshold"].as<double>();
-            if (config["small_threshold"]) small_threshold = config["small_threshold"].as<double>();
-            if (config["tiny_threshold"]) tiny_threshold = config["tiny_threshold"].as<double>();
-
-            if (config["long_adj"]) long_adj = config["long_adj"].as<double>();
-            if (config["med_adj"]) med_adj = config["med_adj"].as<double>();
-            if (config["small_adj"]) small_adj = config["small_adj"].as<double>();
-            if (config["tiny_adj"]) tiny_adj = config["tiny_adj"].as<double>();
-
-            if (config["min_alloc"]) min_alloc = config["min_alloc"].as<double>();
-            if (config["max_alloc"]) max_alloc = config["max_alloc"].as<double>();
-
-            return true;
-        } catch (const std::exception &e) {
-            std::cerr << "Failed to load time allocation YAML: " << e.what() << std::endl;
-            return false;
-        }
+template <typename T>
+inline void yamlAssignIfPresent(const YAML::Node &node, const char *key, T &out) {
+    try {
+        if (node && node[key]) out = node[key].as<T>();
+    } catch (...) {
+        // ignore conversion errors
     }
 }
+
+inline void yamlAssignIfPresent(const YAML::Node &node, const char *key, std::string &out) {
+    try {
+        if (node && node[key]) out = node[key].as<std::string>();
+    } catch (...) {
+        // ignore conversion errors
+    }
+}
+
+inline void yamlAssignVec3IfPresent(const YAML::Node &node, const char *key, Eigen::Vector3d &out) {
+    try {
+        if (!node || !node[key] || !node[key].IsSequence() || node[key].size() < 3) return;
+        out = Eigen::Vector3d(node[key][0].as<double>(), node[key][1].as<double>(), node[key][2].as<double>());
+    } catch (...) {
+        // ignore conversion errors
+    }
+}
+} // namespace
+
+// 统一加载 config.yaml（只读一次，其他地方直接用 this->config_ 的参数）
+bool UavPathPlanner::loadFromYAML(const std::string &config_path)
+{
+    PlannerConfig cfg; // defaults
+    std::vector<std::string> candidates;
+
+    if (!config_path.empty()) {
+        candidates.push_back(config_path);
+    } else {
+        candidates = {"config.yaml", "../config.yaml", "../../config.yaml"};
+    }
+
+    std::string found;
+    for (const auto &p : candidates) {
+        if (fileExists(p)) {
+            found = p;
+            break;
+        }
+    }
+
+    if (found.empty()) {
+        cfg.loaded = false;
+        cfg.loaded_from.clear();
+        cfg.load_error = "config.yaml not found";
+        this->config_ = cfg;
+        return false;
+    }
+
+    try {
+        YAML::Node root = YAML::LoadFile(found);
+        cfg.loaded = true;
+        cfg.loaded_from = found;
+        cfg.load_error.clear();
+
+        if (root["altitude_optimization"]) {
+            auto alt = root["altitude_optimization"];
+            yamlAssignIfPresent(alt, "enabled", cfg.altitude_optimization.enabled);
+            yamlAssignIfPresent(alt, "elevation_file", cfg.altitude_optimization.elevation_file);
+            yamlAssignIfPresent(alt, "lambda_smooth", cfg.altitude_optimization.lambda_smooth);
+            yamlAssignIfPresent(alt, "lambda_follow", cfg.altitude_optimization.lambda_follow);
+            yamlAssignIfPresent(alt, "max_climb_rate", cfg.altitude_optimization.max_climb_rate);
+            yamlAssignIfPresent(alt, "uav_R", cfg.altitude_optimization.uav_R);
+            yamlAssignIfPresent(alt, "safe_distance", cfg.altitude_optimization.safe_distance);
+        }
+
+        if (root["path_planning"]) {
+            auto pp = root["path_planning"];
+            yamlAssignIfPresent(pp, "position_misalignment", cfg.path_planning.position_misalignment);
+            yamlAssignIfPresent(pp, "min_turning_radius", cfg.path_planning.min_turning_radius);
+            yamlAssignIfPresent(pp, "patrol_width", cfg.path_planning.patrol_width);
+            yamlAssignIfPresent(pp, "patrol_mode", cfg.path_planning.patrol_mode);
+            yamlAssignIfPresent(pp, "formation_distance", cfg.path_planning.formation_distance);
+            yamlAssignIfPresent(pp, "uav_formation_max_row", cfg.path_planning.uav_formation_max_row);
+
+            // 兼容历史字段
+            if (pp["Distance_Points"]) {
+                yamlAssignIfPresent(pp, "Distance_Points", cfg.path_planning.distance_points);
+            } else {
+                yamlAssignIfPresent(pp, "distance_points", cfg.path_planning.distance_points);
+            }
+        }
+
+        if (root["minimum_snap"]) {
+            auto ms = root["minimum_snap"];
+            yamlAssignIfPresent(ms, "order", cfg.minimum_snap.order);
+            yamlAssignIfPresent(ms, "path_weight", cfg.minimum_snap.path_weight);
+            yamlAssignIfPresent(ms, "vel_zero_weight", cfg.minimum_snap.vel_zero_weight);
+            yamlAssignIfPresent(ms, "V_avg", cfg.minimum_snap.V_avg);
+            yamlAssignIfPresent(ms, "min_time_s", cfg.minimum_snap.min_time_s);
+            yamlAssignIfPresent(ms, "sample_distance", cfg.minimum_snap.sample_distance);
+            yamlAssignVec3IfPresent(ms, "start_vel", cfg.minimum_snap.start_vel);
+            yamlAssignVec3IfPresent(ms, "end_vel", cfg.minimum_snap.end_vel);
+            yamlAssignVec3IfPresent(ms, "start_acc", cfg.minimum_snap.start_acc);
+            yamlAssignVec3IfPresent(ms, "end_acc", cfg.minimum_snap.end_acc);
+        }
+
+        this->config_ = cfg;
+        std::cerr << "Loaded config from " << cfg.loaded_from << std::endl;
+        return true;
+    } catch (const std::exception &e) {
+        cfg.loaded = false;
+        cfg.loaded_from = found;
+        cfg.load_error = e.what();
+        this->config_ = cfg;
+        std::cerr << "Warning: failed to load config from " << found << ": " << e.what() << std::endl;
+        return false;
+    }
+}
+
 // 经纬度转ECEF坐标
 ECEFPoint UavPathPlanner::wgs84ToECEF(const WGS84Point& lla) {
     double lat_rad = deg2rad(lla.lat);
@@ -104,6 +169,9 @@ UavPathPlanner::UavPathPlanner() {
     origin_.lat = 0.0;
     origin_.alt = 0.0;
     elev_cost_map_ = std::make_unique<ElevationCostMap>();
+
+    // 统一读取 config.yaml（若不存在则使用默认值）
+    this->loadFromYAML();
 }
 
 UavPathPlanner::~UavPathPlanner() = default;
@@ -493,33 +561,23 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
         }
 
         AltitudeParams params;
-        // Try to load from config.yaml
-        std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
-        bool config_loaded = false;
-        for (const auto& config_path : config_paths) {
-            struct stat buffer;
-            if (stat(config_path.c_str(), &buffer) == 0) {
-                 try {
-                    YAML::Node config = YAML::LoadFile(config_path);
-                    if (config["altitude_optimization"]) {
-                        auto alt_conf = config["altitude_optimization"];
-                        if (alt_conf["uav_R"]) params.uav_R = alt_conf["uav_R"].as<double>();
-                        if (alt_conf["safe_distance"]) params.safe_distance = alt_conf["safe_distance"].as<double>();
-                        if (alt_conf["lambda_follow"]) params.lambda_follow = alt_conf["lambda_follow"].as<double>();
-                        if (alt_conf["lambda_smooth"]) params.lambda_smooth = alt_conf["lambda_smooth"].as<double>();
-                        if (alt_conf["max_climb_rate"]) params.max_climb_rate = alt_conf["max_climb_rate"].as<double>();
-                        std::cerr << "AltitudeOptimizer: loaded params from " << config_path << "\n";
-                        config_loaded = true;
-                        break;
-                    }
-                 } catch (const std::exception &e) {
-                     std::cerr << "AltitudeOptimizer: failed to parse " << config_path << ": " << e.what() << std::endl;
-                 }
-            }
-        }
-        
-        if (!config_loaded) {
-             std::cerr << "AltitudeOptimizer: config.yaml not found or invalid, using defaults.\n";
+
+        // 统一使用构造时加载的 config.yaml 参数（不在这里重复读取）
+        params.uav_R = this->config_.altitude_optimization.uav_R;
+        params.safe_distance = this->config_.altitude_optimization.safe_distance;
+        params.lambda_follow = this->config_.altitude_optimization.lambda_follow;
+        params.lambda_smooth = this->config_.altitude_optimization.lambda_smooth;
+        params.max_climb_rate = this->config_.altitude_optimization.max_climb_rate;
+
+        // 允许从输入 JSON 覆盖（可选）
+        try {
+            if (input_json.contains("uav_R")) params.uav_R = input_json["uav_R"].get<double>();
+            if (input_json.contains("safe_distance")) params.safe_distance = input_json["safe_distance"].get<double>();
+            if (input_json.contains("lambda_follow")) params.lambda_follow = input_json["lambda_follow"].get<double>();
+            if (input_json.contains("lambda_smooth")) params.lambda_smooth = input_json["lambda_smooth"].get<double>();
+            if (input_json.contains("max_climb_rate")) params.max_climb_rate = input_json["max_climb_rate"].get<double>();
+        } catch (...) {
+            // ignore
         }
 
         std::vector<double> out_z;
@@ -967,29 +1025,9 @@ double UavPathPlanner::getDistanceFromJSON(const json& j, const std::string& key
 
     if (distance_ > 0.0) return distance_;
 
-    // 2) 从 config.yaml 读取（Distance_Points）
-    std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
-    for (const auto& path : config_paths) {
-        try {
-            YAML::Node config = YAML::LoadFile(path);
-            if (!config["path_planning"]) continue;
-            auto pp = config["path_planning"];
-
-            // 兼容大小写与历史字段
-            if (pp["Distance_Points"]) {
-                distance_ = pp["Distance_Points"].as<double>();
-            } else if (pp["distance_points"]) {
-                distance_ = pp["distance_points"].as<double>();
-            }
-
-            if (distance_ > 0.0) {
-                std::cout << "Loaded Distance_Points from " << path << ": " << distance_ << std::endl;
-                return distance_;
-            }
-        } catch (...) {
-            // ignore
-        }
-    }
+    // 2) 从已加载的 config.yaml 读取（Distance_Points / distance_points）
+    distance_ = this->config_.path_planning.distance_points;
+    if (distance_ > 0.0) return distance_;
 
     return 0.0;
 }
@@ -1367,35 +1405,11 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
     double position_misalignment = 0.0; // 无人机定位误差（米）
     double uav_R = 2.0;                 // 机体半径/安全包络（米）
 
-    // 尝试从 config.yaml 读取
-    std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
-    for (const auto& path : config_paths) {
-        try {
-            YAML::Node config = YAML::LoadFile(path);
-            if (config["path_planning"]) {
-                auto pp = config["path_planning"];
-                if (pp["formation_distance"]) {
-                    formation_distance = pp["formation_distance"].as<double>();
-                    std::cout << "Loaded formation_distance from " << path << ": " << formation_distance << std::endl;
-                }
-                if (pp["position_misalignment"]) {
-                    position_misalignment = pp["position_misalignment"].as<double>();
-                }
-                if (pp["uav_formation_max_row"]) {
-                    uav_formation_max_row = pp["uav_formation_max_row"].as<int>();
-                }
-            }
-            // uav_R 位于 altitude_optimization 配置段（与高度优化共用参数）
-            if (config["altitude_optimization"] && config["altitude_optimization"]["uav_R"]) {
-                uav_R = config["altitude_optimization"]["uav_R"].as<double>();
-            }
-
-            // 如果读取成功（至少加载了 yaml），就停止继续尝试其他路径
-            break;
-        } catch (...) {
-            // ignore
-        }
-    }
+    // 使用构造时加载的 config.yaml 参数（不在这里重复读取）
+    formation_distance = this->config_.path_planning.formation_distance;
+    position_misalignment = this->config_.path_planning.position_misalignment;
+    uav_formation_max_row = this->config_.path_planning.uav_formation_max_row;
+    uav_R = this->config_.altitude_optimization.uav_R;
 
     // 允许从输入 JSON 覆盖
     if (input_json.contains("formation_distance")) {
@@ -1617,32 +1631,18 @@ json UavPathPlanner::generateVerticalLineShapeTrajectories(const json &uavs_ids,
         start_wp.alt = s.size() >= 3 ? s[2].get<double>() : 0.0;
 
         // Vertical line (trail) geometry: behind leader along body -x
-        // uav_formation_max_row 语义：每一列最多支持的“总行数”。主列(col=0)包含长机，因此主列最多容纳 (max_row-1) 架僚机。
-        // 超出则自动增加列数，后续列不含长机，每列最多 max_row 架僚机。
-        int max_row = uav_formation_max_row;
-        int cap_col0 = std::max(0, max_row - 1);
-        int col = 0;
-        int row_in_col = 0;
-
-        int follower_index = static_cast<int>(idx); // 0-based
-        if (cap_col0 > 0 && follower_index < cap_col0) {
-            col = 0;
-            row_in_col = follower_index; // 0..cap_col0-1
-        } else {
-            int rest = follower_index - cap_col0;
-            int cap_other = std::max(1, max_row); // 保底
-            col = 1 + rest / cap_other;           // 1,2,3...
-            row_in_col = rest % cap_other;        // 0..cap_other-1
-        }
+        // 每一列最多 uav_formation_max_row 架；超出则换到下一列。
+        int col = static_cast<int>(idx) / uav_formation_max_row;      // 0,1,2...
+        int row_in_col = static_cast<int>(idx) % uav_formation_max_row; // 0..max_row-1
 
         // rows start from 1 step behind leader
         double dx = -(row_in_col + 1) * safety_distance;
 
-        // columns expand laterally (body +y is left): col=0 -> 0, col=1 -> +1, col=2 -> -1, col=3 -> +2, ...
+        // columns expand laterally (body +y is left): 0, +1, -1, +2, -2, ...
         double dy = 0.0;
         if (col > 0) {
-            int side = (col % 2 == 1) ? 1 : -1; // odd -> left, even -> right
-            int level = (col + 1) / 2;          // 1,1,2,2,...
+            int side = (col % 2 == 1) ? 1 : -1;          // odd -> left, even -> right
+            int level = (col + 1) / 2;                   // 1,1,2,2,...
             dy = side * level * safety_distance;
         }
 
@@ -1791,31 +1791,7 @@ std::vector<ENUPoint> UavPathPlanner::Minisnap_EN (std::vector<ENUPoint> Enu_way
         route(i, 2) = 0.0;                     // z -> 0 (忽略高度)
     }
 
-    // use global generator
-    // 与 Minisnap_3D 相同的配置查找策略
-    std::vector<std::string> try_paths = {
-        "math_util/minimum_snap_config.ymal",
-        "../math_util/minimum_snap_config.ymal",
-        "../../math_util/minimum_snap_config.ymal"
-    };
-
-    std::string yaml_cfg;
-    bool found = false;
-    for (const auto &p : try_paths) {
-        std::ifstream ifs(p);
-        if (ifs.good()) {
-            yaml_cfg = p;
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        yaml_cfg = "math_util/minimum_snap_config.ymal";
-        std::cerr << "Warning: cannot find config in usual locations; will try '" << yaml_cfg << "' and fall back to defaults if unreadable." << std::endl;
-    } else {
-        std::cerr << "Using YAML config: " << yaml_cfg << std::endl;
-    }
-
+    // use global generator (config.yaml.minimum_snap)
     if (distance_ > 0) {
         std::cerr << "Using input JSON distance_points as sampling distance: " << distance_ << " m" << std::endl;
     }
@@ -1823,7 +1799,7 @@ std::vector<ENUPoint> UavPathPlanner::Minisnap_EN (std::vector<ENUPoint> Enu_way
         std::cerr << "Using leader_speed as average speed: " << v_avg_override << " m/s" << std::endl;
     }
 
-    Eigen::MatrixXd sampled = this->generator_.GenerateTrajectoryMatrix(route, yaml_cfg, distance_, v_avg_override);
+    Eigen::MatrixXd sampled = this->generator_.GenerateTrajectoryMatrix(route, this->config_.minimum_snap, distance_, v_avg_override);
 
     // 将采样的平面点转换回 ENUPoint，并把高度固定为起点高度（高度可保持不变或任意）
     double up_value = Enu_waypoint_[0].up; // 固定高度为起点高度
@@ -1853,30 +1829,7 @@ std::vector<ENUPoint> UavPathPlanner::Minisnap_3D(std::vector<ENUPoint> Enu_wayp
         route(i, 2) = Enu_waypoint_[i].up;     // z -> up
     }
 
-    // use global generator
-    std::vector<std::string> try_paths = {
-        "math_util/minimum_snap_config.ymal",
-        "../math_util/minimum_snap_config.ymal",
-        "../../math_util/minimum_snap_config.ymal"
-    };
-
-    std::string yaml_cfg;
-    bool found = false;
-    for (const auto &p : try_paths) {
-        std::ifstream ifs(p);
-        if (ifs.good()) {
-            yaml_cfg = p;
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        yaml_cfg = "math_util/minimum_snap_config.ymal";
-        std::cerr << "Warning: cannot find config in usual locations; will try '" << yaml_cfg << "' and fall back to defaults if unreadable." << std::endl;
-    } else {
-        std::cerr << "Using YAML config: " << yaml_cfg << std::endl;
-    }
-
+    // use global generator (config.yaml.minimum_snap)
     if (distance_ > 0) {
         std::cerr << "Using input JSON distance_points as sampling distance: " << distance_ << " m" << std::endl;
     }
@@ -1884,7 +1837,7 @@ std::vector<ENUPoint> UavPathPlanner::Minisnap_3D(std::vector<ENUPoint> Enu_wayp
         std::cerr << "Using leader_speed as average speed: " << v_avg_override << " m/s" << std::endl;
     }
 
-    Eigen::MatrixXd sampled = this->generator_.GenerateTrajectoryMatrix(route, yaml_cfg, distance_, v_avg_override);
+    Eigen::MatrixXd sampled = this->generator_.GenerateTrajectoryMatrix(route, this->config_.minimum_snap, distance_, v_avg_override);
 
     // 将采样点转换为 ENUPoint 向量返回
     for (int i = 0; i < sampled.rows(); ++i) {
@@ -1971,29 +1924,12 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
     }
 
     if (!has_json_distance) {
-        // 从 YAML 配置回退
-        std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
-        for (const auto& config_path : config_paths) {
-            try {
-                YAML::Node config = YAML::LoadFile(config_path);
-                if (config["path_planning"]) {
-                    auto pp = config["path_planning"];
-                    if (pp["Distance_Points"]) {
-                        input_data.distance_points = pp["Distance_Points"].as<double>();
-                        std::cout << "Loaded Distance_Points from " << config_path << ": " << input_data.distance_points << std::endl;
-                        break;
-                    } else if (pp["distance_points"]) {
-                        input_data.distance_points = pp["distance_points"].as<double>();
-                        std::cout << "Loaded distance_points from " << config_path << ": " << input_data.distance_points << std::endl;
-                        break;
-                    }
-                }
-            } catch (...) {
-                // ignore
-            }
-        }
+        // 从已加载的 config.yaml 回退（不在这里重复读取）
+        input_data.distance_points = this->config_.path_planning.distance_points;
 
-        if (!(input_data.distance_points > 0.0)) {
+        if (input_data.distance_points > 0.0) {
+            std::cout << "Loaded Distance_Points from config: " << input_data.distance_points << std::endl;
+        } else {
             std::cout << "distance_points is empty/missing; Distance_Points not found in config.yaml." << std::endl;
         }
     }
@@ -2152,28 +2088,10 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
     {
         // std::cout << "min_turning_radius is empty." << std::endl;
     }
-    // Load config from yaml if available to set min_turning_radius if not provided in input
-    std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
-    for (const auto& config_path : config_paths) {
-        struct stat buffer;
-        if (stat(config_path.c_str(), &buffer) == 0) {
-             try {
-                YAML::Node config = YAML::LoadFile(config_path);
-                if (config["path_planning"]) {
-                    auto pp_conf = config["path_planning"];
-                    if (pp_conf["min_turning_radius"]) {
-                        double r = pp_conf["min_turning_radius"].as<double>();
-                        if (input_data.min_turning_radius <= 0.0) {
-                             input_data.min_turning_radius = r;
-                             std::cerr << "Loaded min_turning_radius from " << config_path << ": " << r << std::endl;
-                        }
-                    }
-                }
-             } catch (const std::exception &e) {
-                 std::cerr << "Failed to parse " << config_path << ": " << e.what() << std::endl;
-             }
-             break; 
-        }
+    // 从已加载的 config.yaml 回退 min_turning_radius（不在这里重复读取）
+    if (input_data.min_turning_radius <= 0.0 && this->config_.path_planning.min_turning_radius > 0.0) {
+        input_data.min_turning_radius = this->config_.path_planning.min_turning_radius;
+        std::cerr << "Loaded min_turning_radius from config: " << input_data.min_turning_radius << std::endl;
     }
 
     if (input_json.contains("using_midway_lines") && input_json["using_midway_lines"].is_array() && !input_json["using_midway_lines"].empty()) {

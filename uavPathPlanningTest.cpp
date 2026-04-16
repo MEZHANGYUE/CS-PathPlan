@@ -77,31 +77,18 @@ int main(int argc, char *argv[])
         std::cerr << "Failed to plan!" << std::endl;
     }
 
-    // Load configuration
-    std::string config_path = "../config.yaml";
-    bool altitude_opt_enabled = false;
-    std::string elevation_file;
+    // Load configuration（使用 planner 构造时缓存的 config.yaml，不在这里重复读取）
+    bool altitude_opt_enabled = planner.config().altitude_optimization.enabled;
+    std::string elevation_file = planner.config().altitude_optimization.elevation_file;
 
-    try {
-        if (std::filesystem::exists(config_path)) {
-            YAML::Node config = YAML::LoadFile(config_path);
-            if (config["altitude_optimization"]) {
-                if (config["altitude_optimization"]["enabled"]) {
-                    altitude_opt_enabled = config["altitude_optimization"]["enabled"].as<bool>();
-                    std::cout << "altitude_opt_enabled: " << altitude_opt_enabled << std::endl;
-                }
-                if (config["altitude_optimization"]["elevation_file"]) {
-                    elevation_file = config["altitude_optimization"]["elevation_file"].as<std::string>();
-                } else {
-                    std::cerr << "Warning: 'elevation_file' parameter missing in " << config_path << std::endl;
-                }
-            }
-            std::cout << "Loaded config from " << config_path << std::endl;
-        } else {
-             std::cout << "Config file " << config_path << " not found." << std::endl;
+    if (!planner.config().loaded) {
+        std::cerr << "Warning: config.yaml not loaded (" << planner.config().load_error << ")" << std::endl;
+    } else {
+        std::cout << "Loaded config from " << planner.config().loaded_from << std::endl;
+        std::cout << "altitude_opt_enabled: " << altitude_opt_enabled << std::endl;
+        if (altitude_opt_enabled && elevation_file.empty()) {
+            std::cerr << "Warning: 'elevation_file' parameter missing in config.yaml" << std::endl;
         }
-    } catch (const std::exception& e) {
-        std::cerr << "Warning: Failed to load config.yaml (" << e.what() << ")" << std::endl;
     }
     //需要高度优化
     if (altitude_opt_enabled) {

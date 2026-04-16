@@ -1,7 +1,6 @@
 
 #include "minimum_snap.hpp"
 #include <iostream>
-#include <yaml-cpp/yaml.h>
 #include <cmath>
 #include <vector>
 
@@ -20,51 +19,24 @@ int TrajectoryGeneratorTool::Factorial(int x) {
     return fac;
 }
 
-Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const std::string &yaml_path, double sample_distance_override, double v_avg_override) {
-    // 配置默认值
-    int order = 3; // 默认最小化 snap 对应 d_order=3 (可在yaml中覆盖)
-    double V_avg = 5.0; // m/s
-    double min_time_s = 0.1;
-    double sample_distance = 1.0; // 轨迹采样距离 m
+Eigen::MatrixXd TrajectoryGeneratorTool::GenerateTrajectoryMatrix(const Eigen::MatrixXd &Path, const MinimumSnapConfig &cfg, double sample_distance_override, double v_avg_override) {
+    // 配置默认值/入参
+    int order = cfg.order;
+    double V_avg = cfg.V_avg;
+    double min_time_s = cfg.min_time_s;
+    double sample_distance = cfg.sample_distance;
 
-    // 起始/终止速度与加速度（可在yaml中配置为数组 [x,y,z]）
+    // 起始/终止速度与加速度
     Eigen::MatrixXd Vel = Eigen::MatrixXd::Zero(2, 3);
     Eigen::MatrixXd Acc = Eigen::MatrixXd::Zero(2, 3);
+    Vel.row(0) = cfg.start_vel.transpose();
+    Vel.row(1) = cfg.end_vel.transpose();
+    Acc.row(0) = cfg.start_acc.transpose();
+    Acc.row(1) = cfg.end_acc.transpose();
 
-    // 读取 YAML 配置（若文件存在且字段可用则覆盖默认值）
-    double vel_zero_weight = 0.0;
-    try {
-        YAML::Node cfg = YAML::LoadFile(yaml_path);
-        if (cfg["order"]) order = cfg["order"].as<int>();
-        if (cfg["path_weight"]) path_weight = cfg["path_weight"].as<double>();
-        if (cfg["vel_zero_weight"]) vel_zero_weight = cfg["vel_zero_weight"].as<double>();
-        if (cfg["V_avg"]) V_avg = cfg["V_avg"].as<double>();
-        if (cfg["min_time_s"]) min_time_s = cfg["min_time_s"].as<double>();
-        if (cfg["sample_distance"]) sample_distance = cfg["sample_distance"].as<double>();
-
-        if (cfg["start_vel"] && cfg["start_vel"].IsSequence() && cfg["start_vel"].size()>=3) {
-            Vel(0,0) = cfg["start_vel"][0].as<double>();
-            Vel(0,1) = cfg["start_vel"][1].as<double>();
-            Vel(0,2) = cfg["start_vel"][2].as<double>();
-        }
-        if (cfg["end_vel"] && cfg["end_vel"].IsSequence() && cfg["end_vel"].size()>=3) {
-            Vel(1,0) = cfg["end_vel"][0].as<double>();
-            Vel(1,1) = cfg["end_vel"][1].as<double>();
-            Vel(1,2) = cfg["end_vel"][2].as<double>();
-        }
-        if (cfg["start_acc"] && cfg["start_acc"].IsSequence() && cfg["start_acc"].size()>=3) {
-            Acc(0,0) = cfg["start_acc"][0].as<double>();
-            Acc(0,1) = cfg["start_acc"][1].as<double>();
-            Acc(0,2) = cfg["start_acc"][2].as<double>();
-        }
-        if (cfg["end_acc"] && cfg["end_acc"].IsSequence() && cfg["end_acc"].size()>=3) {
-            Acc(1,0) = cfg["end_acc"][0].as<double>();
-            Acc(1,1) = cfg["end_acc"][1].as<double>();
-            Acc(1,2) = cfg["end_acc"][2].as<double>();
-        }
-    } catch (const std::exception &e) {
-        std::cerr << "TrajectoryGeneratorTool: failed to load YAML config '"<< yaml_path << "': " << e.what() << ". Using defaults." << std::endl;
-    }
+    // 权重
+    this->path_weight = cfg.path_weight;
+    double vel_zero_weight = cfg.vel_zero_weight;
 
     // 如果调用者传入了覆盖采样距离的参数，优先使用它
     if (sample_distance_override > 0.0) {
