@@ -1,19 +1,18 @@
-altitude_optimization:
-  #是否启用高度优化
-  enabled: true
-#读取地形高程的 DEM 文件路径
-  elevation_file: "../data/neimeng.tif"
-#平滑项权重
-  lambda_smooth: 1.0 
-#跟随地形项权重
-  lambda_follow: 1.0
-#最大爬升率约束
-  max_climb_rate: 0.5
+altitude_optimization:  
+  enabled: true #是否启用高度优化
+  elevation_file: "../data/neimeng.tif" #读取地形高程的 DEM 文件路径
+  lambda_smooth: 1.0 #平滑项权重
+  lambda_follow: 1.0 #跟随地形项权重
+  max_climb_rate: 0.5 #最大爬升率约束
   uav_R: 2.0
-#相对于地形的最小安全垂直距离（米）
-  safe_distance: 50.0
+  safe_distance: 50.0 #相对于地形的最小安全垂直距离（米）
+
 path_planning:
-#路径规划时允许的最小转弯半径（米）
-  min_turning_radius: 300.0
-#路径规划中的安全距离
-  safe_distance: 50.0
+  position_misalignment: 100  #无人机定位误差（米）
+  min_turning_radius: 300.0 #路径规划时允许的最小转弯半径（米）
+  # safe_distance: 50.0 #路径规划中的安全距离 (编队的安全距离) , 改用 formation_distance 参数
+  patrol_width: 300.0  #巡航路径之间的间距
+  patrol_mode: "BOW" #巡航模式，支持"CIRCULAR"（回形）和"BOW"（弓形） , 回形保留配置 暂不实现
+  formation_distance: 200 # 无人机编队飞行时其无人机之间的间距,注意，如果formation_distance小于（2*position_misalignment + uav_R）* 1.41421则会内部调用时自动扩大到该值
+  uav_formation_max_row: 8   # 无人机竖1字型队形时，队形支持最大行数,如使用竖1字型队形，无人机数量超出该设定则会主动增加列数,最小为1
+  Distance_Points: 300 # 无人机路径规划的航点间距，单位米

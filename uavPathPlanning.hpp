@@ -259,5 +259,21 @@ private:
                                        const std::vector<double> &leader_headings,
                                        const std::vector<ENUPoint> &Trajectory_ENU,
                                        double safety_distance);
+
+    // formation_model = 3: 一字形编队(竖) / trail
+    json generateVerticalLineShapeTrajectories(const json &uavs_ids, const json &uav_starts,
+                                               const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
+                                               const std::vector<Eigen::Vector2d> &leader_xy,
+                                               const std::vector<double> &leader_headings,
+                                               const std::vector<ENUPoint> &Trajectory_ENU,
+                                               double safety_distance);
+
+    // formation_model = 4: 三角形编队 / triangle
+    json generateTriangleShapeTrajectories(const json &uavs_ids, const json &uav_starts,
+                                           const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
+                                           const std::vector<Eigen::Vector2d> &leader_xy,
+                                           const std::vector<double> &leader_headings,
+                                           const std::vector<ENUPoint> &Trajectory_ENU,
+                                           double safety_distance);
 };
 #endif

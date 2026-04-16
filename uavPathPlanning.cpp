@@ -945,26 +945,53 @@ std::vector<ENUPoint> UavPathPlanner::getENUFromJSON(const json& j, const std::s
     }
     return enu_path;
 }
-//轨迹点之间的距离参数
-double UavPathPlanner::getDistanceFromJSON(const json& j, const std::string& key) 
+//轨迹点之间的距离参数（采样间距，单位：米）
+// 优先级：input_json[distance_points] -> config.yaml(path_planning.Distance_Points/ distance_points) -> 0
+double UavPathPlanner::getDistanceFromJSON(const json& j, const std::string& key)
 {
-    double distance_;
-    
+    double distance_ = 0.0;
+
+    // 1) 从输入 JSON 读取
     try {
-        // 检查键是否存在
-        if (!j.contains(key)) {
-            throw std::runtime_error("JSON中未找到键: " + key);
+        if (j.contains(key) && !j[key].empty()) {
+            // 支持数值或数组（取第一个元素）
+            if (j[key].is_number()) {
+                distance_ = j[key].get<double>();
+            } else if (j[key].is_array() && !j[key].empty() && j[key][0].is_number()) {
+                distance_ = j[key][0].get<double>();
+            }
         }
-        
-        auto distance_json = j[key];
-        if (distance_json.empty()) {
-            return distance_;
-        }
-        distance_ = distance_json;               
-    } catch (const std::exception& e) {
-        std::cerr << "从JSON获取DISTANCE错误: " << e.what() << std::endl;
+    } catch (...) {
+        // ignore
     }
-    return distance_;
+
+    if (distance_ > 0.0) return distance_;
+
+    // 2) 从 config.yaml 读取（Distance_Points）
+    std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
+    for (const auto& path : config_paths) {
+        try {
+            YAML::Node config = YAML::LoadFile(path);
+            if (!config["path_planning"]) continue;
+            auto pp = config["path_planning"];
+
+            // 兼容大小写与历史字段
+            if (pp["Distance_Points"]) {
+                distance_ = pp["Distance_Points"].as<double>();
+            } else if (pp["distance_points"]) {
+                distance_ = pp["distance_points"].as<double>();
+            }
+
+            if (distance_ > 0.0) {
+                std::cout << "Loaded Distance_Points from " << path << ": " << distance_ << std::endl;
+                return distance_;
+            }
+        } catch (...) {
+            // ignore
+        }
+    }
+
+    return 0.0;
 }
 
 //规划函数 用于总调用
@@ -1030,6 +1057,15 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     }
 
     distance  = this->getDistanceFromJSON(input_json,"distance_points");
+    if (!(distance > 0.0)) {
+        distance = this->input_data_.distance_points;
+    }
+    if (!(distance > 0.0)) {
+        // 最终兜底默认值
+        distance = 300.0;
+        std::cout << "Distance_Points not provided; using default distance_points=" << distance << std::endl;
+    }
+
     // 支持从输入 JSON 中指定平均速度（key: "leader_speed"），兼容旧键 "V_avg" / "v_avg"
     double leader_speed = -1.0;
     try {
@@ -1321,40 +1357,80 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
         leader_headings = smoothed;
     }
 
-    // 获取安全距离
-    double safety_distance = 50.0; // 默认值
+    // 编队距离：改用 formation_distance
+    double formation_distance = 50.0; // 默认值（若 config.yaml/输入未提供，则沿用旧默认）
+
+    // 编队距离下限约束：如果 formation_distance < (2*position_misalignment + uav_R)*1.41421 则自动扩大
+    double position_misalignment = 0.0; // 无人机定位误差（米）
+    double uav_R = 2.0;                 // 机体半径/安全包络（米）
 
     // 尝试从 config.yaml 读取
     std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
     for (const auto& path : config_paths) {
         try {
             YAML::Node config = YAML::LoadFile(path);
-            if (config["path_planning"] && config["path_planning"]["safe_distance"]) {
-                safety_distance = config["path_planning"]["safe_distance"].as<double>();
-                std::cout << "Loaded safe_distance from " << path << ": " << safety_distance << std::endl;
-                break; 
+            if (config["path_planning"]) {
+                auto pp = config["path_planning"];
+                if (pp["formation_distance"]) {
+                    formation_distance = pp["formation_distance"].as<double>();
+                    std::cout << "Loaded formation_distance from " << path << ": " << formation_distance << std::endl;
+                }
+                if (pp["position_misalignment"]) {
+                    position_misalignment = pp["position_misalignment"].as<double>();
+                }
             }
+            // uav_R 位于 altitude_optimization 配置段（与高度优化共用参数）
+            if (config["altitude_optimization"] && config["altitude_optimization"]["uav_R"]) {
+                uav_R = config["altitude_optimization"]["uav_R"].as<double>();
+            }
+
+            // 如果读取成功（至少加载了 yaml），就停止继续尝试其他路径
+            break;
         } catch (...) {
             // ignore
         }
     }
 
-    if (input_json.contains("safety_distance")) {
-        safety_distance = input_json["safety_distance"].get<double>();
+    // 允许从输入 JSON 覆盖
+    if (input_json.contains("formation_distance")) {
+        formation_distance = input_json["formation_distance"].get<double>();
+    } else if (input_json.contains("safety_distance")) {
+        // 兼容旧字段：如果外部仍传 safety_distance，则当作 formation_distance
+        formation_distance = input_json["safety_distance"].get<double>();
+    }
+    if (input_json.contains("position_misalignment")) {
+        position_misalignment = input_json["position_misalignment"].get<double>();
+    }
+    if (input_json.contains("uav_R")) {
+        uav_R = input_json["uav_R"].get<double>();
+    }
+
+    const double min_formation_distance = (2.0 * position_misalignment + uav_R) * 1.41421;
+    if (formation_distance < min_formation_distance) {
+        std::cout << "formation_distance is too small (" << formation_distance << "), clamped to min "
+                  << min_formation_distance << " (position_misalignment=" << position_misalignment
+                  << ", uav_R=" << uav_R << ")" << std::endl;
+        formation_distance = min_formation_distance;
     }
 
     // std::cout << "Formation Model: " << input_data.formation_model << std::endl;
 
     if (input_data.formation_model == 1) {
         std::cout << "Formation Model: 人字形编队" << std::endl;
-        plane_array = generateVShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, safety_distance);
+        plane_array = generateVShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, formation_distance);
     } else if (input_data.formation_model == 2) {
-        std::cout << "Formation Model: 一字形编队" << std::endl;
-        plane_array = generateLineShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, safety_distance);
+        std::cout << "Formation Model: 一字形编队(横)" << std::endl;
+        plane_array = generateLineShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, formation_distance);
+    } else if (input_data.formation_model == 3) {
+        std::cout << "Formation Model: 一字形编队(竖)" << std::endl;
+        plane_array = generateVerticalLineShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, formation_distance);
+    } else if (input_data.formation_model == 4) {
+        std::cout << "Formation Model: 三角形编队" << std::endl;
+        plane_array = generateTriangleShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, formation_distance);
     } else {
         // 默认使用人字形 (V-shape)
         std::cout << "Formation Model: 人字形编队" << std::endl;
-        plane_array = generateVShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, safety_distance);
+        plane_array = generateVShapeTrajectories(uavs_ids, uav_starts, leader_start_enu, R0, leader_xy, leader_headings, Trajectory_ENU, formation_distance);
     }
 
     return plane_array;
@@ -1500,6 +1576,162 @@ json UavPathPlanner::generateLineShapeTrajectories(const json &uavs_ids, const j
     }
     return plane_array;
 }
+
+//生成一字形编队轨迹(竖)
+json UavPathPlanner::generateVerticalLineShapeTrajectories(const json &uavs_ids, const json &uav_starts,
+                                                           const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
+                                                           const std::vector<Eigen::Vector2d> &leader_xy,
+                                                           const std::vector<double> &leader_headings,
+                                                           const std::vector<ENUPoint> &Trajectory_ENU,
+                                                           double safety_distance)
+{
+    (void)leader_start_enu;
+    (void)R0;
+
+    json plane_array = json::array();
+    size_t N = Trajectory_ENU.size();
+
+    for (size_t idx = 0; idx < uavs_ids.size(); ++idx) {
+        int uid = uavs_ids[idx].get<int>();
+        if (idx >= uav_starts.size()) break;
+
+        // Get start point
+        auto s = uav_starts[idx];
+        WGS84Point start_wp;
+        start_wp.lon = s[0].get<double>();
+        start_wp.lat = s[1].get<double>();
+        start_wp.alt = s.size() >= 3 ? s[2].get<double>() : 0.0;
+
+        // Vertical line (trail) geometry: behind leader along body -x
+        int row = static_cast<int>(idx) + 1;
+        double dx = -row * safety_distance;
+        double dy = 0.0;
+
+        Eigen::Vector2d rel_body(dx, dy);
+        double rel_up = 0.0;
+
+        json follower_entry = json::array();
+        follower_entry.push_back(uid);
+
+        for (size_t t = 0; t < N; ++t) {
+            if (t == 0) {
+                json pa = json::array();
+                pa.push_back(start_wp.lon);
+                pa.push_back(start_wp.lat);
+                pa.push_back(start_wp.alt);
+                follower_entry.push_back(pa);
+                continue;
+            }
+
+            double heading = leader_headings[t];
+            double c = cos(heading);
+            double s_ = sin(heading);
+            Eigen::Matrix2d Rt;
+            Rt << c, -s_,
+                  s_,  c;
+            Eigen::Vector2d offset_global = Rt * rel_body;
+
+            ENUPoint fp;
+            fp.east = leader_xy[t].x() + offset_global.x();
+            fp.north = leader_xy[t].y() + offset_global.y();
+            fp.up = Trajectory_ENU[t].up + rel_up;
+
+            WGS84Point wp = this->enuToWGS84(fp, this->origin_);
+            json pa = json::array();
+            pa.push_back(wp.lon);
+            pa.push_back(wp.lat);
+            pa.push_back(wp.alt);
+            follower_entry.push_back(pa);
+        }
+
+        plane_array.push_back(follower_entry);
+    }
+
+    return plane_array;
+}
+
+//生成三角形编队轨迹
+json UavPathPlanner::generateTriangleShapeTrajectories(const json &uavs_ids, const json &uav_starts,
+                                                       const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
+                                                       const std::vector<Eigen::Vector2d> &leader_xy,
+                                                       const std::vector<double> &leader_headings,
+                                                       const std::vector<ENUPoint> &Trajectory_ENU,
+                                                       double safety_distance)
+{
+    (void)leader_start_enu;
+    (void)R0;
+
+    json plane_array = json::array();
+    size_t N = Trajectory_ENU.size();
+
+    for (size_t idx = 0; idx < uavs_ids.size(); ++idx) {
+        int uid = uavs_ids[idx].get<int>();
+        if (idx >= uav_starts.size()) break;
+
+        // Get start point
+        auto s = uav_starts[idx];
+        WGS84Point start_wp;
+        start_wp.lon = s[0].get<double>();
+        start_wp.lat = s[1].get<double>();
+        start_wp.alt = s.size() >= 3 ? s[2].get<double>() : 0.0;
+
+        // Triangle layers: row 1 has 1 UAV, row 2 has 2 UAVs, ...
+        int k = static_cast<int>(idx) + 1; // 1-based follower index
+        int row = 1;
+        int prev_count = 0;
+        while (prev_count + row < k) {
+            prev_count += row;
+            row++;
+        }
+        int pos_in_row = k - prev_count - 1; // 0..row-1
+
+        double dx = -row * safety_distance;
+        double center = (row - 1) / 2.0;
+        double dy = (pos_in_row - center) * 2.0 * safety_distance;
+
+        Eigen::Vector2d rel_body(dx, dy);
+        double rel_up = 0.0;
+
+        json follower_entry = json::array();
+        follower_entry.push_back(uid);
+
+        for (size_t t = 0; t < N; ++t) {
+            if (t == 0) {
+                json pa = json::array();
+                pa.push_back(start_wp.lon);
+                pa.push_back(start_wp.lat);
+                pa.push_back(start_wp.alt);
+                follower_entry.push_back(pa);
+                continue;
+            }
+
+            double heading = leader_headings[t];
+            double c = cos(heading);
+            double s_ = sin(heading);
+            Eigen::Matrix2d Rt;
+            Rt << c, -s_,
+                  s_,  c;
+            Eigen::Vector2d offset_global = Rt * rel_body;
+
+            ENUPoint fp;
+            fp.east = leader_xy[t].x() + offset_global.x();
+            fp.north = leader_xy[t].y() + offset_global.y();
+            fp.up = Trajectory_ENU[t].up + rel_up;
+
+            WGS84Point wp = this->enuToWGS84(fp, this->origin_);
+            json pa = json::array();
+            pa.push_back(wp.lon);
+            pa.push_back(wp.lat);
+            pa.push_back(wp.alt);
+            follower_entry.push_back(pa);
+        }
+
+        plane_array.push_back(follower_entry);
+    }
+
+    return plane_array;
+}
+
 // Minisnap_EN: 仅在平面上(东/北)进行轨迹优化，忽略高度(将高度固定为起点高度)
 std::vector<ENUPoint> UavPathPlanner::Minisnap_EN (std::vector<ENUPoint> Enu_waypoint_, double distance_, double v_avg_override)
 {
@@ -1677,14 +1909,49 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
     {
         std::cout << "battle_zone_list is empty." << std::endl;
     }
-    if (input_json["distance_points"].size() != 0)
-    {
-        auto value = input_json["distance_points"];
-        input_data.distance_points = value;
+    // 路径采样间距（单位：米）
+    // 优先读取 input_json.distance_points；若缺失/为空则读取 config.yaml(path_planning.Distance_Points)
+    bool has_json_distance = false;
+    if (input_json.contains("distance_points") && !input_json["distance_points"].empty()) {
+        try {
+            if (input_json["distance_points"].is_number()) {
+                input_data.distance_points = input_json["distance_points"].get<double>();
+                has_json_distance = true;
+            } else if (input_json["distance_points"].is_array() && !input_json["distance_points"].empty()) {
+                input_data.distance_points = input_json["distance_points"][0].get<double>();
+                has_json_distance = true;
+            }
+        } catch (...) {
+            has_json_distance = false;
+        }
     }
-    else
-    {
-        std::cout << "distance_points is empty." << std::endl;
+
+    if (!has_json_distance) {
+        // 从 YAML 配置回退
+        std::vector<std::string> config_paths = {"config.yaml", "../config.yaml", "../../config.yaml"};
+        for (const auto& config_path : config_paths) {
+            try {
+                YAML::Node config = YAML::LoadFile(config_path);
+                if (config["path_planning"]) {
+                    auto pp = config["path_planning"];
+                    if (pp["Distance_Points"]) {
+                        input_data.distance_points = pp["Distance_Points"].as<double>();
+                        std::cout << "Loaded Distance_Points from " << config_path << ": " << input_data.distance_points << std::endl;
+                        break;
+                    } else if (pp["distance_points"]) {
+                        input_data.distance_points = pp["distance_points"].as<double>();
+                        std::cout << "Loaded distance_points from " << config_path << ": " << input_data.distance_points << std::endl;
+                        break;
+                    }
+                }
+            } catch (...) {
+                // ignore
+            }
+        }
+
+        if (!(input_data.distance_points > 0.0)) {
+            std::cout << "distance_points is empty/missing; Distance_Points not found in config.yaml." << std::endl;
+        }
     }
     // 允许从输入 JSON 指定平均速度 V_avg（m/s）
     if (input_json.contains("leader_speed") && !input_json["leader_speed"].empty()) {
