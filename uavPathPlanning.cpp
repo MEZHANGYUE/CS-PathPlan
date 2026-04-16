@@ -1,9 +1,9 @@
 #include "uavPathPlanning.hpp"
+#include "elevation_cost_map.hpp"
 #include "math_util/minimum_snap.hpp"
 #include "math_util/bezier.hpp"
 #include <yaml-cpp/yaml.h>
 #include <cmath>
-#include <cpl_string.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -103,6 +103,7 @@ UavPathPlanner::UavPathPlanner() {
     origin_.lon = 0.0;
     origin_.lat = 0.0;
     origin_.alt = 0.0;
+    elev_cost_map_ = std::make_unique<ElevationCostMap>();
 }
 
 UavPathPlanner::~UavPathPlanner() = default;
@@ -292,7 +293,7 @@ std::vector<WGS84Point> UavPathPlanner::enuToWGS84_Batch(const std::vector<ENUPo
     return results;
 }
 
-// 生成 arc-line-arc（相切圆 - 直线 - 相切圆）路径实现
+// 生成 arc-line-arc（相切圆 - 直线 - 相切圆）路径实现,用于任务区域过渡
 std::vector<ENUPoint> UavPathPlanner::generateArcLineArc(const ENUPoint &p0, double heading0,
                                                          const ENUPoint &p1, const ENUPoint &p2,
                                                          double radius, double resolution)
@@ -471,7 +472,7 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
 
         // Filter Trajectory_ENU logic removed as per request (filtering input points instead)
 
-        if (!this->loadElevationData(elev_file)) {
+        if (!elev_cost_map_ || !elev_cost_map_->loadElevationData(elev_file)) {
             std::cerr << "AltitudeOptimizer: failed to load elevation file: " << elev_file << "\n";
             return false;
         }
@@ -582,397 +583,7 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
         return false;
     }
 }
-
-bool UavPathPlanner::loadElevationData(const std::string &path)
-{
-  std::string path_to_load = path;
-  
-  struct stat stat_buf;
-  if (stat(path.c_str(), &stat_buf) == 0) {
-      long long size = stat_buf.st_size;
-      long long limit = 200LL * 1024 * 1024; // 200MB
-      
-      if (size > limit) {
-          std::string ovr_path = path + ".ovr";
-          struct stat stat_ovr;
-          if (stat(ovr_path.c_str(), &stat_ovr) == 0) {
-              std::cout << "Elevation file is large (" << size << " bytes). Found .ovr file, using it instead: " << ovr_path << std::endl;
-              path_to_load = ovr_path;
-          }
-      }
-  }
-
-#ifdef HAVE_GDAL
-  GDALAllRegister();
-  std::cerr << "ElevationMap: opening TIFF: " << path_to_load << std::endl;
-  // open readonly first to probe size and geotransform
-  GDALDataset *poDS = (GDALDataset*)GDALOpen(path_to_load.c_str(), GA_ReadOnly);
-  if (!poDS) {
-    cerr << "ElevationMap: GDALOpen failed for " << path_to_load << "\n";
-    return false;
-  }
-  int full_w = poDS->GetRasterXSize();
-  int full_h = poDS->GetRasterYSize();
-  std::cerr << "ElevationMap: dataset size: " << full_w << " x " << full_h << std::endl;
-  double gt[6];
-  if (poDS->GetGeoTransform(gt) == CE_None) {
-    elev_geo_.origin_x = gt[0];
-    elev_geo_.pixel_w = gt[1];
-    elev_geo_.rot_x = gt[2];
-    elev_geo_.origin_y = gt[3];
-    elev_geo_.rot_y = gt[4];
-    elev_geo_.pixel_h = gt[5];
-    std::cerr << "ElevationMap: geotransform: origin(" << elev_geo_.origin_x << ", " << elev_geo_.origin_y << ") pixel_w=" << elev_geo_.pixel_w << " pixel_h=" << elev_geo_.pixel_h << std::endl;
-  } else {
-    // default geotransform (pixel-as-meter)
-    elev_geo_.origin_x = 0.0; elev_geo_.pixel_w = 1.0; elev_geo_.rot_x = 0.0;
-    elev_geo_.origin_y = 0.0; elev_geo_.rot_y = 0.0; elev_geo_.pixel_h = -1.0;
-  }
-
-  // estimate memory needed (float32 per pixel)
-  const uint64_t bytes_needed = static_cast<uint64_t>(full_w) * static_cast<uint64_t>(full_h) * sizeof(float);
-   // target maximum bytes after downsampling: 1 GB (user request)
-   const uint64_t TARGET_BYTES = 200ULL * 1024ULL * 1024ULL;
-//    std::cerr << "ElevationMap: estimated memory for full raster (bytes): " << bytes_needed << " target_bytes=" << TARGET_BYTES << std::endl;
-
-  // Check for existing overviews first
-  GDALRasterBand *band = poDS->GetRasterBand(1);
-  int existing_ov = band ? band->GetOverviewCount() : 0;
-  bool found_suitable_ov = false;
-  if (existing_ov > 0) {
-    for (int i = 0; i < existing_ov; ++i) {
-      GDALRasterBand *ob = band->GetOverview(i);
-      if (ob) {
-        uint64_t ow = static_cast<uint64_t>(ob->GetXSize());
-        uint64_t oh = static_cast<uint64_t>(ob->GetYSize());
-        if (ow * oh * sizeof(float) <= TARGET_BYTES) {
-          found_suitable_ov = true;
-          break;
-        }
-      }
-    }
-  }
-
-   // If file is large and no suitable overview exists, perform in-code downsampling using MAX pooling
-   if (bytes_needed > TARGET_BYTES && !found_suitable_ov) {
-     bool ok = performDownsampling(poDS, full_w, full_h, bytes_needed, TARGET_BYTES, path_to_load);
-     GDALClose(poDS);
-     if (ok) {
-       printElevationInfo();
-       return true;
-     } else {
-       return false;
-     }
-   }  // If file is large and no overviews, try to create external overviews (.ovr) by reopening in update mode
-  if (bytes_needed > TARGET_BYTES && existing_ov == 0) {
-    std::cerr << "ElevationMap: large raster and no overviews; attempting to build external overviews..." << std::endl;
-  GDALClose(poDS);
-  // try to open in update mode to build overviews
-  // Force creation of external overviews (.ovr) by setting GDAL config option
-  CPLSetConfigOption("GDAL_TIFF_OVR", "YES");
-  std::cerr << "ElevationMap: CPLSetConfigOption GDAL_TIFF_OVR=YES to force external overviews" << std::endl;
-  GDALDataset *poDSup = (GDALDataset*)GDALOpen(path_to_load.c_str(), GA_Update);
-    if (poDSup) {
-      // build overview levels 2,4,8,... until smallest dimension < 256
-      std::vector<int> ov_levels;
-      int w = full_w, h = full_h;
-      int level = 2;
-      while ((w / level) >= 25600 || (h / level) >= 25600) {
-        ov_levels.push_back(level);
-        level *= 2;
-      }
-      std::cerr << "ElevationMap: requested overview levels: ";
-      for (size_t i=0;i<ov_levels.size();++i) std::cerr << ov_levels[i] << (i+1<ov_levels.size()?",":"\n");
-  if (!ov_levels.empty()) {
-        // BuildOverviews signature expects: resampling, nListCount, panOverviewList, nBands, panBands, pfnProgress, pProgressData
-        int nBands = 1;
-        int panBands[1] = {1};
-        // Try to build overviews using MAX sampling (take maximum of covered pixels) to preserve peaks.
-        const char *resampling_try = "MAX";
-        CPLErr berr = poDSup->BuildOverviews(resampling_try, static_cast<int>(ov_levels.size()), ov_levels.data(), nBands, panBands, nullptr, nullptr);
-        if (berr != CE_None) {
-          std::cerr << "ElevationMap: BuildOverviews with resampling=MAX failed, falling back to AVERAGE for " << path_to_load << "\n";
-          resampling_try = "AVERAGE";
-          berr = poDSup->BuildOverviews(resampling_try, static_cast<int>(ov_levels.size()), ov_levels.data(), nBands, panBands, nullptr, nullptr);
-        }
-        if (berr != CE_None) {
-          cerr << "ElevationMap: BuildOverviews failed for " << path_to_load << "\n";
-        } else {
-          std::cerr << "ElevationMap: external overviews built for " << path_to_load << " using resampling=" << resampling_try << "\n";
-        }
-      } else {
-        std::cerr << "ElevationMap: no overview levels chosen (small raster)" << std::endl;
-      }
-      GDALClose(poDSup);
-    } else {
-      // cannot open update; warn and fall back to read-only
-      std::cerr << "ElevationMap: cannot open " << path_to_load << " in update mode to build overviews; continuing" << std::endl;
-    }
-    // clear the config option we set earlier
-    CPLSetConfigOption("GDAL_TIFF_OVR", nullptr);
-    // reopen readonly to continue
-    poDS = (GDALDataset*)GDALOpen(path_to_load.c_str(), GA_ReadOnly);
-    if (!poDS) {
-      cerr << "ElevationMap: GDALOpen failed for " << path_to_load << " after overview attempt\n";
-      return false;
-    }
-    band = poDS->GetRasterBand(1);
-    existing_ov = band ? band->GetOverviewCount() : 0;
-  }
-
-  // If overviews exist, try to pick a lower-resolution overview that fits memory threshold
-  GDALRasterBand *readBand = band;
-  int use_ov_index = -1;
-  if (band && existing_ov > 0) {
-    // iterate from largest overview (highest index) to smallest
-    for (int i = existing_ov - 1; i >= 0; --i) {
-      GDALRasterBand *ob = band->GetOverview(i);
-      if (!ob) continue;
-      uint64_t ow = static_cast<uint64_t>(ob->GetXSize());
-      uint64_t oh = static_cast<uint64_t>(ob->GetYSize());
-  uint64_t need = ow * oh * sizeof(float);
-  if (need <= TARGET_BYTES) {
-        readBand = ob;
-        use_ov_index = i;
-        elev_width_ = static_cast<int>(ow);
-        elev_height_ = static_cast<int>(oh);
-        // adjust geotransform: pixel size scales by factor = full_w / ow (assume integer)
-        double scale_x = static_cast<double>(full_w) / static_cast<double>(ow);
-        double scale_y = static_cast<double>(full_h) / static_cast<double>(oh);
-        elev_geo_.pixel_w = elev_geo_.pixel_w * scale_x;
-        elev_geo_.pixel_h = elev_geo_.pixel_h * scale_y;
-        break;
-      }
-    }
-    // std::cerr << "ElevationMap: existing overviews count=" << existing_ov << " chosen overview index=" << use_ov_index << std::endl;
-  }
-
-  // If we didn't pick an overview, read full resolution
-  if (use_ov_index == -1) {
-    elev_width_ = full_w;
-    elev_height_ = full_h;
-  }
-
-  // allocate and read from the chosen band (overview or base)
-  elev_data_.assign(static_cast<size_t>(elev_width_) * static_cast<size_t>(elev_height_), std::numeric_limits<float>::quiet_NaN());
-  CPLErr err;
-  if (readBand) {
-    // readBand may be an overview; use RasterIO on the band
-    err = readBand->RasterIO(GF_Read, 0, 0, elev_width_, elev_height_, elev_data_.data(), elev_width_, elev_height_, GDT_Float32, 0, 0);
-  } else {
-    err = CE_Failure;
-  }
-  if (err != CE_None) {
-    cerr << "ElevationMap: GDAL RasterIO failed\n";
-    GDALClose(poDS);
-    return false;
-  }
-  GDALClose(poDS);
-  elev_valid_ = true;
-  std::cerr << "ElevationMap: finished reading raster (width=" << elev_width_ << " height=" << elev_height_ << ")" << std::endl;
-  // print a short summary of the map
-//   printElevationInfo();
-  return true;
-#else
-  cerr << "ElevationMap: GDAL not available at build time. Cannot load TIFF.\n";
-  return false;
-#endif
-}
-
-bool UavPathPlanner::performDownsampling(void* poDS_ptr, int full_w, int full_h, uint64_t bytes_needed, uint64_t target_bytes, const std::string& path) {
-#ifdef HAVE_GDAL
-    GDALDataset *poDS = (GDALDataset*)poDS_ptr;
-    std::cerr << "ElevationMap: raster exceeds target size and no suitable overview found, performing in-code max downsample\n";
-    GDALRasterBand *band = poDS->GetRasterBand(1);
-    if (!band) {
-      std::cerr << "ElevationMap: no raster band found\n";
-      return false;
-    }
-    int hasNoData = 0;
-    double noDataVal = band->GetNoDataValue(&hasNoData);
-
-    // compute initial reduction factor so that output fits within TARGET_BYTES
-    double scale = std::sqrt((double)bytes_needed / (double)target_bytes);
-    int factor = static_cast<int>(std::ceil(scale));
-    if (factor < 1) factor = 1;
-
-    // We'll try decreasing the factor if the resulting downsample has too little valid data
-    const double MIN_VALID_FRACTION = 0.01; // require at least 1% valid pixels
-    const int MAX_ITER = 8;
-    int iter = 0;
-    bool done = false;
-    std::vector<float> best_data;
-    int best_w = 0, best_h = 0;
-    while (!done && iter < MAX_ITER) {
-      ++iter;
-      int out_w = static_cast<int>((full_w + factor - 1) / factor);
-      int out_h = static_cast<int>((full_h + factor - 1) / factor);
-      std::cerr << "ElevationMap: attempt " << iter << " downsample factor=" << factor << " out_size=" << out_w << "x" << out_h << std::endl;
-
-      std::vector<float> outdata(static_cast<size_t>(out_w) * static_cast<size_t>(out_h), std::numeric_limits<float>::quiet_NaN());
-      std::vector<char> hasValTmp(static_cast<size_t>(out_w) * static_cast<size_t>(out_h), 0);
-      std::vector<float> rowbuf(full_w);
-      for (int y = 0; y < full_h; ++y) {
-        CPLErr rerr = band->RasterIO(GF_Read, 0, y, full_w, 1, rowbuf.data(), full_w, 1, GDT_Float32, 0, 0);
-        if (rerr != CE_None) {
-          std::cerr << "ElevationMap: RasterIO row read failed at y=" << y << "\n";
-          return false;
-        }
-        int oy = y / factor;
-        for (int x = 0; x < full_w; ++x) {
-          float v = rowbuf[x];
-          if (!std::isfinite(v)) continue;
-          bool isNoData = false;
-          if (hasNoData) {
-            if (v == static_cast<float>(noDataVal)) isNoData = true;
-          } else {
-            if (v == -32767.0f || v == -32768.0f || v == -9999.0f || v == -99999.0f) isNoData = true;
-          }
-          if (isNoData) continue;
-          int ox = x / factor;
-          size_t idx = static_cast<size_t>(oy) * static_cast<size_t>(out_w) + static_cast<size_t>(ox);
-          if (!hasValTmp[idx]) {
-            outdata[idx] = v;
-            hasValTmp[idx] = 1;
-          } else {
-            if (v > outdata[idx]) outdata[idx] = v;
-          }
-        }
-      }
-      size_t total_out = static_cast<size_t>(out_w) * static_cast<size_t>(out_h);
-      size_t valid_count = 0;
-      for (size_t i = 0; i < total_out; ++i) if (hasValTmp[i]) ++valid_count;
-      double valid_frac = total_out ? (double)valid_count / (double)total_out : 0.0;
-      std::cerr << "ElevationMap: valid fraction=" << valid_frac << " (" << valid_count << "/" << total_out << ")" << std::endl;
-
-      if (valid_frac >= MIN_VALID_FRACTION || factor == 1) {
-        // accept this result
-        best_data.swap(outdata);
-        best_w = out_w; best_h = out_h;
-        done = true;
-        break;
-      } else {
-        // keep as fallback, but try to reduce factor to get more valid pixels
-        best_data.swap(outdata);
-        best_w = out_w; best_h = out_h;
-        int new_factor = std::max(1, factor / 2);
-        if (new_factor == factor) { done = true; break; }
-        factor = new_factor;
-        std::cerr << "ElevationMap: too few valid pixels, reducing factor to " << factor << " and retrying" << std::endl;
-      }
-    }
-
-    if (best_data.empty()) {
-      std::cerr << "ElevationMap: downsample produced no data" << std::endl;
-      return false;
-    }
-
-    // move best_data into data_
-    elev_width_ = best_w; elev_height_ = best_h;
-    elev_data_.swap(best_data);
-    // update geo transform based on final factor estimate: compute effective factor = full_w / width_
-    double eff_scale_x = static_cast<double>(full_w) / static_cast<double>(elev_width_);
-    double eff_scale_y = static_cast<double>(full_h) / static_cast<double>(elev_height_);
-    elev_geo_.pixel_w = elev_geo_.pixel_w * eff_scale_x;
-    elev_geo_.pixel_h = elev_geo_.pixel_h * eff_scale_y;
-
-    // Save the downsampled data to .ovr file for future use
-    std::string ovrPath = path + ".ovr";
-    GDALDriver *poDriver = GetGDALDriverManager()->GetDriverByName("GTiff");
-    if (poDriver) {
-        char **papszOptions = nullptr;
-        papszOptions = CSLSetNameValue(papszOptions, "COMPRESS", "LZW");
-        papszOptions = CSLSetNameValue(papszOptions, "TILED", "YES");
-        GDALDataset *poOvrDS = poDriver->Create(ovrPath.c_str(), elev_width_, elev_height_, 1, GDT_Float32, papszOptions);
-        if (poOvrDS) {
-             double new_gt[6];
-             new_gt[0] = elev_geo_.origin_x;
-             new_gt[1] = elev_geo_.pixel_w;
-             new_gt[2] = elev_geo_.rot_x;
-             new_gt[3] = elev_geo_.origin_y;
-             new_gt[4] = elev_geo_.rot_y;
-             new_gt[5] = elev_geo_.pixel_h;
-             poOvrDS->SetGeoTransform(new_gt);
-             poOvrDS->SetProjection(poDS->GetProjectionRef());
-             GDALRasterBand *ovBand = poOvrDS->GetRasterBand(1);
-             if (hasNoData) ovBand->SetNoDataValue(noDataVal);
-             if (ovBand->RasterIO(GF_Write, 0, 0, elev_width_, elev_height_, elev_data_.data(), elev_width_, elev_height_, GDT_Float32, 0, 0) != CE_None) {
-                 std::cerr << "ElevationMap: failed to write data to overview file " << ovrPath << std::endl;
-             }
-             GDALClose(poOvrDS);
-             std::cerr << "ElevationMap: saved downsampled data to " << ovrPath << std::endl;
-        } else {
-             std::cerr << "ElevationMap: failed to create overview file " << ovrPath << std::endl;
-        }
-        CSLDestroy(papszOptions);
-    }
-
-    elev_valid_ = true;
-    std::cerr << "ElevationMap: in-code max downsample finished (width=" << elev_width_ << " height=" << elev_height_ << ")" << std::endl;
-    return true;
-#else
-    return false;
-#endif
-}
-
-void UavPathPlanner::printElevationInfo() const
-{
-  if (!elev_valid_) {
-    std::cerr << "ElevationMap: no valid data loaded" << std::endl;
-    return;
-  }
-  std::cerr << "ElevationMap: info -> width=" << elev_width_ << " height=" << elev_height_ << " resolution_x=" << elev_geo_.pixel_w << " resolution_y=" << elev_geo_.pixel_h << std::endl;
-  // compute basic stats (skip NaNs)
-  double minv = std::numeric_limits<double>::infinity();
-  double maxv = -std::numeric_limits<double>::infinity();
-  uint64_t nan_count = 0;
-  size_t total = static_cast<size_t>(elev_width_) * static_cast<size_t>(elev_height_);
-  for (size_t i = 0; i < total; ++i) {
-    float v = elev_data_[i];
-    if (std::isnan(v)) { ++nan_count; continue; }
-    if (v < minv) minv = v;
-    if (v > maxv) maxv = v;
-  }
-  if (nan_count == total) {
-    std::cerr << "ElevationMap: all values are NaN" << std::endl;
-  } else {
-    std::cerr << "ElevationMap: data min=" << minv << " max=" << maxv << " NaN_count=" << nan_count << std::endl;
-  }
-  // print a few sample values
-  std::cerr << "ElevationMap: sample values (first up to 8): ";
-  for (size_t i = 0; i < std::min<size_t>(8, total); ++i) {
-    if (i) std::cerr << ", ";
-    std::cerr << elev_data_[i];
-  }
-  std::cerr << std::endl;
-}
-
-bool UavPathPlanner::getElevationAt(double x, double y, double &elev) const
-{
-  if (!elev_valid_) return false;
-  // Convert world x,y to pixel indices (assuming geo_.origin is top-left)
-  // pixel center at origin + (i+0.5)*pixel_w
-  double px = (x - elev_geo_.origin_x) / elev_geo_.pixel_w - 0.5;
-  double py = (y - elev_geo_.origin_y) / elev_geo_.pixel_h - 0.5; // pixel_h may be negative
-  // Note: if pixel_h negative, dividing by negative flips sign; above handles both
-  // Bilinear interpolation
-  int ix = static_cast<int>(floor(px));
-  int iy = static_cast<int>(floor(py));
-  double fx = px - ix;
-  double fy = py - iy;
-  if (ix < 0 || iy < 0 || ix+1 >= elev_width_ || iy+1 >= elev_height_) return false;
-  int i00 = iy * elev_width_ + ix;
-  int i10 = iy * elev_width_ + (ix+1);
-  int i01 = (iy+1) * elev_width_ + ix;
-  int i11 = (iy+1) * elev_width_ + (ix+1);
-  double v00 = elev_data_[i00];
-  double v10 = elev_data_[i10];
-  double v01 = elev_data_[i01];
-  double v11 = elev_data_[i11];
-  elev = v00*(1-fx)*(1-fy) + v10*(fx)*(1-fy) + v01*(1-fx)*(fy) + v11*(fx)*(fy);
-  return true;
-}
-
+//高度优化,根据代价地图高程值
 bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoints,
                                        const AltitudeParams &p,
                                        std::vector<double> &out_z)
@@ -1012,7 +623,7 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
     float celev;
     
     // Try CostMap first (which is now in ENU)
-    if (this->getCostAt(wx, wy, celev)) {
+    if (elev_cost_map_ && elev_cost_map_->getCostAt(wx, wy, celev)) {
         elev = static_cast<double>(celev);
         has_elev = true;
     } else {
@@ -1023,7 +634,7 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
         enu_pt.up = 0.0;
         WGS84Point wgs_pt = this->enuToWGS84(enu_pt, this->origin_);
         
-        if (this->getElevationAt(wgs_pt.lon, wgs_pt.lat, elev)) {
+        if (elev_cost_map_ && elev_cost_map_->getElevationAt(wgs_pt.lon, wgs_pt.lat, elev)) {
             has_elev = true;
         }
     }
@@ -1089,7 +700,7 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
       float celev;
       double min_h = -std::numeric_limits<double>::infinity();
       
-      if (this->getCostAt(wx, wy, celev)) {
+      if (elev_cost_map_ && elev_cost_map_->getCostAt(wx, wy, celev)) {
           min_h = static_cast<double>(celev) + p.safe_distance;
       } else {
           double elev;
@@ -1100,7 +711,7 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
           enu_pt.up = 0.0;
           WGS84Point wgs_pt = this->enuToWGS84(enu_pt, this->origin_);
 
-          if (this->getElevationAt(wgs_pt.lon, wgs_pt.lat, elev)) {
+          if (elev_cost_map_ && elev_cost_map_->getElevationAt(wgs_pt.lon, wgs_pt.lat, elev)) {
               min_h = elev + p.safe_distance;
           }
       }
@@ -1112,7 +723,7 @@ bool UavPathPlanner::optimizeHeights(const std::vector<Eigen::Vector3d> &waypoin
 
   return true;
 }
-
+//全局高度优化平滑(二次优化)
 bool UavPathPlanner::optimizeHeightsGlobalSmooth(const std::vector<double> &input_z,
                                                  const std::vector<Eigen::Vector3d> &waypoints,
                                                  const AltitudeParams &p,
@@ -1214,7 +825,7 @@ bool UavPathPlanner::optimizeHeightsGlobalSmooth(const std::vector<double> &inpu
 
         if (!violation) break; // Converged
     }
-
+    
     // Final check to ensure strictly >= input_z
     for (size_t i = 0; i < n; ++i) {
         if (current_z[i] < input_z[i]) current_z[i] = input_z[i];
@@ -1229,9 +840,7 @@ bool UavPathPlanner::optimizeHeightsGlobalSmooth(const std::vector<double> &inpu
 
 
 //get the input data of uav waypoints
-// 读取JSON文件中的路径点并直接返回东北天坐标
 // 从JSON对象中读取路径点并直接返回东北天坐标
-
 std::vector<ENUPoint> UavPathPlanner::getENUFromJSON(const json& j, const std::string& key1, const std::string& key2) 
 {
     std::vector<ENUPoint> enu_path;
@@ -1336,7 +945,7 @@ std::vector<ENUPoint> UavPathPlanner::getENUFromJSON(const json& j, const std::s
     }
     return enu_path;
 }
-
+//轨迹点之间的距离参数
 double UavPathPlanner::getDistanceFromJSON(const json& j, const std::string& key) 
 {
     double distance_;
@@ -1358,7 +967,7 @@ double UavPathPlanner::getDistanceFromJSON(const json& j, const std::string& key
     return distance_;
 }
 
-//
+//规划函数 用于总调用
 
 bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, std::string algorithm)
 {
@@ -1601,12 +1210,10 @@ if(input_json["high_zhandou_point_wgs84"].size()!=0 && !Trajectory_ENU.empty() &
     // 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
     computeTransitionAndRotatePatrol(p0, heading0, this->input_data_.min_turning_radius, distance, Patrol_Path, output_json);
 }
-
-
     return true;
 }
 
-
+//保存经纬度轨迹到JSON
 bool UavPathPlanner::putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj) {
     try {
         // 创建二维数组
@@ -1629,7 +1236,7 @@ bool UavPathPlanner::putWGS84ToJson(json &j, const std::string &key, const std::
         return false;
     }
 }
-
+//生成僚机编队轨迹
 json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const InputData &input_data,
                                   const std::vector<ENUPoint> &Trajectory_ENU,
                                   const std::vector<WGS84Point> &Trajectory_WGS84) {
@@ -1752,7 +1359,7 @@ json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const 
 
     return plane_array;
 }
-
+//生成人字形编队轨迹
 json UavPathPlanner::generateVShapeTrajectories(const json &uavs_ids, const json &uav_starts, 
                                                 const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
                                                 const std::vector<Eigen::Vector2d> &leader_xy, 
@@ -1823,7 +1430,7 @@ json UavPathPlanner::generateVShapeTrajectories(const json &uavs_ids, const json
     }
     return plane_array;
 }
-
+//生成一字形编队轨迹
 json UavPathPlanner::generateLineShapeTrajectories(const json &uavs_ids, const json &uav_starts, 
                                                    const ENUPoint &leader_start_enu, const Eigen::Matrix2d &R0,
                                                    const std::vector<Eigen::Vector2d> &leader_xy, 
@@ -2016,7 +1623,7 @@ std::vector<ENUPoint> UavPathPlanner::Minisnap_3D(std::vector<ENUPoint> Enu_wayp
     return result;
 }
 
-// Bezier_3D: 贝塞尔曲线轨迹生成
+// Bezier_3D: 贝塞尔曲线轨迹生成,未使用
 std::vector<ENUPoint> UavPathPlanner::Bezier_3D(std::vector<ENUPoint> Enu_waypoint_, double distance_, double V_avg_override, double min_radius) //转弯半径无效
 {
     std::vector<ENUPoint> result{};
@@ -2051,7 +1658,7 @@ std::vector<ENUPoint> UavPathPlanner::Bezier_3D(std::vector<ENUPoint> Enu_waypoi
     std::cout << "Generated Bezier 3D trajectory point number:" << result.size() << std::endl;
     return result;
 }
-
+//将input json数据加载到input_data结构体中
 bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
 {
     if (input_json["battle_high_list"].size() != 0)
@@ -2258,46 +1865,32 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
         }
     }
 
+    if (input_json.contains("using_midway_lines") && input_json["using_midway_lines"].is_array() && !input_json["using_midway_lines"].empty()) {
+        for (const auto& line : input_json["using_midway_lines"]) {
+            if (line.is_array() && line.size() > 2) {
+                // line[0] is uav_id, line[1] is segment_id
+                for (size_t i = 2; i < line.size(); ++i) {
+                    const auto& pt = line[i];
+                    if (pt.is_array() && pt.size() >= 2) {
+                        double lon = pt[0].get<double>();
+                        double lat = pt[1].get<double>();
+                        double alt = (pt.size() >= 3) ? pt[2].get<double>() : 0.0;
+                        input_data.existing_midway_lines.emplace_back(WGS84Coord(lon, lat, alt));
+                    }
+                }
+            }
+        }
+    } else {
+        std::cout << "using_midway_lines is empty or missing." << std::endl;
+    }
+
     return true;
 }
 
-// CostMap implementation merged into UavPathPlanner
-void UavPathPlanner::createCostMap(int width, int height, double resolution, double origin_x, double origin_y)
-{
-  cost_width_ = width; 
-  cost_height_ = height; 
-  cost_resolution_ = resolution; 
-  cost_origin_x_ = origin_x; 
-  cost_origin_y_ = origin_y;
-  cost_data_.assign(cost_width_ * cost_height_, -std::numeric_limits<float>::infinity());
-}
-
-void UavPathPlanner::setCost(int x, int y, float c)
-{
-  if (x < 0 || y < 0 || x >= cost_width_ || y >= cost_height_) return;
-  cost_data_[y * cost_width_ + x] = c;
-}
-
-float UavPathPlanner::getCost(int x, int y) const
-{
-  if (x < 0 || y < 0 || x >= cost_width_ || y >= cost_height_) return -std::numeric_limits<float>::infinity();
-  return cost_data_[y * cost_width_ + x];
-}
-
-bool UavPathPlanner::getCostAt(double x, double y, float &val) const
-{
-  // Assume top-left origin, x increases right, y decreases down (standard map)
-  int c = static_cast<int>(floor((x - cost_origin_x_) / cost_resolution_));
-  int r = static_cast<int>(floor((cost_origin_y_ - y) / cost_resolution_));
-  
-  if (c < 0 || c >= cost_width_ || r < 0 || r >= cost_height_) return false;
-  val = cost_data_[r * cost_width_ + c];
-  return true;
-}
-
+//创建局部代价地图（ENU坐标系）
 void UavPathPlanner::buildLocalENUCostMap(double margin, double resolution)//margin:边距参数,扩大局部地图覆盖范围
 {
-  if (!elev_valid_ || Trajectory_ENU.empty()) return;
+    if (!elev_cost_map_ || !elev_cost_map_->isElevationValid() || Trajectory_ENU.empty()) return;
 
   // 1. Determine bounding box of the trajectory in ENU
   double min_e = std::numeric_limits<double>::infinity();
@@ -2326,7 +1919,7 @@ void UavPathPlanner::buildLocalENUCostMap(double margin, double resolution)//mar
   if (w <= 0) w = 1;
   if (h <= 0) h = 1;
 
-  createCostMap(w, h, resolution, min_e, max_n); // Origin is top-left (min_e, max_n)
+    elev_cost_map_->createCostMap(w, h, resolution, min_e, max_n); // Origin is top-left (min_e, max_n)
 
   std::cerr << std::fixed << std::setprecision(15)
             // << "Building local ENU CostMap: " << w << "x" << h 
@@ -2354,11 +1947,11 @@ void UavPathPlanner::buildLocalENUCostMap(double margin, double resolution)//mar
           double elev_val = -std::numeric_limits<double>::infinity();
           // Query ElevationMap (which is in WGS84)
           // Note: getElevationAt expects x,y in the ElevationMap's CRS (WGS84 Lon/Lat)
-          if (this->getElevationAt(wgs_pt.lon, wgs_pt.lat, elev_val)) {
-              setCost(c, r, static_cast<float>(elev_val));
+          if (elev_cost_map_->getElevationAt(wgs_pt.lon, wgs_pt.lat, elev_val)) {
+              elev_cost_map_->setCost(c, r, static_cast<float>(elev_val));
           } else {
               // If out of bounds of elevation map, set to -inf or some default
-              setCost(c, r, -std::numeric_limits<float>::infinity());
+              elev_cost_map_->setCost(c, r, -std::numeric_limits<float>::infinity());
           }
       }
   }
@@ -2574,7 +2167,7 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
     this->putWGS84ToJson(output_json, "uav_leader_plane2", Transition_Path_WGS84);
     this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, 2, Transition_Path_WGS84);
 }
-
+//避开禁飞区域,高度避障或者绕障
 std::vector<ENUPoint> UavPathPlanner::avoidProhibitedZones(const std::vector<ENUPoint>& path) {
     if (input_data_.prohibited_zones.empty() || path.size() < 2) {
         return path;
@@ -2777,7 +2370,7 @@ std::vector<ENUPoint> UavPathPlanner::avoidProhibitedZones(const std::vector<ENU
 
     return current_path;
 }
-
+//将规划的轨迹保存到using_midway_lines 输出
 void UavPathPlanner::appendTrajectoryToOutput(json &output_json, int uav_id, int segment_id, const std::vector<WGS84Point> &traj) {
     if (!output_json.contains("using_midway_lines")) {
         output_json["using_midway_lines"] = json::array();

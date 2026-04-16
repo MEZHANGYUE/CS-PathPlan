@@ -13,19 +13,14 @@
 #include <algorithm>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
+#include <cstdint>
+#include <memory>
 
 using namespace std;
 using json = nlohmann::json;
 using namespace math_util;
 
-struct GeoTransform {
-  double origin_x; // top-left X
-  double pixel_w;  // pixel width (x resolution)
-  double rot_x;    // rotation
-  double origin_y; // top-left Y
-  double rot_y;
-  double pixel_h;  // pixel height (negative if north-up)
-};
+class ElevationCostMap;
 
 struct ProhibitedZone {
     std::vector<WGS84Coord> polygon;
@@ -50,6 +45,7 @@ struct InputData
     std::pair<int, std::pair<int, int>> uavs_plane_data;
     bool has_prohibited_zone = false;
     std::vector<ProhibitedZone> prohibited_zones;
+    std::vector<WGS84Coord> existing_midway_lines; // 新增
 };
 
 struct OutputData
@@ -236,42 +232,17 @@ private:
         double safe_distance = 50.0; // Safe distance from terrain (meters)
     };
 
-    // Elevation Map Data
-    int elev_width_ = 0;
-    int elev_height_ = 0;
-    std::vector<float> elev_data_; // row-major, top-left origin
-    GeoTransform elev_geo_;
-    bool elev_valid_ = false;
+    // Elevation + Cost map (delegated to ElevationCostMap)
+    std::unique_ptr<ElevationCostMap> elev_cost_map_;
 
-    // CostMap Data
-    int cost_width_ = 0;
-    int cost_height_ = 0;
-    double cost_resolution_ = 0.0;
-    double cost_origin_x_ = 0.0;
-    double cost_origin_y_ = 0.0;
-    std::vector<float> cost_data_; // row-major, top-left origin
-
-    // Helpers for elevation
-    bool performDownsampling(void* poDS_ptr, int full_w, int full_h, uint64_t bytes_needed, uint64_t target_bytes, const std::string& path);
-    bool getElevationAt(double x, double y, double &elev) const;
+    // Helpers for altitude optimization
     bool optimizeHeights(const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
     bool optimizeHeightsGlobalSmooth(const std::vector<double> &input_z, const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
 
     // ECEF转经纬度（迭代法）
     ECEFPoint wgs84ToECEF(const WGS84Point& lla);
 
-    // Altitude Optimization methods
-    bool loadElevationData(const std::string &path);
-    
-    // Elevation Map Info
-    void printElevationInfo() const;
-    bool isElevationValid() const { return elev_valid_; }
-
-    // CostMap methods
-    void createCostMap(int width, int height, double resolution, double origin_x, double origin_y);
-    void setCost(int x, int y, float c);
-    float getCost(int x, int y) const;
-    bool getCostAt(double x, double y, float &val) const;
+    // Elevation/CostMap methods are provided directly by ElevationCostMap
     // void initCostMapFromElevation(); // Removed in favor of local ENU map
     void buildLocalENUCostMap(double margin, double resolution);
 

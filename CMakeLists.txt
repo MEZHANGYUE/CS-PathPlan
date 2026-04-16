@@ -14,7 +14,10 @@ find_package(nlohmann_json REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(GDAL)
 
-add_library(algo uavPathPlanning.cpp)
+add_library(algo
+    uavPathPlanning.cpp
+    elevation_cost_map.cpp
+)
 
 add_library(math_util 
     math_util/polygon2d.cpp

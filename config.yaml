@@ -1,11 +1,19 @@
 altitude_optimization:
+  #是否启用高度优化
   enabled: true
+#读取地形高程的 DEM 文件路径
   elevation_file: "../data/neimeng.tif"
-  lambda_smooth: 1.0
+#平滑项权重
+  lambda_smooth: 1.0 
+#跟随地形项权重
   lambda_follow: 1.0
+#最大爬升率约束
   max_climb_rate: 0.5
   uav_R: 2.0
+#相对于地形的最小安全垂直距离（米）
   safe_distance: 50.0
 path_planning:
+#路径规划时允许的最小转弯半径（米）
   min_turning_radius: 300.0
+#路径规划中的安全距离
   safe_distance: 50.0
