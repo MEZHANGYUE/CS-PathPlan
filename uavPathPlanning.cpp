@@ -550,7 +550,7 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
         // Instead of copying the whole map (which is in WGS84), we build a local ENU costmap
         // around the trajectory. This solves the coordinate system mismatch.
         // Use a reasonable resolution (e.g. 10m) and margin (e.g. 200m)
-        this->buildLocalENUCostMap(500.0, 10.0);
+        this->buildLocalENUCostMap(1000.0, 10.0);
 
         // build waypoint vector for optimizer from member Trajectory_ENU
         std::vector<Eigen::Vector3d> wpts;
@@ -1144,9 +1144,6 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         std::cerr << "Unknown algorithm: " << algorithm << ". Please use one of: minimum_snap, bspline, bezier" << std::endl;
         return false;
     }
-    // Altitude optimization is no longer performed automatically here.
-    // Use UavPathPlanner::runAltitudeOptimization(elev_file) externally to run
-    // a separate altitude-only optimization step when desired.
     // std::cout << "trajectory point number:" << Trajectory_ENU.size() << std::endl;
     //东北天坐标转换为经纬高
     std::vector<WGS84Point> Trajectory_WGS84 = this->enuToWGS84_Batch(Trajectory_ENU,this->origin_);
@@ -1206,84 +1203,193 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
 
     std::vector<ENUPoint> Patrol_Path; // 提升作用域以供第二段轨迹计算使用
 
-/*                   第三段段任务区域巡逻轨迹计算               */
-if(input_json["high_zhandou_point_wgs84"].size()!=0)   //存在高战斗区域点且有前序轨迹
-{
-    std::cout<<"开始计算第三段任务区域巡逻轨迹"<<std::endl;
-    
-    // 提取用于区域边界点的点（仅包含 zhandou points）
-    std::vector<ENUPoint> Patrol_waypoints={};
-    if (Enu_waypoint.size() >= zhandoupoint_num) {
-        Patrol_waypoints.assign(Enu_waypoint.end() - zhandoupoint_num ,Enu_waypoint.end());
-    } 
-    Patrol_waypoints.push_back(Patrol_waypoints[0]); //闭合巡逻路径
-
-    // 为了保证闭合处的切向连续（即第一个点和最后一个点的朝向相同），
-    // 我们在末尾再多加一个点（即第二个点），使路径变为 P0 -> P1 -> ... -> P0 -> P1
-    // 然后截取 P0 -> ... -> P0 部分
-    if (Patrol_waypoints.size() > 2) {
-        Patrol_waypoints.push_back(Patrol_waypoints[1]);
-    }
-
-    std::vector<ENUPoint> Patrol_Path_Full = Minisnap_3D(Patrol_waypoints, distance, this->input_data_.leader_speed);
-    
-    if (Patrol_waypoints.size() > 2 && !Patrol_Path_Full.empty()) {
-        // 目标截断点是倒数第二个航点 (P0)
-        ENUPoint target_p = Patrol_waypoints[Patrol_waypoints.size() - 2];
+    /*                   第三段段任务区域巡逻轨迹计算               */
+    if(input_json["high_zhandou_point_wgs84"].size()!=0)   //存在高战斗区域点且有前序轨迹
+    {
+        std::cout<<"开始计算第三段任务区域巡逻轨迹"<<std::endl;
         
-        // 从后往前搜索最接近 target_p 的点
-        // 限制搜索范围为后半段，避免匹配到起点的 P0
-        size_t best_idx = Patrol_Path_Full.size() - 1;
-        double min_dist = std::numeric_limits<double>::max();
-        size_t search_start = Patrol_Path_Full.size() / 2;
-        
-        for (size_t i = Patrol_Path_Full.size() - 1; i >= search_start; --i) {
-            double dx = Patrol_Path_Full[i].east - target_p.east;
-            double dy = Patrol_Path_Full[i].north - target_p.north;
-            double dz = Patrol_Path_Full[i].up - target_p.up;
-            double d = dx*dx + dy*dy + dz*dz;
-            
-            if (d < min_dist) {
-                min_dist = d;
-                best_idx = i;
-            }
+        // 提取用于区域边界点的点（仅包含 zhandou points）
+        std::vector<ENUPoint> Patrol_waypoints={};
+        if (Enu_waypoint.size() >= zhandoupoint_num) {
+            Patrol_waypoints.assign(Enu_waypoint.end() - zhandoupoint_num ,Enu_waypoint.end());
+        } 
+        Patrol_waypoints.push_back(Patrol_waypoints[0]); //闭合巡逻路径
+
+        // 为了保证闭合处的切向连续（即第一个点和最后一个点的朝向相同），
+        // 我们在末尾再多加一个点（即第二个点），使路径变为 P0 -> P1 -> ... -> P0 -> P1
+        // 然后截取 P0 -> ... -> P0 部分
+        if (Patrol_waypoints.size() > 2) {
+            Patrol_waypoints.push_back(Patrol_waypoints[1]);
         }
+
+        std::vector<ENUPoint> Patrol_Path_Full = Minisnap_3D(Patrol_waypoints, distance, this->input_data_.leader_speed);
         
-        // 截取到 best_idx
-        if (best_idx < Patrol_Path_Full.size()) {
-            Patrol_Path.assign(Patrol_Path_Full.begin(), Patrol_Path_Full.begin() + best_idx + 1);
+        if (Patrol_waypoints.size() > 2 && !Patrol_Path_Full.empty()) {
+            // 目标截断点是倒数第二个航点 (P0)
+            ENUPoint target_p = Patrol_waypoints[Patrol_waypoints.size() - 2];
+            
+            // 从后往前搜索最接近 target_p 的点
+            // 限制搜索范围为后半段，避免匹配到起点的 P0
+            size_t best_idx = Patrol_Path_Full.size() - 1;
+            double min_dist = std::numeric_limits<double>::max();
+            size_t search_start = Patrol_Path_Full.size() / 2;
+            
+            for (size_t i = Patrol_Path_Full.size() - 1; i >= search_start; --i) {
+                double dx = Patrol_Path_Full[i].east - target_p.east;
+                double dy = Patrol_Path_Full[i].north - target_p.north;
+                double dz = Patrol_Path_Full[i].up - target_p.up;
+                double d = dx*dx + dy*dy + dz*dz;
+                
+                if (d < min_dist) {
+                    min_dist = d;
+                    best_idx = i;
+                }
+            }
+            
+            // 截取到 best_idx
+            if (best_idx < Patrol_Path_Full.size()) {
+                Patrol_Path.assign(Patrol_Path_Full.begin(), Patrol_Path_Full.begin() + best_idx + 1);
+            } else {
+                Patrol_Path = Patrol_Path_Full;
+            }
         } else {
             Patrol_Path = Patrol_Path_Full;
         }
+        Patrol_Path.push_back(Patrol_Path[0]); //闭合巡逻路径
+        std::vector<WGS84Point> Patrol_Path_WGS84 = this->enuToWGS84_Batch(Patrol_Path,this->origin_);
+        this->putWGS84ToJson(output_json, "uav_leader_plane3", Patrol_Path_WGS84);
+        
+        if (Trajectory_ENU.empty()) {
+            this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, 3, Patrol_Path_WGS84);
+        }
+
+    }
+
+
+    /*                   第二段任务区域过渡轨迹计算      input_json["high_zhandou_point_wgs84"].size()           */
+    if(input_json["high_zhandou_point_wgs84"].size()!=0 && !Trajectory_ENU.empty() && !Patrol_Path.empty())   //存在高战斗区域点且有前序轨迹
+    {
+        std::cout<<"开始计算第二段任务区域过渡轨迹 (切圆切入优化)"<<std::endl;
+        ENUPoint p0 = Trajectory_ENU.back(); // 起点 ENU
+        double heading0 = final_heading; // 起点朝向
+
+        //僚机和长机巡逻区域不一样,所以注释掉
+        // // 计算并更新跟随者轨迹
+        // json plane_array = this->generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
+        // output_json["uav_plane1"] = plane_array;
+
+        // 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
+        computeTransitionAndRotatePatrol(p0, heading0, this->input_data_.min_turning_radius, distance, Patrol_Path, output_json);
+    }
+
+    // ---------- 高度优化与输出后处理（统一封装在 getPlan） ----------
+    bool altitude_opt_enabled = this->config_.altitude_optimization.enabled;
+    std::string elevation_file = this->config_.altitude_optimization.elevation_file;
+
+    if (!this->config_.loaded) {
+        std::cerr << "Warning: config.yaml not loaded (" << this->config_.load_error << ")" << std::endl;
     } else {
-        Patrol_Path = Patrol_Path_Full;
-    }
-    Patrol_Path.push_back(Patrol_Path[0]); //闭合巡逻路径
-    std::vector<WGS84Point> Patrol_Path_WGS84 = this->enuToWGS84_Batch(Patrol_Path,this->origin_);
-    this->putWGS84ToJson(output_json, "uav_leader_plane3", Patrol_Path_WGS84);
-    
-    if (Trajectory_ENU.empty()) {
-        this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, 3, Patrol_Path_WGS84);
+        std::cout << "Loaded config from " << this->config_.loaded_from << std::endl;
+        std::cout << "altitude_opt_enabled: " << altitude_opt_enabled << std::endl;
+        if (altitude_opt_enabled && elevation_file.empty()) {
+            std::cerr << "Warning: 'elevation_file' parameter missing in config.yaml" << std::endl;
+        }
     }
 
-}
+    if (altitude_opt_enabled) {
+        if (!elevation_file.empty()) {
+            std::cout << "Running Altitude Optimization with file: " << elevation_file << std::endl;
+            auto start_time = std::chrono::high_resolution_clock::now();
+            if (!this->runAltitudeOptimization(elevation_file, output_json, input_json)) {
+                std::cerr << "Failed to Altitude Optimization!" << std::endl;
+            }
+            auto end_time = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double> elapsed = end_time - start_time;
+            std::cout << "Altitude optimization time: " << elapsed.count() << "s" << std::endl;
+        } else {
+            std::cerr << "Altitude optimization enabled but no elevation file specified." << std::endl;
+        }
+    } else {
+        std::cout << "Altitude optimization skipped." << std::endl;
+    }
 
+    // using_uav_list（包含长机与僚机，去重）
+    output_json["using_uav_list"] = json::array();
+    auto append_unique_numeric = [&](const json &arr) {
+        if (!arr.is_array()) return;
+        for (const auto &id : arr) {
+            if (!id.is_number()) continue;
+            bool found = false;
+            for (const auto &existing : output_json["using_uav_list"]) {
+                if (existing == id) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) output_json["using_uav_list"].push_back(id);
+        }
+    };
+    if (input_json.contains("uav_leader_id")) {
+        if (input_json["uav_leader_id"].is_array()) {
+            append_unique_numeric(input_json["uav_leader_id"]);
+        } else if (input_json["uav_leader_id"].is_number()) {
+            output_json["using_uav_list"].push_back(input_json["uav_leader_id"]);
+        }
+    }
+    if (input_json.contains("uavs_id")) {
+        append_unique_numeric(input_json["uavs_id"]);
+    }
 
-/*                   第二段任务区域过渡轨迹计算      input_json["high_zhandou_point_wgs84"].size()           */
-if(input_json["high_zhandou_point_wgs84"].size()!=0 && !Trajectory_ENU.empty() && !Patrol_Path.empty())   //存在高战斗区域点且有前序轨迹
-{
-    std::cout<<"开始计算第二段任务区域过渡轨迹 (切圆切入优化)"<<std::endl;
-    ENUPoint p0 = Trajectory_ENU.back(); // 起点 ENU
-    double heading0 = final_heading; // 起点朝向
+    // ready_id
+    output_json["ready_id"] = json::array();
+    if (input_json.contains("ready_id") && input_json["ready_id"].is_array()) {
+        output_json["ready_id"] = input_json["ready_id"];
+    }
 
-    //僚机和长机巡逻区域不一样,所以注释掉
-    // // 计算并更新跟随者轨迹
-    // json plane_array = this->generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
-    // output_json["uav_plane1"] = plane_array;
+    // leader_show_points：leader_midway_point_wgs84 + high_zhandou_point_wgs84（继承最后高度）
+    output_json["leader_show_points"] = json::array();
+    if (input_json.contains("leader_midway_point_wgs84") && input_json["leader_midway_point_wgs84"].is_array()) {
+        output_json["leader_show_points"] = input_json["leader_midway_point_wgs84"];
+    }
+    if (input_json.contains("high_zhandou_point_wgs84") && input_json["high_zhandou_point_wgs84"].is_array()) {
+        double last_alt = 0.0;
+        if (output_json["leader_show_points"].is_array() && !output_json["leader_show_points"].empty()) {
+            auto last_pt = output_json["leader_show_points"].back();
+            if (last_pt.is_object()) {
+                if (last_pt.contains("z") && last_pt["z"].is_number()) {
+                    last_alt = last_pt["z"].get<double>();
+                } else if (last_pt.contains("altitude") && last_pt["altitude"].is_number()) {
+                    last_alt = last_pt["altitude"].get<double>();
+                } else if (last_pt.contains("height") && last_pt["height"].is_number()) {
+                    last_alt = last_pt["height"].get<double>();
+                }
+            } else if (last_pt.is_array() && last_pt.size() >= 3 && last_pt[2].is_number()) {
+                last_alt = last_pt[2].get<double>();
+            }
+        }
 
-    // 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
-    computeTransitionAndRotatePatrol(p0, heading0, this->input_data_.min_turning_radius, distance, Patrol_Path, output_json);
-}
+        for (const auto &pt : input_json["high_zhandou_point_wgs84"]) {
+            if (pt.is_object()) {
+                json newpt = pt;
+                if (newpt.contains("z")) newpt["z"] = last_alt;
+                else if (newpt.contains("altitude")) newpt["altitude"] = last_alt;
+                else if (newpt.contains("height")) newpt["height"] = last_alt;
+                else newpt["z"] = last_alt;
+                output_json["leader_show_points"].push_back(newpt);
+            } else if (pt.is_array() && pt.size() >= 2) {
+                json newpt = pt;
+                if (pt.size() >= 3) {
+                    newpt[2] = last_alt;
+                } else {
+                    newpt.push_back(last_alt);
+                }
+                output_json["leader_show_points"].push_back(newpt);
+            }
+        }
+    }
+
+    std::cout << "Constructed using_uav_list from input: " << output_json["using_uav_list"].dump() << std::endl;
+
     return true;
 }
 
