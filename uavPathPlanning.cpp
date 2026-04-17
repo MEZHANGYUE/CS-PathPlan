@@ -1604,14 +1604,14 @@ json UavPathPlanner::generateVShapeTrajectories(const json &uavs_ids, const json
         follower_entry.push_back(uid);
 
         for (size_t t = 0; t < N; ++t) {
-            if (t == 0) {
-                json pa = json::array();
-                pa.push_back(start_wp.lon);
-                pa.push_back(start_wp.lat);
-                pa.push_back(start_wp.alt);
-                follower_entry.push_back(pa);
-                continue;
-            }
+            // if (t == 0) {
+            //     json pa = json::array();
+            //     pa.push_back(start_wp.lon);
+            //     pa.push_back(start_wp.lat);
+            //     pa.push_back(start_wp.alt);
+            //     follower_entry.push_back(pa);
+            //     continue;
+            // }
 
             double heading = leader_headings[t];
             double c = cos(heading);
@@ -1646,6 +1646,7 @@ json UavPathPlanner::generateLineShapeTrajectories(const json &uavs_ids, const j
                                                    double safety_distance) {
     json plane_array = json::array();
     size_t N = Trajectory_ENU.size();
+    double leader_start_alt = (N > 0) ? Trajectory_ENU.front().up : 0.0;
 
     for (size_t idx = 0; idx < uavs_ids.size(); ++idx) {
         int uid = uavs_ids[idx].get<int>();
@@ -1678,7 +1679,7 @@ json UavPathPlanner::generateLineShapeTrajectories(const json &uavs_ids, const j
                 json pa = json::array();
                 pa.push_back(start_wp.lon);
                 pa.push_back(start_wp.lat);
-                pa.push_back(start_wp.alt);
+                pa.push_back(leader_start_alt);
                 follower_entry.push_back(pa);
                 continue;
             }
@@ -1724,6 +1725,7 @@ json UavPathPlanner::generateVerticalLineShapeTrajectories(const json &uavs_ids,
 
     json plane_array = json::array();
     size_t N = Trajectory_ENU.size();
+    double leader_start_alt = (N > 0) ? Trajectory_ENU.front().up : 0.0;
 
     for (size_t idx = 0; idx < uavs_ids.size(); ++idx) {
         int uid = uavs_ids[idx].get<int>();
@@ -1763,7 +1765,7 @@ json UavPathPlanner::generateVerticalLineShapeTrajectories(const json &uavs_ids,
                 json pa = json::array();
                 pa.push_back(start_wp.lon);
                 pa.push_back(start_wp.lat);
-                pa.push_back(start_wp.alt);
+                pa.push_back(leader_start_alt);
                 follower_entry.push_back(pa);
                 continue;
             }
@@ -1808,6 +1810,7 @@ json UavPathPlanner::generateTriangleShapeTrajectories(const json &uavs_ids, con
 
     json plane_array = json::array();
     size_t N = Trajectory_ENU.size();
+    double leader_start_alt = (N > 0) ? Trajectory_ENU.front().up : 0.0;
 
     for (size_t idx = 0; idx < uavs_ids.size(); ++idx) {
         int uid = uavs_ids[idx].get<int>();
@@ -1850,7 +1853,7 @@ json UavPathPlanner::generateTriangleShapeTrajectories(const json &uavs_ids, con
                 json pa = json::array();
                 pa.push_back(start_wp.lon);
                 pa.push_back(start_wp.lat);
-                pa.push_back(start_wp.alt);
+                pa.push_back(leader_start_alt);
                 follower_entry.push_back(pa);
                 continue;
             }
