@@ -184,6 +184,42 @@ inline std::unordered_map<int, UavProgress> parseUavProgress(const json &input_j
 
     return progress;
 }
+
+inline double computeTailHeadingRobust(const std::vector<ENUPoint> &path, double fallback_heading = 0.0) {
+    if (path.size() < 2) return fallback_heading;
+
+    // 使用末端若干段的加权方向向量，抑制末尾单段抖动/反向小回摆
+    const int max_segments = 8;
+    Eigen::Vector2d acc(0.0, 0.0);
+    int used = 0;
+
+    for (int i = static_cast<int>(path.size()) - 1; i > 0 && used < max_segments; --i) {
+        double dx = path[i].east - path[i - 1].east;
+        double dy = path[i].north - path[i - 1].north;
+        double d = std::hypot(dx, dy);
+        if (d < 1e-3) continue;  // 跳过几乎重合点
+
+        // 越靠近末端权重越大
+        double w = 1.0 + 0.25 * used;
+        acc.x() += w * (dx / d);
+        acc.y() += w * (dy / d);
+        ++used;
+    }
+
+    if (used == 0 || acc.norm() < 1e-9) {
+        // 回退到最后一个非零线段
+        for (int i = static_cast<int>(path.size()) - 1; i > 0; --i) {
+            double dx = path[i].east - path[i - 1].east;
+            double dy = path[i].north - path[i - 1].north;
+            if (std::hypot(dx, dy) > 1e-3) {
+                return std::atan2(dy, dx);
+            }
+        }
+        return fallback_heading;
+    }
+
+    return std::atan2(acc.y(), acc.x());
+}
 } // namespace
 
 // 统一加载 config.yaml（只读一次，其他地方直接用 this->config_ 的参数）
@@ -1634,15 +1670,11 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     // 计算 Trajectory_ENU 最终点的朝向
     double final_heading = 0.0;
     if (Trajectory_ENU.size() >= 2) {
-        const auto& p_last = Trajectory_ENU.back();
-        const auto& p_prev = Trajectory_ENU[Trajectory_ENU.size() - 2];
-        final_heading = std::atan2(p_last.north - p_prev.north, p_last.east - p_prev.east);
+        final_heading = computeTailHeadingRobust(Trajectory_ENU, final_heading);
     } else if (!planning_waypoints.empty()) {
         // 如果轨迹点不足，尝试使用规划点的最后两个点
         if (planning_waypoints.size() >= 2) {
-             const auto& p_last = planning_waypoints.back();
-             const auto& p_prev = planning_waypoints[planning_waypoints.size() - 2];
-             final_heading = std::atan2(p_last.north - p_prev.north, p_last.east - p_prev.east);
+             final_heading = computeTailHeadingRobust(planning_waypoints, final_heading);
         }
     }
     // std::cout << "Final heading: " << final_heading << " rad (" << rad2deg(final_heading) << " deg)" << std::endl;
@@ -1719,6 +1751,170 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         this->optimizeAndApplyOutputSegment(output_json, "uav_leader_plane3", 3, input_json, true);
     }
 
+    // ready_id: 需要前往 ready_zone 的无人机。
+    // 参考长机第二/第三段的生成思路，为 ready_id 生成过渡段(2)与巡逻段(3)。
+    output_json["uav_plane2"] = json::array();
+    output_json["uav_plane3"] = json::array();
+    if (input_json.contains("ready_id") && input_json["ready_id"].is_array() &&
+        input_json.contains("ready_zone") && input_json["ready_zone"].is_array() && input_json["ready_zone"].size() >= 3 &&
+        output_json.contains("uav_plane1") && output_json["uav_plane1"].is_array()) {
+
+        auto upsertTrajectoryToOutput = [&](int uav_id, int segment_id, const std::vector<WGS84Point> &traj) {
+            if (!output_json.contains("using_midway_lines") || !output_json["using_midway_lines"].is_array()) {
+                output_json["using_midway_lines"] = json::array();
+            }
+
+            bool replaced = false;
+            for (auto &line : output_json["using_midway_lines"]) {
+                if (!line.is_array() || line.size() < 2) continue;
+                if (!line[0].is_number_integer() || !line[1].is_number_integer()) continue;
+                if (line[0].get<int>() == uav_id && line[1].get<int>() == segment_id) {
+                    json new_entry = json::array();
+                    new_entry.push_back(uav_id);
+                    new_entry.push_back(segment_id);
+                    for (const auto &p : traj) {
+                        json pa = json::array();
+                        pa.push_back(p.lon);
+                        pa.push_back(p.lat);
+                        pa.push_back(p.alt);
+                        new_entry.push_back(pa);
+                    }
+                    line = new_entry;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                this->appendTrajectoryToOutput(output_json, uav_id, segment_id, traj);
+            }
+        };
+
+        auto parseWGSFromPlaneEntry = [](const json &entry, std::vector<WGS84Point> &out) -> bool {
+            out.clear();
+            if (!entry.is_array() || entry.size() < 2) return false;
+            for (size_t i = 1; i < entry.size(); ++i) {
+                if (!entry[i].is_array() || entry[i].size() < 2) continue;
+                if (!entry[i][0].is_number() || !entry[i][1].is_number()) continue;
+                WGS84Point p;
+                p.lon = entry[i][0].get<double>();
+                p.lat = entry[i][1].get<double>();
+                p.alt = (entry[i].size() >= 3 && entry[i][2].is_number()) ? entry[i][2].get<double>() : 0.0;
+                out.push_back(p);
+            }
+            return out.size() >= 2;
+        };
+
+        std::vector<int> ready_ids;
+        for (const auto &rid : input_json["ready_id"]) {
+            if (rid.is_number_integer()) ready_ids.push_back(rid.get<int>());
+        }
+
+        for (int rid : ready_ids) {
+            // 从 uav_plane1 中找到该 ready 无人机第一段轨迹
+            const json *follower_entry = nullptr;
+            for (const auto &entry : output_json["uav_plane1"]) {
+                if (!entry.is_array() || entry.empty()) continue;
+                if (!entry[0].is_number_integer()) continue;
+                if (entry[0].get<int>() == rid) {
+                    follower_entry = &entry;
+                    break;
+                }
+            }
+            if (follower_entry == nullptr) {
+                std::cerr << "ready_id=" << rid << " not found in uav_plane1, skip ready plane2/3 generation." << std::endl;
+                continue;
+            }
+
+            std::vector<WGS84Point> follower_plane1_wgs;
+            if (!parseWGSFromPlaneEntry(*follower_entry, follower_plane1_wgs)) {
+                std::cerr << "ready_id=" << rid << " has invalid uav_plane1 trajectory, skip." << std::endl;
+                continue;
+            }
+
+            std::vector<ENUPoint> follower_plane1_enu = this->wgs84ToENU_Batch(follower_plane1_wgs, this->origin_);
+            if (follower_plane1_enu.size() < 2) continue;
+
+            // 第二段起点与起始航向：取该无人机第一段末点
+            ENUPoint p0 = follower_plane1_enu.back();
+            double heading0 = computeTailHeadingRobust(follower_plane1_enu, final_heading);
+
+            // ready_zone -> ENU（高度继承第一段末点高度）
+            std::vector<WGS84Point> ready_zone_wgs;
+            ready_zone_wgs.reserve(input_json["ready_zone"].size());
+            for (const auto &pt : input_json["ready_zone"]) {
+                if (!pt.is_array() || pt.size() < 2) continue;
+                if (!pt[0].is_number() || !pt[1].is_number()) continue;
+                WGS84Point p;
+                p.lon = pt[0].get<double>();
+                p.lat = pt[1].get<double>();
+                p.alt = p0.up;
+                ready_zone_wgs.push_back(p);
+            }
+            if (ready_zone_wgs.size() < 3) {
+                std::cerr << "ready_zone invalid (<3 points), skip ready_id=" << rid << std::endl;
+                continue;
+            }
+
+            std::vector<ENUPoint> ready_zone_enu = this->wgs84ToENU_Batch(ready_zone_wgs, this->origin_);
+
+            // 第三段：准备区域巡逻轨迹（复用长机巡逻生成策略）
+            std::vector<ENUPoint> ready_patrol = this->computePatrolPathByMode(
+                ready_zone_enu,
+                static_cast<int>(ready_zone_enu.size()),
+                distance,
+                this->config_.path_planning.patrol_mode,
+                follower_plane1_enu);
+
+            if (ready_patrol.empty()) {
+                std::cerr << "ready_id=" << rid << " failed to generate ready patrol path." << std::endl;
+                continue;
+            }
+
+            // 第二段：过渡轨迹（复用 arc-line-arc 生成）
+            ENUPoint p1 = ready_patrol.front();
+            ENUPoint p2 = (ready_patrol.size() >= 2) ? ready_patrol[1] : ready_patrol.front();
+
+            const double radius = std::max(0.0, this->input_data_.min_turning_radius);
+            const double resolution = (distance > 0.0) ? distance : 300.0;
+            std::vector<ENUPoint> ready_transition = this->generateArcLineArc(p0, heading0, p1, p2, radius, resolution);
+
+            if (ready_transition.empty()) {
+                std::cerr << "ready_id=" << rid << " failed to generate ready transition path." << std::endl;
+                continue;
+            }
+
+            std::vector<WGS84Point> ready_transition_wgs = this->enuToWGS84_Batch(ready_transition, this->origin_);
+            std::vector<WGS84Point> ready_patrol_wgs = this->enuToWGS84_Batch(ready_patrol, this->origin_);
+
+            // 写入 using_midway_lines（段2/段3）
+            upsertTrajectoryToOutput(rid, 2, ready_transition_wgs);
+            upsertTrajectoryToOutput(rid, 3, ready_patrol_wgs);
+
+            // 同时写入可视化数组 uav_plane2 / uav_plane3
+            json plane2_entry = json::array();
+            plane2_entry.push_back(rid);
+            for (const auto &p : ready_transition_wgs) {
+                json pa = json::array();
+                pa.push_back(p.lon);
+                pa.push_back(p.lat);
+                pa.push_back(p.alt);
+                plane2_entry.push_back(pa);
+            }
+            output_json["uav_plane2"].push_back(plane2_entry);
+
+            json plane3_entry = json::array();
+            plane3_entry.push_back(rid);
+            for (const auto &p : ready_patrol_wgs) {
+                json pa = json::array();
+                pa.push_back(p.lon);
+                pa.push_back(p.lat);
+                pa.push_back(p.alt);
+                plane3_entry.push_back(pa);
+            }
+            output_json["uav_plane3"].push_back(plane3_entry);
+        }
+    }
+
     // using_uav_list（包含长机与僚机，去重）
     output_json["using_uav_list"] = json::array();
     auto append_unique_numeric = [&](const json &arr) {
@@ -1744,6 +1940,9 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     }
     if (input_json.contains("uavs_id")) {
         append_unique_numeric(input_json["uavs_id"]);
+    }
+    if (input_json.contains("ready_id")) {
+        append_unique_numeric(input_json["ready_id"]);
     }
 
     // ready_id

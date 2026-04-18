@@ -647,13 +647,19 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
             except Exception:
                 pass
 
-    # 绘制 plane_trajs（多条），使用 colormap 区分
+    # 绘制 plane_trajs（多条），相同的无人机 id 使用相同颜色
     if plane_trajs:
-        cmap = plt.get_cmap('tab10')
-        for idx, (pid, pts) in enumerate(plane_trajs):
+        cmap = plt.get_cmap('tab20')
+        unique_ids = []
+        for pid, _ in plane_trajs:
+            if pid not in unique_ids:
+                unique_ids.append(pid)
+        id_to_color = {pid: cmap(i % cmap.N) for i, pid in enumerate(unique_ids)}
+
+        for pid, pts in plane_trajs:
             if not pts:
                 continue
-            color = cmap(idx % 10)
+            color = id_to_color.get(pid, cmap(0))
             if need_3d:
                 xs = [p[0] for p in pts]
                 ys = [p[1] for p in pts]
