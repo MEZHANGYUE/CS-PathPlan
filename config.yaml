@@ -8,11 +8,12 @@ altitude_optimization:
   safe_distance: 50.0 #相对于地形的最小安全垂直距离（米）
 
 path_planning:
+  patrol_region_shrink_distance: 20.0  #区域内缩距离
   position_misalignment: 100  #无人机定位误差（米）
   min_turning_radius: 300.0 #路径规划时允许的最小转弯半径（米）
   # safe_distance: 50.0 #路径规划中的安全距离 (编队的安全距离) , 改用 formation_distance 参数
-  patrol_width: 300.0  #巡航路径之间的间距
-  patrol_mode: "BOW" #巡航模式，支持"CIRCULAR"（回形）和"BOW"（弓形） , 回形保留配置 暂不实现
+  patrol_width: 300.0  #巡逻路径之间的间距
+  patrol_mode: "CIRCULAR" #巡逻模式，支持"CIRCULAR"（回形）和"BOW"（弓形）,"SINGLE"(原始的单圈巡逻) , 回形保留配置 暂不实现
   formation_distance: 200 # 无人机编队飞行时其无人机之间的间距,注意，如果formation_distance小于（2*position_misalignment + uav_R）* 1.41421则会内部调用时自动扩大到该值
   uav_formation_max_row: 8   # 无人机竖1字型队形时，队形支持最大总行数（包含长机）。若数量超出该设定则会主动增加列数；最小为1
   Distance_Points: 300 # 无人机路径规划的航点间距，单位米

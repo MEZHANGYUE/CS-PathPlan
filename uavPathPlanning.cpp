@@ -13,6 +13,7 @@
 #include <iomanip> // Added for std::setprecision
 #include <queue>
 #include <map>
+#include <cctype>
 #include "math_util/polygon2d.hpp"
 
 #ifdef HAVE_GDAL
@@ -1090,6 +1091,107 @@ double UavPathPlanner::getDistanceFromJSON(const json& j, const std::string& key
 
     return 0.0;
 }
+// patrol_mode 支持"CIRCULAR"（回形）和"BOW"（弓形）,"SINGLE"(原始的单圈巡逻)
+std::vector<ENUPoint> UavPathPlanner::computePatrolPathByMode(const std::vector<ENUPoint>& enu_waypoints,
+                                                              int zhandoupoint_num,
+                                                              double distance,
+                                                              const std::string& patrol_mode,
+                                                              const std::vector<ENUPoint>& trajectory_enu)
+{
+    std::vector<ENUPoint> patrol_path;
+    if (zhandoupoint_num <= 0) {
+        std::cerr << "computePatrolPathByMode failed: zhandoupoint_num <= 0 (zhandoupoint_num="
+                  << zhandoupoint_num << ")" << std::endl;
+        return patrol_path;
+    }
+
+    if (enu_waypoints.size() < static_cast<size_t>(zhandoupoint_num)) {
+        std::cerr << "computePatrolPathByMode failed: insufficient enu_waypoints, enu_waypoints.size()="
+                  << enu_waypoints.size() << ", zhandoupoint_num=" << zhandoupoint_num << std::endl;
+        return patrol_path;
+    }
+
+    std::string mode = patrol_mode;
+    if (mode.empty()) {
+        mode = "SINGLE";
+    }
+
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+
+    if (mode == "CIRCULAR" || mode == "BOW") {
+        std::cerr << "patrol_mode='" << mode << "' is not implemented yet, fallback to SINGLE." << std::endl;
+        mode = "SINGLE";
+    } else if (mode != "SINGLE") {
+        std::cerr << "Unknown patrol_mode='" << mode << "', fallback to SINGLE." << std::endl;
+        mode = "SINGLE";
+    }
+
+    // 当前实现：SINGLE（原始单圈巡逻）
+    std::vector<ENUPoint> patrol_waypoints(enu_waypoints.end() - zhandoupoint_num, enu_waypoints.end());
+    if (patrol_waypoints.empty()) {
+        std::cerr << "computePatrolPathByMode failed: patrol_waypoints is empty after extracting battle points." << std::endl;
+        return patrol_path;
+    }
+
+    patrol_waypoints.push_back(patrol_waypoints[0]); // 闭合巡逻路径
+
+    // 保证闭合处切向连续：P0 -> P1 -> ... -> P0 -> P1
+    if (patrol_waypoints.size() > 2) {
+        patrol_waypoints.push_back(patrol_waypoints[1]);
+    }
+
+    std::vector<ENUPoint> patrol_path_full = Minisnap_3D(patrol_waypoints, distance, this->input_data_.leader_speed);
+    if (patrol_path_full.empty()) {
+        std::cerr << "computePatrolPathByMode failed: Minisnap_3D returned empty patrol path. patrol_waypoints.size()="
+                  << patrol_waypoints.size() << ", distance=" << distance
+                  << ", leader_speed=" << this->input_data_.leader_speed << std::endl;
+        return patrol_path;
+    }
+
+    if (patrol_waypoints.size() > 2) {
+        ENUPoint target_p = patrol_waypoints[patrol_waypoints.size() - 2]; // 倒数第二个航点(P0)
+        size_t best_idx = patrol_path_full.size() - 1;
+        double min_dist = std::numeric_limits<double>::max();
+        size_t search_start = patrol_path_full.size() / 2; // 避免匹配到起点的 P0
+
+        for (size_t i = patrol_path_full.size(); i-- > search_start;) {
+            double dx = patrol_path_full[i].east - target_p.east;
+            double dy = patrol_path_full[i].north - target_p.north;
+            double dz = patrol_path_full[i].up - target_p.up;
+            double d = dx * dx + dy * dy + dz * dz;
+
+            if (d < min_dist) {
+                min_dist = d;
+                best_idx = i;
+            }
+        }
+
+        if (best_idx < patrol_path_full.size()) {
+            patrol_path.assign(patrol_path_full.begin(), patrol_path_full.begin() + best_idx + 1);
+        } else {
+            patrol_path = patrol_path_full;
+        }
+    } else {
+        patrol_path = patrol_path_full;
+    }
+
+    // 第三段高度与第一段（已优化后的）高度保持一致
+    if (!trajectory_enu.empty()) {
+        const double h_plane1 = trajectory_enu.back().up;
+        for (auto &pt : patrol_path) {
+            pt.up = h_plane1;
+        }
+    }
+
+    if (!patrol_path.empty()) {
+        patrol_path.push_back(patrol_path[0]); // 闭合巡逻路径
+    } else {
+        std::cerr << "computePatrolPathByMode failed: final patrol_path is empty." << std::endl;
+    }
+
+    return patrol_path;
+}
 
 //规划函数 用于总调用
 
@@ -1298,74 +1400,27 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     std::vector<ENUPoint> Patrol_Path; // 提升作用域以供第二段轨迹计算使用
 
     /*                   第三段段任务区域巡逻轨迹计算               */
-    if(input_json["high_zhandou_point_wgs84"].size()!=0)   //存在高战斗区域点且有前序轨迹
+    if (zhandoupoint_num != 0)   //存在高战斗区域点
     {
         std::cout<<"开始计算第三段任务区域巡逻轨迹"<<std::endl;
-        
-        // 提取用于区域边界点的点（仅包含 zhandou points）
-        std::vector<ENUPoint> Patrol_waypoints={};
-        if (Enu_waypoint.size() >= zhandoupoint_num) {
-            Patrol_waypoints.assign(Enu_waypoint.end() - zhandoupoint_num ,Enu_waypoint.end());
-        } 
-        Patrol_waypoints.push_back(Patrol_waypoints[0]); //闭合巡逻路径
+        Patrol_Path = this->computePatrolPathByMode(
+            Enu_waypoint,
+            zhandoupoint_num,
+            distance,
+            this->config_.path_planning.patrol_mode,
+            Trajectory_ENU
+        );
 
-        // 为了保证闭合处的切向连续（即第一个点和最后一个点的朝向相同），
-        // 我们在末尾再多加一个点（即第二个点），使路径变为 P0 -> P1 -> ... -> P0 -> P1
-        // 然后截取 P0 -> ... -> P0 部分
-        if (Patrol_waypoints.size() > 2) {
-            Patrol_waypoints.push_back(Patrol_waypoints[1]);
-        }
+        if (!Patrol_Path.empty()) {
+            std::vector<WGS84Point> Patrol_Path_WGS84 = this->enuToWGS84_Batch(Patrol_Path, this->origin_);
+            this->putWGS84ToJson(output_json, "uav_leader_plane3", Patrol_Path_WGS84);
 
-        std::vector<ENUPoint> Patrol_Path_Full = Minisnap_3D(Patrol_waypoints, distance, this->input_data_.leader_speed);
-        
-        if (Patrol_waypoints.size() > 2 && !Patrol_Path_Full.empty()) {
-            // 目标截断点是倒数第二个航点 (P0)
-            ENUPoint target_p = Patrol_waypoints[Patrol_waypoints.size() - 2];
-            
-            // 从后往前搜索最接近 target_p 的点
-            // 限制搜索范围为后半段，避免匹配到起点的 P0
-            size_t best_idx = Patrol_Path_Full.size() - 1;
-            double min_dist = std::numeric_limits<double>::max();
-            size_t search_start = Patrol_Path_Full.size() / 2;
-            
-            for (size_t i = Patrol_Path_Full.size() - 1; i >= search_start; --i) {
-                double dx = Patrol_Path_Full[i].east - target_p.east;
-                double dy = Patrol_Path_Full[i].north - target_p.north;
-                double dz = Patrol_Path_Full[i].up - target_p.up;
-                double d = dx*dx + dy*dy + dz*dz;
-                
-                if (d < min_dist) {
-                    min_dist = d;
-                    best_idx = i;
-                }
-            }
-            
-            // 截取到 best_idx
-            if (best_idx < Patrol_Path_Full.size()) {
-                Patrol_Path.assign(Patrol_Path_Full.begin(), Patrol_Path_Full.begin() + best_idx + 1);
-            } else {
-                Patrol_Path = Patrol_Path_Full;
+            if (Trajectory_ENU.empty()) {
+                this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, 3, Patrol_Path_WGS84);
             }
         } else {
-            Patrol_Path = Patrol_Path_Full;
+            std::cerr << "Warning: failed to generate patrol path in plane3." << std::endl;
         }
-
-        // 第三段高度与第一段（已优化后的）高度保持一致
-        if (!Trajectory_ENU.empty()) {
-            const double h_plane1 = Trajectory_ENU.back().up;
-            for (auto &pt : Patrol_Path) {
-                pt.up = h_plane1;
-            }
-        }
-
-        Patrol_Path.push_back(Patrol_Path[0]); //闭合巡逻路径
-        std::vector<WGS84Point> Patrol_Path_WGS84 = this->enuToWGS84_Batch(Patrol_Path,this->origin_);
-        this->putWGS84ToJson(output_json, "uav_leader_plane3", Patrol_Path_WGS84);
-        
-        if (Trajectory_ENU.empty()) {
-            this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, 3, Patrol_Path_WGS84);
-        }
-
     }
 
 

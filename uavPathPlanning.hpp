@@ -257,6 +257,12 @@ private:
     // 内部辅助：从 JSON 读取 ENU 路径与 distance
     std::vector<ENUPoint> getENUFromJSON(const json& j, const std::string& key1, const std::string& key2);
     double getDistanceFromJSON(const json& j, const std::string& key);
+    // 第三段巡逻轨迹：按 patrol_mode 选择计算方法（当前仅实现 SINGLE）
+    std::vector<ENUPoint> computePatrolPathByMode(const std::vector<ENUPoint>& enu_waypoints,
+                                                  int zhandoupoint_num,
+                                                  double distance,
+                                                  const std::string& patrol_mode,
+                                                  const std::vector<ENUPoint>& trajectory_enu);
 
     // Altitude Optimization Params
     struct AltitudeParams {
