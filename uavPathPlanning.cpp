@@ -13,6 +13,8 @@
 #include <iomanip> // Added for std::setprecision
 #include <queue>
 #include <map>
+#include <set>
+#include <unordered_map>
 #include <cctype>
 #include "math_util/polygon2d.hpp"
 
@@ -53,6 +55,134 @@ inline void yamlAssignVec3IfPresent(const YAML::Node &node, const char *key, Eig
     } catch (...) {
         // ignore conversion errors
     }
+}
+
+struct CheckZoneSpec {
+    std::vector<WGS84Point> polygon_wgs;
+    double min_h = -std::numeric_limits<double>::infinity();
+    double max_h = std::numeric_limits<double>::infinity();
+};
+
+inline bool altitudeRangeOverlap(double a_min, double a_max, double b_min, double b_max) {
+    return !(a_max < b_min || b_max < a_min);
+}
+
+inline bool parseWGS84PointArray(const json &arr, WGS84Point &out) {
+    if (!arr.is_array() || arr.size() < 2 || !arr[0].is_number() || !arr[1].is_number()) {
+        return false;
+    }
+    out.lon = arr[0].get<double>();
+    out.lat = arr[1].get<double>();
+    out.alt = (arr.size() >= 3 && arr[2].is_number()) ? arr[2].get<double>() : 0.0;
+    return true;
+}
+
+inline bool parseHeightRangeArray(const json &arr, double &min_h, double &max_h) {
+    if (!arr.is_array() || arr.size() < 2 || !arr[0].is_number() || !arr[1].is_number()) {
+        return false;
+    }
+    min_h = arr[0].get<double>();
+    max_h = arr[1].get<double>();
+    if (min_h > max_h) std::swap(min_h, max_h);
+    return true;
+}
+
+inline std::vector<CheckZoneSpec> parseCheckZonesFromJson(const json &input_json) {
+    std::vector<CheckZoneSpec> zones;
+    if (!input_json.contains("check_prohibited_zone_wgs84") || !input_json["check_prohibited_zone_wgs84"].is_array()) {
+        return zones;
+    }
+
+    for (const auto &zone : input_json["check_prohibited_zone_wgs84"]) {
+        CheckZoneSpec z;
+
+        // 兼容格式1：[[lon,lat], ..., [hmin,hmax]]
+        if (zone.is_array()) {
+            if (zone.size() < 3) continue;
+
+            // 尝试把最后一个元素识别为高度范围
+            bool has_height_range = false;
+            double hmin = z.min_h;
+            double hmax = z.max_h;
+            if (zone.size() >= 4 && parseHeightRangeArray(zone.back(), hmin, hmax)) {
+                z.min_h = hmin;
+                z.max_h = hmax;
+                has_height_range = true;
+            }
+
+            size_t pt_end = has_height_range ? (zone.size() - 1) : zone.size();
+            for (size_t i = 0; i < pt_end; ++i) {
+                WGS84Point p;
+                if (parseWGS84PointArray(zone[i], p)) {
+                    z.polygon_wgs.push_back(p);
+                }
+            }
+        }
+        // 兼容格式2：{"polygon": [...], "height_range": [min,max]}
+        else if (zone.is_object()) {
+            if (zone.contains("height_range")) {
+                double hmin = z.min_h;
+                double hmax = z.max_h;
+                if (parseHeightRangeArray(zone["height_range"], hmin, hmax)) {
+                    z.min_h = hmin;
+                    z.max_h = hmax;
+                }
+            }
+
+            const char *poly_keys[] = {"polygon", "points", "zone"};
+            for (const char *k : poly_keys) {
+                if (!zone.contains(k) || !zone[k].is_array()) continue;
+                for (const auto &pt : zone[k]) {
+                    WGS84Point p;
+                    if (parseWGS84PointArray(pt, p)) {
+                        z.polygon_wgs.push_back(p);
+                    }
+                }
+                if (!z.polygon_wgs.empty()) break;
+            }
+        }
+
+        if (z.polygon_wgs.size() >= 3) {
+            zones.push_back(std::move(z));
+        }
+    }
+
+    return zones;
+}
+
+struct UavProgress {
+    int segment_id = 0;
+    int point_idx = 0; // 1-based
+};
+
+inline std::unordered_map<int, UavProgress> parseUavProgress(const json &input_json) {
+    std::unordered_map<int, UavProgress> progress;
+    if (!input_json.contains("uavs_plane_data") || !input_json["uavs_plane_data"].is_array()) {
+        return progress;
+    }
+
+    for (const auto &item : input_json["uavs_plane_data"]) {
+        if (!item.is_array() || item.size() < 3) continue;
+        if (!item[0].is_number_integer() || !item[1].is_number_integer() || !item[2].is_number_integer()) continue;
+
+        int uav_id = item[0].get<int>();
+        UavProgress cur{item[1].get<int>(), item[2].get<int>()};
+
+        auto it = progress.find(uav_id);
+        if (it == progress.end()) {
+            progress[uav_id] = cur;
+            continue;
+        }
+
+        // 取“更靠后”的进度（段号更大优先；段号相同取点号更大）
+        const UavProgress &old = it->second;
+        if (cur.segment_id > old.segment_id ||
+            (cur.segment_id == old.segment_id && cur.point_idx > old.point_idx)) {
+            it->second = cur;
+        }
+    }
+
+    return progress;
 }
 } // namespace
 
@@ -1192,11 +1322,154 @@ std::vector<ENUPoint> UavPathPlanner::computePatrolPathByMode(const std::vector<
 
     return patrol_path;
 }
+//检查历史和当前航段是否进入异常区域
+bool UavPathPlanner::check_change(const json &input_json, json &output_json)
+{
+    output_json["abnormal_uav_plane"] = json::array();
+
+    if (!output_json.contains("using_midway_lines") || !output_json["using_midway_lines"].is_array()) {
+        std::cout << "check_change: no using_midway_lines in output_json, skipping check.\n";
+        return true;
+    }
+
+    const auto zones_wgs = parseCheckZonesFromJson(input_json);
+    if (zones_wgs.empty()) {
+        std::cout << "check_change: no check zones defined in input_json, skipping check.\n";
+        return true;
+    }
+
+    // 若 origin_ 仍为默认值，尝试从 using_midway_lines 第一个点初始化一个参考点
+    if (std::abs(this->origin_.lon) < 1e-12 && std::abs(this->origin_.lat) < 1e-12) {
+        for (const auto &line : output_json["using_midway_lines"]) {
+            if (!line.is_array() || line.size() < 3) continue;
+            WGS84Point p;
+            if (parseWGS84PointArray(line[2], p)) {
+                this->origin_ = p;
+                this->origin_.alt = 0.0;
+                break;
+            }
+        }
+    }
+
+    struct ENUZone {
+        Polygon2d poly;
+        double min_h = -std::numeric_limits<double>::infinity();
+        double max_h = std::numeric_limits<double>::infinity();
+    };
+
+    std::vector<ENUZone> zones_enu;
+    zones_enu.reserve(zones_wgs.size());
+    for (const auto &zw : zones_wgs) {
+        std::vector<Vec2d> pts;
+        pts.reserve(zw.polygon_wgs.size());
+        for (const auto &pw : zw.polygon_wgs) {
+            ENUPoint ep = this->wgs84ToENU(pw, this->origin_);
+            pts.emplace_back(ep.east, ep.north);
+        }
+        if (pts.size() < 3) continue;
+        zones_enu.push_back({Polygon2d(pts), zw.min_h, zw.max_h});
+    }
+    if (zones_enu.empty()) {
+        return true;
+    }
+
+    const auto progress_map = parseUavProgress(input_json);
+    std::set<int> bad_uavs;
+
+    for (const auto &line : output_json["using_midway_lines"]) {
+        if (!line.is_array() || line.size() < 4) continue; // 至少 2 个点
+        if (!line[0].is_number_integer() || !line[1].is_number_integer()) continue;
+
+        const int uav_id = line[0].get<int>();
+        const int segment_id = line[1].get<int>();
+
+        std::vector<WGS84Point> wpts;
+        wpts.reserve(line.size() - 2);
+        for (size_t i = 2; i < line.size(); ++i) {
+            WGS84Point p;
+            if (parseWGS84PointArray(line[i], p)) {
+                wpts.push_back(p);
+            }
+        }
+        if (wpts.size() < 2) continue;
+
+        // 基于 uavs_plane_data 剔除“已经飞过/已完成”的航段
+        size_t start_idx = 0; // 从哪个点开始检查（检查线段为 [i, i+1]）
+        auto pit = progress_map.find(uav_id);
+        if (pit != progress_map.end()) {
+            const UavProgress &pr = pit->second;
+            if (segment_id < pr.segment_id) {
+                continue; // 整段已完成，跳过检测
+            }
+            if (segment_id == pr.segment_id) {
+                if (pr.point_idx >= static_cast<int>(wpts.size())) {
+                    continue; // 本段也已完成
+                }
+                if (pr.point_idx > 1) {
+                    // 1-based point idx -> 0-based start point
+                    start_idx = static_cast<size_t>(pr.point_idx - 1);
+                }
+            }
+        }
+        if (start_idx >= wpts.size() - 1) {
+            continue;
+        }
+
+        std::vector<ENUPoint> epts;
+        epts.reserve(wpts.size());
+        for (const auto &p : wpts) {
+            epts.push_back(this->wgs84ToENU(p, this->origin_));
+        }
+
+        bool collided = false;
+        for (size_t i = start_idx; i + 1 < epts.size() && !collided; ++i) {
+            const auto &a = epts[i];
+            const auto &b = epts[i + 1];
+            LineSegment2d seg(Vec2d(a.east, a.north), Vec2d(b.east, b.north));
+            double seg_min_h = std::min(a.up, b.up);
+            double seg_max_h = std::max(a.up, b.up);
+
+            for (const auto &zone : zones_enu) {
+                if (!altitudeRangeOverlap(seg_min_h, seg_max_h, zone.min_h, zone.max_h)) {
+                    continue;
+                }
+
+                // 规则1：点在区域内
+                if (zone.poly.IsPointIn(seg.start()) || zone.poly.IsPointIn(seg.end())) {
+                    collided = true;
+                    break;
+                }
+
+                // 规则2：线段与多边形边界相交/重叠/穿越
+                if (zone.poly.DistanceTo(seg) <= 1e-8) {
+                    collided = true;
+                    break;
+                }
+            }
+        }
+
+        if (collided) {
+            bad_uavs.insert(uav_id);
+        }
+    }
+
+    for (int uid : bad_uavs) {
+        output_json["abnormal_uav_plane"].push_back(uid);
+    }
+    return true;
+}
 
 //规划函数 用于总调用
 
 bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, std::string algorithm)
 {
+    // using_midway_lines 采用“输入历史 + 本次新增”的迭代模式
+    if (input_json.contains("using_midway_lines") && input_json["using_midway_lines"].is_array()) {
+        output_json["using_midway_lines"] = input_json["using_midway_lines"];
+    } else {
+        output_json["using_midway_lines"] = json::array();
+    }
+
     std::vector<ENUPoint> Enu_waypoint;
     int midwaypoint_num=0;
     int zhandoupoint_num=0;
@@ -1522,6 +1795,11 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     }
 
     std::cout << "Constructed using_uav_list from input: " << output_json["using_uav_list"].dump() << std::endl;
+
+    if (!this->check_change(input_json, output_json)) {
+        std::cerr << "check_change failed." << std::endl;
+    }
+    else std::cerr << "check_change succeeded." << std::endl;
 
     return true;
 }

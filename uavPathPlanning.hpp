@@ -153,6 +153,8 @@ public:
 
     // 主规划接口
     bool getPlan(json &input_json, json &output_json, bool use3D = true, std::string algorithm = "minimum_snap");
+    // 检查历史/当前航线与 check_prohibited_zone_wgs84 的冲突并输出 abnormal_uav_plane
+    bool check_change(const json &input_json, json &output_json);
     //高度优化接口 以 Trajectory_ENU 为主，优化后还要联动 follower
     bool runAltitudeOptimization(const std::string &elev_file, json &output_json, const json &input_json);
     // 辅助函数
