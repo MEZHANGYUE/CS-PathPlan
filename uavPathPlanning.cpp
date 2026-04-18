@@ -529,6 +529,118 @@ std::vector<ENUPoint> UavPathPlanner::generateArcLineArc(const ENUPoint &p0, dou
 }
 
 // UavPathPlanner::runAltitudeOptimization: 现在只接受一个高程文件路径参数 (.tif 或 PGM)
+UavPathPlanner::AltitudeParams UavPathPlanner::makeAltitudeParams(const json &input_json) const
+{
+    AltitudeParams params;
+    params.uav_R = this->config_.altitude_optimization.uav_R;
+    params.safe_distance = this->config_.altitude_optimization.safe_distance;
+    params.lambda_follow = this->config_.altitude_optimization.lambda_follow;
+    params.lambda_smooth = this->config_.altitude_optimization.lambda_smooth;
+    params.max_climb_rate = this->config_.altitude_optimization.max_climb_rate;
+
+    try {
+        if (input_json.contains("uav_R")) params.uav_R = input_json["uav_R"].get<double>();
+        if (input_json.contains("safe_distance")) params.safe_distance = input_json["safe_distance"].get<double>();
+        if (input_json.contains("lambda_follow")) params.lambda_follow = input_json["lambda_follow"].get<double>();
+        if (input_json.contains("lambda_smooth")) params.lambda_smooth = input_json["lambda_smooth"].get<double>();
+        if (input_json.contains("max_climb_rate")) params.max_climb_rate = input_json["max_climb_rate"].get<double>();
+    } catch (...) {
+        // ignore
+    }
+    return params;
+}
+
+bool UavPathPlanner::optimizeSegmentAltitudeENU(std::vector<ENUPoint> &segment_enu, const json &input_json)
+{
+    if (segment_enu.empty()) return false;
+
+    std::vector<Eigen::Vector3d> wpts;
+    wpts.reserve(segment_enu.size());
+    for (const auto &p : segment_enu) {
+        wpts.emplace_back(p.east, p.north, p.up);
+    }
+
+    AltitudeParams params = this->makeAltitudeParams(input_json);
+
+    std::vector<double> out_z;
+    if (!this->optimizeHeights(wpts, params, out_z)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < out_z.size() && i < segment_enu.size(); ++i) {
+        segment_enu[i].up = out_z[i];
+    }
+
+    // Second pass: Global Smoothing
+    std::vector<double> out_z_smooth;
+    AltitudeParams params_smooth = params;
+    params_smooth.lambda_smooth *= 10.0;
+    params_smooth.max_climb_rate *= 0.5;
+    if (this->optimizeHeightsGlobalSmooth(out_z, wpts, params_smooth, out_z_smooth)) {
+        for (size_t i = 0; i < out_z_smooth.size() && i < segment_enu.size(); ++i) {
+            segment_enu[i].up = out_z_smooth[i];
+        }
+    }
+
+    return true;
+}
+//  以 output_json 为主，优化后直接回写输出
+bool UavPathPlanner::optimizeAndApplyOutputSegment(json &output_json, const char *key, int segment_id, const json &input_json, bool keep_closed_equal_height)
+{
+    if (!output_json.contains(key) || !output_json[key].is_array() || output_json[key].empty()) return false;
+
+    std::vector<WGS84Point> seg_wgs;
+    seg_wgs.reserve(output_json[key].size());
+    for (const auto &pt : output_json[key]) {
+        if (!pt.is_array() || pt.size() < 3) continue;
+        seg_wgs.push_back({pt[0].get<double>(), pt[1].get<double>(), pt[2].get<double>()});
+    }
+    if (seg_wgs.empty()) return false;
+
+    std::vector<ENUPoint> seg_enu = this->wgs84ToENU_Batch(seg_wgs, this->origin_);
+    if (!this->optimizeSegmentAltitudeENU(seg_enu, input_json)) return false;
+
+    if (keep_closed_equal_height && seg_enu.size() >= 2) {
+        const auto &p0 = seg_enu.front();
+        const auto &pn = seg_enu.back();
+        if (std::hypot(p0.east - pn.east, p0.north - pn.north) < 1e-6) {
+            seg_enu.back().up = seg_enu.front().up;
+        }
+    }
+
+    seg_wgs = this->enuToWGS84_Batch(seg_enu, this->origin_);
+    this->putWGS84ToJson(output_json, key, seg_wgs);
+
+    // 同步 using_midway_lines 中长机对应段（若存在）
+    if (output_json.contains("using_midway_lines") && output_json["using_midway_lines"].is_array()) {
+        bool replaced = false;
+        for (auto &line : output_json["using_midway_lines"]) {
+            if (!line.is_array() || line.size() < 2) continue;
+            if (!line[0].is_number_integer() || !line[1].is_number_integer()) continue;
+            if (line[0].get<int>() == this->input_data_.uav_leader_id && line[1].get<int>() == segment_id) {
+                json new_entry = json::array();
+                new_entry.push_back(this->input_data_.uav_leader_id);
+                new_entry.push_back(segment_id);
+                for (const auto &p : seg_wgs) {
+                    json pa = json::array();
+                    pa.push_back(p.lon);
+                    pa.push_back(p.lat);
+                    pa.push_back(p.alt);
+                    new_entry.push_back(pa);
+                }
+                line = new_entry;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, segment_id, seg_wgs);
+        }
+    }
+
+    return true;
+}
+
 bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json &output_json, const json &input_json)
 {
     try {
@@ -552,60 +664,7 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
         // Use a reasonable resolution (e.g. 10m) and margin (e.g. 200m)
         this->buildLocalENUCostMap(1000.0, 10.0);
 
-        // build waypoint vector for optimizer from member Trajectory_ENU
-        std::vector<Eigen::Vector3d> wpts;
-        wpts.reserve(this->Trajectory_ENU.size());
-        for (size_t i = 0; i < this->Trajectory_ENU.size(); ++i) {
-            const auto &p = this->Trajectory_ENU[i];
-            wpts.emplace_back(p.east, p.north, p.up);
-        }
-
-        AltitudeParams params;
-
-        // 统一使用构造时加载的 config.yaml 参数（不在这里重复读取）
-        params.uav_R = this->config_.altitude_optimization.uav_R;
-        params.safe_distance = this->config_.altitude_optimization.safe_distance;
-        params.lambda_follow = this->config_.altitude_optimization.lambda_follow;
-        params.lambda_smooth = this->config_.altitude_optimization.lambda_smooth;
-        params.max_climb_rate = this->config_.altitude_optimization.max_climb_rate;
-
-        // 允许从输入 JSON 覆盖（可选）
-        try {
-            if (input_json.contains("uav_R")) params.uav_R = input_json["uav_R"].get<double>();
-            if (input_json.contains("safe_distance")) params.safe_distance = input_json["safe_distance"].get<double>();
-            if (input_json.contains("lambda_follow")) params.lambda_follow = input_json["lambda_follow"].get<double>();
-            if (input_json.contains("lambda_smooth")) params.lambda_smooth = input_json["lambda_smooth"].get<double>();
-            if (input_json.contains("max_climb_rate")) params.max_climb_rate = input_json["max_climb_rate"].get<double>();
-        } catch (...) {
-            // ignore
-        }
-
-        std::vector<double> out_z;
-        if (this->optimizeHeights(wpts, params, out_z)) {
-            // First pass applied to Trajectory_ENU
-            for (size_t i = 0; i < out_z.size() && i < this->Trajectory_ENU.size(); ++i) {
-                this->Trajectory_ENU[i].up = out_z[i];
-            }
-            std::cerr << "AltitudeOptimizer: first pass optimized heights applied (" << out_z.size() << " points)\n";
-
-            // Second pass: Global Smoothing
-            // std::cerr << "AltitudeOptimizer: running second pass (global smoothing)...\n";
-            std::vector<double> out_z_smooth;
-            
-            // Adjust params for second pass
-            AltitudeParams params_smooth = params;
-            params_smooth.lambda_smooth *= 10.0; // Increase smoothing weight
-            params_smooth.max_climb_rate *= 0.5; // Stricter climb rate
-            
-            if (this->optimizeHeightsGlobalSmooth(out_z, wpts, params_smooth, out_z_smooth)) {
-                 out_z = out_z_smooth;
-                 for (size_t i = 0; i < out_z.size() && i < this->Trajectory_ENU.size(); ++i) {
-                    this->Trajectory_ENU[i].up = out_z[i];
-                 }
-                //  std::cerr << "AltitudeOptimizer: second pass completed and applied.\n";
-            } else {
-                 std::cerr << "AltitudeOptimizer: second pass failed, keeping first pass results.\n";
-            }
+        if (this->optimizeSegmentAltitudeENU(this->Trajectory_ENU, input_json)) {
 
             // std::cout << "--- Optimized Trajectory Heights ---" << std::endl;
             // for (size_t i = 0; i < out_z.size(); ++i) {
@@ -1149,6 +1208,41 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     std::vector<WGS84Point> Trajectory_WGS84 = this->enuToWGS84_Batch(Trajectory_ENU,this->origin_);
     // 将经纬高路径写入 output_json —— leader
     this->putWGS84ToJson(output_json, "uav_leader_plane1", Trajectory_WGS84);
+
+    // ---------- 高度优化（先优化第一段，再生成第二/三段） ----------
+    bool altitude_opt_enabled = this->config_.altitude_optimization.enabled;
+    std::string elevation_file = this->config_.altitude_optimization.elevation_file;
+
+    if (!this->config_.loaded) {
+        std::cerr << "Warning: config.yaml not loaded (" << this->config_.load_error << ")" << std::endl;
+    } else {
+        std::cout << "Loaded config from " << this->config_.loaded_from << std::endl;
+        std::cout << "altitude_opt_enabled: " << altitude_opt_enabled << std::endl;
+        if (altitude_opt_enabled && elevation_file.empty()) {
+            std::cerr << "Warning: 'elevation_file' parameter missing in config.yaml" << std::endl;
+        }
+    }
+
+    if (altitude_opt_enabled) {
+        if (!elevation_file.empty()) {
+            std::cout << "Running Altitude Optimization with file: " << elevation_file << std::endl;
+            auto start_time = std::chrono::high_resolution_clock::now();
+            if (!this->runAltitudeOptimization(elevation_file, output_json, input_json)) {
+                std::cerr << "Failed to Altitude Optimization!" << std::endl;
+            }
+            auto end_time = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double> elapsed = end_time - start_time;
+            std::cout << "Altitude optimization time: " << elapsed.count() << "s" << std::endl;
+        } else {
+            std::cerr << "Altitude optimization enabled but no elevation file specified." << std::endl;
+        }
+    } else {
+        std::cout << "Altitude optimization skipped." << std::endl;
+    }
+
+    // 统一使用（可能已优化后的）第一段轨迹
+    Trajectory_WGS84 = this->enuToWGS84_Batch(Trajectory_ENU, this->origin_);
+    this->putWGS84ToJson(output_json, "uav_leader_plane1", Trajectory_WGS84);
     this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, 1, Trajectory_WGS84);
 
     // uav_plane1 用于保存编队（followers）列表，每个子数组以 follower id 开头后跟点列表
@@ -1255,6 +1349,15 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         } else {
             Patrol_Path = Patrol_Path_Full;
         }
+
+        // 第三段高度与第一段（已优化后的）高度保持一致
+        if (!Trajectory_ENU.empty()) {
+            const double h_plane1 = Trajectory_ENU.back().up;
+            for (auto &pt : Patrol_Path) {
+                pt.up = h_plane1;
+            }
+        }
+
         Patrol_Path.push_back(Patrol_Path[0]); //闭合巡逻路径
         std::vector<WGS84Point> Patrol_Path_WGS84 = this->enuToWGS84_Batch(Patrol_Path,this->origin_);
         this->putWGS84ToJson(output_json, "uav_leader_plane3", Patrol_Path_WGS84);
@@ -1282,35 +1385,10 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         computeTransitionAndRotatePatrol(p0, heading0, this->input_data_.min_turning_radius, distance, Patrol_Path, output_json);
     }
 
-    // ---------- 高度优化与输出后处理（统一封装在 getPlan） ----------
-    bool altitude_opt_enabled = this->config_.altitude_optimization.enabled;
-    std::string elevation_file = this->config_.altitude_optimization.elevation_file;
-
-    if (!this->config_.loaded) {
-        std::cerr << "Warning: config.yaml not loaded (" << this->config_.load_error << ")" << std::endl;
-    } else {
-        std::cout << "Loaded config from " << this->config_.loaded_from << std::endl;
-        std::cout << "altitude_opt_enabled: " << altitude_opt_enabled << std::endl;
-        if (altitude_opt_enabled && elevation_file.empty()) {
-            std::cerr << "Warning: 'elevation_file' parameter missing in config.yaml" << std::endl;
-        }
-    }
-
-    if (altitude_opt_enabled) {
-        if (!elevation_file.empty()) {
-            std::cout << "Running Altitude Optimization with file: " << elevation_file << std::endl;
-            auto start_time = std::chrono::high_resolution_clock::now();
-            if (!this->runAltitudeOptimization(elevation_file, output_json, input_json)) {
-                std::cerr << "Failed to Altitude Optimization!" << std::endl;
-            }
-            auto end_time = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double> elapsed = end_time - start_time;
-            std::cout << "Altitude optimization time: " << elapsed.count() << "s" << std::endl;
-        } else {
-            std::cerr << "Altitude optimization enabled but no elevation file specified." << std::endl;
-        }
-    } else {
-        std::cout << "Altitude optimization skipped." << std::endl;
+    // 最后再对第二段和第三段做高度优化
+    if (altitude_opt_enabled && elev_cost_map_ && elev_cost_map_->isElevationValid()) {
+        this->optimizeAndApplyOutputSegment(output_json, "uav_leader_plane2", 2, input_json, false);
+        this->optimizeAndApplyOutputSegment(output_json, "uav_leader_plane3", 3, input_json, true);
     }
 
     // using_uav_list（包含长机与僚机，去重）

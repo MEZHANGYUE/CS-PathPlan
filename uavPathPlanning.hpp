@@ -153,7 +153,7 @@ public:
 
     // 主规划接口
     bool getPlan(json &input_json, json &output_json, bool use3D = true, std::string algorithm = "minimum_snap");
-    //高度优化接口
+    //高度优化接口 以 Trajectory_ENU 为主，优化后还要联动 follower
     bool runAltitudeOptimization(const std::string &elev_file, json &output_json, const json &input_json);
     // 辅助函数
     bool loadData(InputData &input_data, json &input_json);
@@ -271,6 +271,10 @@ private:
     std::unique_ptr<ElevationCostMap> elev_cost_map_;
 
     // Helpers for altitude optimization
+    AltitudeParams makeAltitudeParams(const json &input_json) const;
+    bool optimizeSegmentAltitudeENU(std::vector<ENUPoint> &segment_enu, const json &input_json);
+    //  以 output_json 为主，优化后直接回写输出
+    bool optimizeAndApplyOutputSegment(json &output_json, const char *key, int segment_id, const json &input_json, bool keep_closed_equal_height);
     bool optimizeHeights(const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
     bool optimizeHeightsGlobalSmooth(const std::vector<double> &input_z, const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
 
