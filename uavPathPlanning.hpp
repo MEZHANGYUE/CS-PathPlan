@@ -15,6 +15,7 @@
 #include <Eigen/Sparse>
 #include <cstdint>
 #include <memory>
+#include <array>
 
 using namespace std;
 using json = nlohmann::json;
@@ -41,11 +42,40 @@ struct InputData
     std::vector<WGS84Coord> high_zhandou_point_wgs84;
     std::vector<WGS84Coord> leader_midway_point_wgs84;
     std::vector<WGS84Coord> ready_zone;
+    std::vector<WGS84Coord> uav_start_point_wgs84;
+    std::vector<int> uavs_id;
+    std::vector<int> ready_id;
+    std::vector<int> uav_leader_ids;
+    std::vector<std::array<int, 3>> uavs_plane_data_list; // [uav_id, segment_id, point_idx]
+    json using_midway_lines = json::array();
+    // input.json 可能提供的“使用中的无人机列表”（为空通常表示使用全部）
+    std::vector<int> using_uav_list;
+
+    // battle_* 字段（当前规划逻辑未必使用，但为保证参数完整性读入）
+    std::vector<std::vector<WGS84Coord>> battle_zone_wgs84; // 多个战斗区多边形（WGS84）
+    std::vector<double> battle_high_list;
+    std::vector<int> battle_zone_link_flag;
+    json battle_zone_list = json::array();
     WGS84Coord uav_leader_start_point_wgs84 = {0.0, 0.0, 0.0};
     std::pair<int, std::pair<int, int>> uavs_plane_data;
     bool has_prohibited_zone = false;
     std::vector<ProhibitedZone> prohibited_zones;
+    bool has_check_prohibited_zone = false;
+    std::vector<ProhibitedZone> check_prohibited_zones;
     std::vector<WGS84Coord> existing_midway_lines; // 新增
+
+    // 可由 input_json 覆盖 config 的参数
+    double formation_distance = -1.0;
+    double position_misalignment = -1.0;
+    double uav_R = -1.0;
+    int uav_formation_max_row = 0;
+
+    // 高度优化参数覆盖
+    double ao_uav_R = -1.0;
+    double ao_safe_distance = -1.0;
+    double ao_lambda_follow = -1.0;
+    double ao_lambda_smooth = -1.0;
+    double ao_max_climb_rate = -1.0;
 };
 
 struct OutputData
@@ -256,9 +286,6 @@ private:
     // 提取的高度优化器函数仍在 cpp 中实现为私有方法
     // 现在只输入高程文件路径（例如 .tif），函数直接使用类成员 Trajectory_ENU 进行高度优化
     // bool runAltitudeOptimization(const std::string &elev_file);
-    // 内部辅助：从 JSON 读取 ENU 路径与 distance
-    std::vector<ENUPoint> getENUFromJSON(const json& j, const std::string& key1, const std::string& key2);
-    double getDistanceFromJSON(const json& j, const std::string& key);
     // 第三段巡逻轨迹：按 patrol_mode 选择计算方法（当前仅实现 SINGLE）
     std::vector<ENUPoint> computePatrolPathByMode(const std::vector<ENUPoint>& enu_waypoints,
                                                   int zhandoupoint_num,
