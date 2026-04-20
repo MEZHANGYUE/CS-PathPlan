@@ -77,6 +77,118 @@ inline bool parseWGS84PointArray(const json &arr, WGS84Point &out) {
     return true;
 }
 
+inline bool parseWGS84PointValue(const json &value, WGS84Point &out) {
+    if (parseWGS84PointArray(value, out)) {
+        return true;
+    }
+
+    if (!value.is_object()) {
+        return false;
+    }
+
+    const char *lon_keys[] = {"lon", "lng", "x", "longitude"};
+    const char *lat_keys[] = {"lat", "y", "latitude"};
+    const char *alt_keys[] = {"alt", "z", "height", "altitude"};
+
+    bool has_lon = false;
+    bool has_lat = false;
+    out.alt = 0.0;
+
+    for (const char *key : lon_keys) {
+        if (value.contains(key) && value[key].is_number()) {
+            out.lon = value[key].get<double>();
+            has_lon = true;
+            break;
+        }
+    }
+    for (const char *key : lat_keys) {
+        if (value.contains(key) && value[key].is_number()) {
+            out.lat = value[key].get<double>();
+            has_lat = true;
+            break;
+        }
+    }
+    for (const char *key : alt_keys) {
+        if (value.contains(key) && value[key].is_number()) {
+            out.alt = value[key].get<double>();
+            break;
+        }
+    }
+
+    return has_lon && has_lat;
+}
+
+inline double degToRad(double deg) {
+    return deg * M_PI / 180.0;
+}
+
+inline double wgs84DistanceSquaredMeters(const WGS84Point &a, const WGS84Point &b) {
+    constexpr double kEarthRadius = 6378137.0;
+    const double lat1 = degToRad(a.lat);
+    const double lat2 = degToRad(b.lat);
+    const double dlat = lat2 - lat1;
+    const double dlon = degToRad(b.lon - a.lon);
+    const double x = dlon * std::cos((lat1 + lat2) * 0.5) * kEarthRadius;
+    const double y = dlat * kEarthRadius;
+    const double z = b.alt - a.alt;
+    return x * x + y * y + z * z;
+}
+
+inline void appendTrajectoryPointsFromJson(const json &segment, std::vector<WGS84Point> &trajectory) {
+    if (!segment.is_array()) {
+        return;
+    }
+
+    for (const auto &pt_json : segment) {
+        WGS84Point pt;
+        if (!parseWGS84PointValue(pt_json, pt)) {
+            continue;
+        }
+
+        if (!trajectory.empty()) {
+            const double duplicate_threshold_sq = 1e-6;
+            if (wgs84DistanceSquaredMeters(trajectory.back(), pt) <= duplicate_threshold_sq) {
+                continue;
+            }
+        }
+        trajectory.push_back(pt);
+    }
+}
+
+inline json buildMidwayPointNum(const json &input_json, const json &output_json) {
+    json midway_point_num = json::array();
+    if (!input_json.contains("leader_midway_point_wgs84") || !input_json["leader_midway_point_wgs84"].is_array()) {
+        return midway_point_num;
+    }
+
+    std::vector<WGS84Point> leader_trajectory;
+    appendTrajectoryPointsFromJson(output_json.value("uav_leader_plane1", json::array()), leader_trajectory);
+    appendTrajectoryPointsFromJson(output_json.value("uav_leader_plane2", json::array()), leader_trajectory);
+    appendTrajectoryPointsFromJson(output_json.value("uav_leader_plane3", json::array()), leader_trajectory);
+
+    for (const auto &midway_json : input_json["leader_midway_point_wgs84"]) {
+        WGS84Point midway_point;
+        if (!parseWGS84PointValue(midway_json, midway_point) || leader_trajectory.empty()) {
+            midway_point_num.push_back(-1);
+            continue;
+        }
+
+        int best_index = -1;
+        double best_dist_sq = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < leader_trajectory.size(); ++i) {
+            const double dist_sq = wgs84DistanceSquaredMeters(midway_point, leader_trajectory[i]);
+            if (dist_sq < best_dist_sq) {
+                best_dist_sq = dist_sq;
+                best_index = static_cast<int>(i);
+            }
+        }
+
+        midway_point_num.push_back(best_index);
+    }
+
+    return midway_point_num;
+}
+
 inline bool parseHeightRangeArray(const json &arr, double &min_h, double &max_h) {
     if (!arr.is_array() || arr.size() < 2 || !arr[0].is_number() || !arr[1].is_number()) {
         return false;
@@ -2018,7 +2130,18 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         std::cerr << "check_change failed." << std::endl;
     }
     else std::cerr << "check_change succeeded." << std::endl;
-
+/*   -------------------规划结果的辅助输出，主要给前端/可视化/标注用，不影响路径求解本身-----------------------   */
+    //输出结果增加 midway_point_num（编队结果里才有）
+    // 含义：把你输入的 leader_midway_point_wgs84（长机中途点）映射到最终生成的航迹点序列上，记录“每个中途点在航迹里的下标”。
+    // 结构：list[int]，长度≈leader_midway_point_wgs84 的长度；找不到就填 -1。
+    // 例如"midway_point_num": [
+    //         6,
+    //         44,
+    //         57,
+    //         92,
+    //         103
+    //     ]
+    output_json["midway_point_num"] = buildMidwayPointNum(input_json, output_json);
     return true;
 }
 
