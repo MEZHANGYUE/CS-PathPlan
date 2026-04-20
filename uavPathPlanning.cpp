@@ -1809,6 +1809,19 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             if (rid.is_number_integer()) ready_ids.push_back(rid.get<int>());
         }
 
+        // ready_zone 相对高度：使用 ready_high_list 的平均值
+        double ready_relative_h = 0.0;
+        try {
+            if (input_json.contains("ready_high_list") && input_json["ready_high_list"].is_array() && input_json["ready_high_list"].size() >= 2 &&
+                input_json["ready_high_list"][0].is_number() && input_json["ready_high_list"][1].is_number()) {
+                double h0 = input_json["ready_high_list"][0].get<double>();
+                double h1 = input_json["ready_high_list"][1].get<double>();
+                ready_relative_h = 0.5 * (h0 + h1);
+            }
+        } catch (...) {
+            ready_relative_h = 0.0;
+        }
+
         for (int rid : ready_ids) {
             // 从 uav_plane1 中找到该 ready 无人机第一段轨迹
             const json *follower_entry = nullptr;
@@ -1837,6 +1850,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             // 第二段起点与起始航向：取该无人机第一段末点
             ENUPoint p0 = follower_plane1_enu.back();
             double heading0 = computeTailHeadingRobust(follower_plane1_enu, final_heading);
+            const double ready_target_up = p0.up + ready_relative_h;
 
             // ready_zone -> ENU（高度继承第一段末点高度）
             std::vector<WGS84Point> ready_zone_wgs;
@@ -1847,7 +1861,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
                 WGS84Point p;
                 p.lon = pt[0].get<double>();
                 p.lat = pt[1].get<double>();
-                p.alt = p0.up;
+                p.alt = ready_target_up;
                 ready_zone_wgs.push_back(p);
             }
             if (ready_zone_wgs.size() < 3) {
@@ -1868,6 +1882,11 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             if (ready_patrol.empty()) {
                 std::cerr << "ready_id=" << rid << " failed to generate ready patrol path." << std::endl;
                 continue;
+            }
+
+            // 巡逻段高度设置为 ready_zone 相对高度目标
+            for (auto &pt : ready_patrol) {
+                pt.up = ready_target_up;
             }
 
             // 第二段：过渡轨迹（复用 arc-line-arc 生成）
