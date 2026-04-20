@@ -1417,27 +1417,9 @@ bool UavPathPlanner::check_change(const json &input_json, json &output_json)
     return true;
 }
 
-//规划函数 用于总调用
-
-bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, std::string algorithm)
+std::vector<ENUPoint> UavPathPlanner::preparePlanningWaypoints(int &midwaypoint_num, int &zhandoupoint_num)
 {
     std::vector<ENUPoint> Enu_waypoint;
-    int midwaypoint_num = 0;
-    int zhandoupoint_num = 0;
-    double distance;
-    // InputData input_data; // Removed local variable
-    if (!loadData(this->input_data_, input_json)) // Use member variable
-    {
-        std::cerr << "Failed to load intput json data." << std::endl;
-    }
-    else
-    {
-        std::cerr << "Successfully load intput json data." << std::endl;
-    }
-    // using_midway_lines 采用“输入历史 + 本次新增”的迭代模式（仅使用 loadData 已解析数据）
-    output_json["using_midway_lines"] = this->input_data_.using_midway_lines.is_array()
-        ? this->input_data_.using_midway_lines
-        : json::array();
 
     // 记录路径点和区域边界点数量
     midwaypoint_num = static_cast<int>(this->input_data_.leader_midway_point_wgs84.size());
@@ -1502,8 +1484,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         this->origin_.alt = 0.0;
         Enu_waypoint = this->wgs84ToENU_Batch(wgs84_points, this->origin_);
     }
-    
-    //增加打印leader_midway_point_wgs84点数和high_zhandou_point_wgs84点数
+
     // Filter Enu_waypoint to remove points too close to the next one
     if (Enu_waypoint.size() > 1) {
         std::vector<ENUPoint> filtered_wpts;
@@ -1514,26 +1495,52 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             const auto& p1 = Enu_waypoint[i];
             const auto& p2 = Enu_waypoint[i+1];
             double dist2d = std::hypot(p1.east - p2.east, p1.north - p2.north);
-            
+
             if (dist2d > min_dist) {
                 filtered_wpts.push_back(p1);
             } else {
-                std::cerr << "getPlan: merging waypoint " << i << " to next (dist=" << dist2d << "m)\n";
+                std::cerr << "preparePlanningWaypoints: merging waypoint " << i << " to next (dist=" << dist2d << "m)\n";
             }
-               }
-        // filtered_wpts.push_back(Enu_waypoint.back()); // Always keep the last point
+        }
         // 将剩余的点（包括最后一个 midway 点和所有的 zhandou 点）添加到结果中
         int start_idx = (midwaypoint_num > 0) ? (midwaypoint_num - 1) : 0;
         for (size_t i = start_idx; i < Enu_waypoint.size(); ++i) {
             filtered_wpts.push_back(Enu_waypoint[i]);
         }
-        
-        if (filtered_wpts.size() < midwaypoint_num) {
-            std::cerr << "getPlan: filtered waypoints from " << midwaypoint_num 
+
+        if (filtered_wpts.size() < static_cast<size_t>(midwaypoint_num + zhandoupoint_num)) {
+            std::cerr << "preparePlanningWaypoints: filtered waypoints from " << (midwaypoint_num + zhandoupoint_num)
                       << " to " << filtered_wpts.size() << " points.\n";
             Enu_waypoint = filtered_wpts;
         }
     }
+
+    return Enu_waypoint;
+}
+
+//规划函数 用于总调用
+
+bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, std::string algorithm)
+{
+    std::vector<ENUPoint> Enu_waypoint;
+    int midwaypoint_num = 0;
+    int zhandoupoint_num = 0;
+    double distance;
+    // InputData input_data; // Removed local variable
+    if (!loadData(this->input_data_, input_json)) // Use member variable
+    {
+        std::cerr << "Failed to load intput json data." << std::endl;
+    }
+    else
+    {
+        std::cerr << "Successfully load intput json data." << std::endl;
+    }
+    // using_midway_lines 采用“输入历史 + 本次新增”的迭代模式（仅使用 loadData 已解析数据）
+    output_json["using_midway_lines"] = this->input_data_.using_midway_lines.is_array()
+        ? this->input_data_.using_midway_lines
+        : json::array();
+
+    Enu_waypoint = this->preparePlanningWaypoints(midwaypoint_num, zhandoupoint_num);
 
     distance = this->input_data_.distance_points;
     if (!(distance > 0.0)) {
@@ -1638,26 +1645,28 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     // std::cout << "Final heading: " << final_heading << " rad (" << rad2deg(final_heading) << " deg)" << std::endl;
 
     // 生成并写入跟随者轨迹
-    try {
-        json plane_array = this->generateFollowerTrajectories(input_json, this->input_data_, Trajectory_ENU, Trajectory_WGS84);
-        output_json["uav_plane1"] = plane_array;
-        
-        // 将跟随者轨迹添加到 using_midway_lines
-        for (const auto& follower : plane_array) {
-            if (follower.empty()) continue;
-            int uid = follower[0].get<int>();
-            std::vector<WGS84Point> follower_traj;
-            for (size_t i = 1; i < follower.size(); ++i) {
-                follower_traj.push_back({
-                    follower[i][0].get<double>(),
-                    follower[i][1].get<double>(),
-                    follower[i][2].get<double>()
-                });
+    if (this->input_data_.formation_using == 1) {
+        try {
+            json plane_array = this->generateFollowerTrajectories(input_json, this->input_data_, Trajectory_ENU, Trajectory_WGS84);
+            output_json["uav_plane1"] = plane_array;
+            
+            // 将跟随者轨迹添加到 using_midway_lines
+            for (const auto& follower : plane_array) {
+                if (follower.empty()) continue;
+                int uid = follower[0].get<int>();
+                std::vector<WGS84Point> follower_traj;
+                for (size_t i = 1; i < follower.size(); ++i) {
+                    follower_traj.push_back({
+                        follower[i][0].get<double>(),
+                        follower[i][1].get<double>(),
+                        follower[i][2].get<double>()
+                    });
+                }
+                this->appendTrajectoryToOutput(output_json, uid, 1, follower_traj);
             }
-            this->appendTrajectoryToOutput(output_json, uid, 1, follower_traj);
+        } catch (const std::exception &e) {
+            std::cerr << "调用 generateFollowerTrajectories 出错: " << e.what() << std::endl;
         }
-    } catch (const std::exception &e) {
-        std::cerr << "调用 generateFollowerTrajectories 出错: " << e.what() << std::endl;
     }
 
     std::vector<ENUPoint> Patrol_Path; // 提升作用域以供第二段轨迹计算使用

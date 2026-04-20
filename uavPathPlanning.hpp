@@ -183,6 +183,10 @@ public:
 
     // 主规划接口
     bool getPlan(json &input_json, json &output_json, bool use3D = true, std::string algorithm = "minimum_snap");
+    
+    // 准备规划航点（整合中途点与区域边界点）
+    std::vector<ENUPoint> preparePlanningWaypoints(int &midwaypoint_num, int &zhandoupoint_num);
+
     // 检查历史/当前航线与 check_prohibited_zone_wgs84 的冲突并输出 abnormal_uav_plane
     bool check_change(const json &input_json, json &output_json);
     //高度优化接口 以 Trajectory_ENU 为主，优化后还要联动 follower
