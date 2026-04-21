@@ -28,6 +28,15 @@ struct ProhibitedZone {
     std::pair<double, double> height_range;
 };
 
+// 飞行区域通用结构体（用于表示准备区域、战斗区域等）
+struct FlightZone {
+    int zone_id = 0;                            // 区域ID
+    std::string zone_type;                      // 区域类型（如 "ready_zone", "battle_zone"）
+    std::vector<WGS84Coord> polygon;            // 区域多边形边界定点集合
+    std::pair<double, double> height_range;     // 区域的高度范围 [下限, 上限]
+    int link_flag = 0;                          // 联结标志或其他自定义数据
+};
+
 struct InputData
 {
     double distance_points = 0.0;
@@ -38,10 +47,9 @@ struct InputData
     int formation_using;
     int uav_leader_id;
     std::pair<double, double> height_list;
-    std::pair<double, double> ready_high_list;
+    FlightZone ready_zone;
     std::vector<WGS84Coord> high_zhandou_point_wgs84;
     std::vector<WGS84Coord> leader_midway_point_wgs84;
-    std::vector<WGS84Coord> ready_zone;
     std::vector<WGS84Coord> uav_start_point_wgs84;
     std::vector<int> uavs_id;
     std::vector<int> ready_id;
@@ -51,10 +59,8 @@ struct InputData
     // input.json 可能提供的“使用中的无人机列表”（为空通常表示使用全部）
     std::vector<int> using_uav_list;
 
-    // battle_* 字段（当前规划逻辑未必使用，但为保证参数完整性读入）
-    std::vector<std::vector<WGS84Coord>> battle_zone_wgs84; // 多个战斗区多边形（WGS84）
-    std::vector<double> battle_high_list;
-    std::vector<int> battle_zone_link_flag;
+    // battle_zone 字段（包含多边形和高度）
+    std::vector<FlightZone> battle_zones;
     json battle_zone_list = json::array();
     WGS84Coord uav_leader_start_point_wgs84 = {0.0, 0.0, 0.0};
     std::pair<int, std::pair<int, int>> uavs_plane_data;
@@ -86,10 +92,9 @@ struct OutputData
     int formation_using;
     int uav_leader_id;
     std::pair<double, double> height_list;
-    std::pair<double, double> ready_high_list;
+    FlightZone ready_zone;
     std::vector<WGS84Coord> high_zhandou_point_wgs84;
     std::vector<WGS84Coord> leader_midway_point_wgs84;
-    std::vector<WGS84Coord> ready_zone;
     WGS84Coord uav_leader_start_point_wgs84 = {0.0, 0.0, 0.0};
     std::pair<int, std::pair<int, int>> uavs_plane_data;
 };

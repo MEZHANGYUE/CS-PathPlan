@@ -1838,7 +1838,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     output_json["uav_plane2"] = json::array();
     output_json["uav_plane3"] = json::array();
     if (!this->input_data_.ready_id.empty() &&
-        this->input_data_.ready_zone.size() >= 3 &&
+        this->input_data_.ready_zone.polygon.size() >= 3 &&
         output_json.contains("uav_plane1") && output_json["uav_plane1"].is_array()) {
 
         auto upsertTrajectoryToOutput = [&](int uav_id, int segment_id, const std::vector<WGS84Point> &traj) {
@@ -1890,7 +1890,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
 
         // ready_zone 相对高度：使用 ready_high_list 的平均值
         double ready_relative_h = 0.0;
-        ready_relative_h = 0.5 * (this->input_data_.ready_high_list.first + this->input_data_.ready_high_list.second);
+        ready_relative_h = 0.5 * (this->input_data_.ready_zone.height_range.first + this->input_data_.ready_zone.height_range.second);
 
         for (int rid : ready_ids) {
             // 从 uav_plane1 中找到该 ready 无人机第一段轨迹
@@ -1924,8 +1924,8 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
 
             // ready_zone -> ENU（高度继承第一段末点高度）
             std::vector<WGS84Point> ready_zone_wgs;
-            ready_zone_wgs.reserve(this->input_data_.ready_zone.size());
-            for (const auto &pt : this->input_data_.ready_zone) {
+            ready_zone_wgs.reserve(this->input_data_.ready_zone.polygon.size());
+            for (const auto &pt : this->input_data_.ready_zone.polygon) {
                 ready_zone_wgs.push_back({pt.lon, pt.lat, ready_target_up});
             }
             if (ready_zone_wgs.size() < 3) {
@@ -2731,7 +2731,16 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
 
     parse_wgs84_list("leader_midway_point_wgs84", input_data.leader_midway_point_wgs84, 0.0);
     parse_wgs84_list("high_zhandou_point_wgs84", input_data.high_zhandou_point_wgs84, 0.0);
-    parse_wgs84_list("ready_zone", input_data.ready_zone, 0.0);
+    input_data.ready_zone.zone_id = 0;
+    input_data.ready_zone.zone_type = "ready_zone";
+    parse_wgs84_list("ready_zone", input_data.ready_zone.polygon, 0.0);
+    if(input_json.contains("ready_high_list") && input_json["ready_high_list"].is_array() && input_json["ready_high_list"].size() >= 2) {
+        input_data.ready_zone.height_range = {
+            input_json["ready_high_list"][0].get<double>(),
+            input_json["ready_high_list"][1].get<double>()
+        };
+    }
+
     parse_wgs84_list("uav_start_point_wgs84", input_data.uav_start_point_wgs84, 0.0);
 
     parse_int_list("uavs_id", input_data.uavs_id);
@@ -2739,28 +2748,43 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
     parse_int_list("uav_leader_id", input_data.uav_leader_ids);
     parse_int_list("using_uav_list", input_data.using_uav_list);
 
-    // battle_* 字段（为保证参数完整性读入；当前规划流程可能未使用）
+    // battle_zones 字段解析
     if (input_json.contains("battle_zone_list")) {
         input_data.battle_zone_list = input_json["battle_zone_list"];
     }
+    
+    std::vector<double> temp_battle_high_list;
     if (input_json.contains("battle_high_list") && input_json["battle_high_list"].is_array()) {
         for (const auto &h : input_json["battle_high_list"]) {
-            if (h.is_number()) input_data.battle_high_list.push_back(h.get<double>());
+            if (h.is_number()) temp_battle_high_list.push_back(h.get<double>());
         }
     }
-    parse_int_list("battle_zone_link_flag", input_data.battle_zone_link_flag);
+    
+    std::vector<int> temp_battle_zone_link_flag;
+    parse_int_list("battle_zone_link_flag", temp_battle_zone_link_flag);
+    
     if (input_json.contains("battle_zone_wgs84") && input_json["battle_zone_wgs84"].is_array()) {
+        int idx = 0;
         for (const auto &poly : input_json["battle_zone_wgs84"]) {
             if (!poly.is_array()) continue;
-            std::vector<WGS84Coord> polygon;
+            FlightZone bz;
+            bz.zone_id = idx;
+            bz.zone_type = "battle_zone";
             for (const auto &pt : poly) {
                 WGS84Point p;
                 if (!parseWGS84PointValue(pt, p)) continue;
-                polygon.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
+                bz.polygon.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
             }
-            if (polygon.size() >= 3) {
-                input_data.battle_zone_wgs84.push_back(std::move(polygon));
+            if (bz.polygon.size() >= 3) {
+                if(idx < temp_battle_high_list.size()) {
+                    bz.height_range = {temp_battle_high_list[idx], temp_battle_high_list[idx]}; // 或者根据实际使用情况赋值
+                }
+                if(idx < temp_battle_zone_link_flag.size()) {
+                    bz.link_flag = temp_battle_zone_link_flag[idx];
+                }
+                input_data.battle_zones.push_back(std::move(bz));
             }
+            idx++;
         }
     }
     if (!input_data.uav_leader_ids.empty()) {
@@ -2848,7 +2872,7 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
 
     if (input_json.contains("ready_high_list") && input_json["ready_high_list"].is_array() && input_json["ready_high_list"].size() >= 2 &&
         input_json["ready_high_list"][0].is_number() && input_json["ready_high_list"][1].is_number()) {
-        input_data.ready_high_list = std::make_pair(input_json["ready_high_list"][0].get<double>(), input_json["ready_high_list"][1].get<double>());
+        input_data.ready_zone.height_range = std::make_pair(input_json["ready_high_list"][0].get<double>(), input_json["ready_high_list"][1].get<double>());
     }
     if (input_json.contains("high_list") && input_json["high_list"].is_array() && input_json["high_list"].size() >= 2 &&
         input_json["high_list"][0].is_number() && input_json["high_list"][1].is_number()) {
