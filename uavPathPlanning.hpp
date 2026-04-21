@@ -190,11 +190,11 @@ public:
     // 检查历史/当前航线与 check_prohibited_zone_wgs84 的冲突并输出 abnormal_uav_plane
     bool check_change(const json &input_json, json &output_json);
     //高度优化接口 以 Trajectory_ENU 为主，优化后还要联动 follower
-    bool runAltitudeOptimization(const std::string &elev_file, json &output_json, const json &input_json);
+    bool runAltitudeOptimization(const std::string &elev_file, json &output_json);
     // 辅助函数
     bool loadData(InputData &input_data, json &input_json);
     bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj);
-    json generateFollowerTrajectories(const json &input_json, const InputData &input_data,
+    json generateFollowerTrajectories(const InputData &input_data,
                                       const std::vector<ENUPoint> &Trajectory_ENU,
                                       const std::vector<WGS84Point> &Trajectory_WGS84);
 
@@ -310,10 +310,12 @@ private:
     std::unique_ptr<ElevationCostMap> elev_cost_map_;
 
     // Helpers for altitude optimization
-    AltitudeParams makeAltitudeParams(const json &input_json) const;
-    bool optimizeSegmentAltitudeENU(std::vector<ENUPoint> &segment_enu, const json &input_json);
+    AltitudeParams makeAltitudeParams() const;
+    bool optimizeSegmentAltitudeENU(std::vector<ENUPoint> &segment_enu);
     //  以 output_json 为主，优化后直接回写输出
-    bool optimizeAndApplyOutputSegment(json &output_json, const char *key, int segment_id, const json &input_json, bool keep_closed_equal_height);
+    bool optimizeAndApplyOutputSegment(json &output_json, const char *key, int segment_id, bool keep_closed_equal_height);
+    // 联合优化多段路径高度，并支持特定段（如巡逻段）等高约束
+    bool optimizeAndApplyJointSegments(json &output_json, const std::vector<std::string> &keys, const std::vector<int> &segment_ids, int equal_height_segment_idx = -1);
     bool optimizeHeights(const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
     bool optimizeHeightsGlobalSmooth(const std::vector<double> &input_z, const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
 

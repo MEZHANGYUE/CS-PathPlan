@@ -755,9 +755,8 @@ std::vector<ENUPoint> UavPathPlanner::generateArcLineArc(const ENUPoint &p0, dou
 }
 
 // UavPathPlanner::runAltitudeOptimization: 现在只接受一个高程文件路径参数 (.tif 或 PGM)
-UavPathPlanner::AltitudeParams UavPathPlanner::makeAltitudeParams(const json &input_json) const
+UavPathPlanner::AltitudeParams UavPathPlanner::makeAltitudeParams() const
 {
-    (void)input_json;
     AltitudeParams params;
     params.uav_R = this->config_.altitude_optimization.uav_R;
     params.safe_distance = this->config_.altitude_optimization.safe_distance;
@@ -774,7 +773,7 @@ UavPathPlanner::AltitudeParams UavPathPlanner::makeAltitudeParams(const json &in
     return params;
 }
 
-bool UavPathPlanner::optimizeSegmentAltitudeENU(std::vector<ENUPoint> &segment_enu, const json &input_json)
+bool UavPathPlanner::optimizeSegmentAltitudeENU(std::vector<ENUPoint> &segment_enu)
 {
     if (segment_enu.empty()) return false;
 
@@ -784,7 +783,7 @@ bool UavPathPlanner::optimizeSegmentAltitudeENU(std::vector<ENUPoint> &segment_e
         wpts.emplace_back(p.east, p.north, p.up);
     }
 
-    AltitudeParams params = this->makeAltitudeParams(input_json);
+    AltitudeParams params = this->makeAltitudeParams();
 
     std::vector<double> out_z;
     if (!this->optimizeHeights(wpts, params, out_z)) {
@@ -809,7 +808,7 @@ bool UavPathPlanner::optimizeSegmentAltitudeENU(std::vector<ENUPoint> &segment_e
     return true;
 }
 //  以 output_json 为主，优化后直接回写输出
-bool UavPathPlanner::optimizeAndApplyOutputSegment(json &output_json, const char *key, int segment_id, const json &input_json, bool keep_closed_equal_height)
+bool UavPathPlanner::optimizeAndApplyOutputSegment(json &output_json, const char *key, int segment_id, bool keep_closed_equal_height)
 {
     if (!output_json.contains(key) || !output_json[key].is_array() || output_json[key].empty()) return false;
 
@@ -822,7 +821,7 @@ bool UavPathPlanner::optimizeAndApplyOutputSegment(json &output_json, const char
     if (seg_wgs.empty()) return false;
 
     std::vector<ENUPoint> seg_enu = this->wgs84ToENU_Batch(seg_wgs, this->origin_);
-    if (!this->optimizeSegmentAltitudeENU(seg_enu, input_json)) return false;
+    if (!this->optimizeSegmentAltitudeENU(seg_enu)) return false;
 
     if (keep_closed_equal_height && seg_enu.size() >= 2) {
         const auto &p0 = seg_enu.front();
@@ -865,7 +864,121 @@ bool UavPathPlanner::optimizeAndApplyOutputSegment(json &output_json, const char
     return true;
 }
 
-bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json &output_json, const json &input_json)
+bool UavPathPlanner::optimizeAndApplyJointSegments(json &output_json, const std::vector<std::string> &keys, const std::vector<int> &segment_ids, int equal_height_segment_idx)
+{
+    if (keys.empty() || keys.size() != segment_ids.size()) return false;
+
+    std::vector<WGS84Point> joint_wgs;
+    std::vector<size_t> segment_end_indices;
+
+    for (const auto &key : keys) {
+        if (!output_json.contains(key) || !output_json[key].is_array() || output_json[key].empty()) return false;
+        for (const auto &pt : output_json[key]) {
+            if (!pt.is_array() || pt.size() < 3) continue;
+            joint_wgs.push_back({pt[0].get<double>(), pt[1].get<double>(), pt[2].get<double>()});
+        }
+        segment_end_indices.push_back(joint_wgs.size());
+    }
+
+    if (joint_wgs.empty()) return false;
+
+    std::vector<ENUPoint> joint_enu = this->wgs84ToENU_Batch(joint_wgs, this->origin_);
+    
+    std::vector<Eigen::Vector3d> wpts;
+    wpts.reserve(joint_enu.size());
+    for (const auto &p : joint_enu) {
+        wpts.emplace_back(p.east, p.north, p.up);
+    }
+
+    AltitudeParams params = this->makeAltitudeParams();
+    std::vector<double> out_z;
+
+    // 如果指定了某一段需要等高（如巡逻段），在优化前处理
+    // 目前 optimizeHeights 是通用的 QP，如果需要严格等高，可以在优化后强制拉平，或者在 QP 中加入等式约束。
+    // 这里采用简单策略：先联合优化保证连续性，然后对等高段取最大高度拉平，再做一次全局平滑。
+
+    if (!this->optimizeHeights(wpts, params, out_z)) {
+        return false;
+    }
+
+    // 处理等高约束 (uav_leader_plane3)
+    if (equal_height_segment_idx >= 0 && equal_height_segment_idx < (int)segment_end_indices.size()) {
+        size_t start_idx = (equal_height_segment_idx == 0) ? 0 : segment_end_indices[equal_height_segment_idx - 1];
+        size_t end_idx = segment_end_indices[equal_height_segment_idx];
+        if (end_idx > start_idx) {
+            double max_h = -1e9;
+            for (size_t i = start_idx; i < end_idx; ++i) {
+                max_h = std::max(max_h, out_z[i]);
+            }
+            for (size_t i = start_idx; i < end_idx; ++i) {
+                out_z[i] = max_h;
+            }
+        }
+    }
+
+    // 全局平滑
+    std::vector<double> out_z_smooth;
+    AltitudeParams params_smooth = params;
+    params_smooth.lambda_smooth *= 10.0;
+    params_smooth.max_climb_rate *= 0.5;
+    if (this->optimizeHeightsGlobalSmooth(out_z, wpts, params_smooth, out_z_smooth)) {
+        out_z = out_z_smooth;
+    }
+
+    // 再次检查等高约束（平滑可能会破坏它，如果是严格等高，平滑后需要再次拉平）
+    if (equal_height_segment_idx >= 0 && equal_height_segment_idx < (int)segment_end_indices.size()) {
+        size_t start_idx = (equal_height_segment_idx == 0) ? 0 : segment_end_indices[equal_height_segment_idx - 1];
+        size_t end_idx = segment_end_indices[equal_height_segment_idx];
+        if (end_idx > start_idx) {
+            double final_h = out_z[start_idx]; // 取平滑后的第一个点高度作为基准
+            for (size_t i = start_idx; i < end_idx; ++i) {
+                out_z[i] = final_h;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < out_z.size(); ++i) {
+        joint_enu[i].up = out_z[i];
+    }
+
+    joint_wgs = this->enuToWGS84_Batch(joint_enu, this->origin_);
+
+    // 回写到 output_json 和 using_midway_lines
+    size_t current_offset = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        size_t next_offset = segment_end_indices[i];
+        std::vector<WGS84Point> seg_wgs(joint_wgs.begin() + current_offset, joint_wgs.begin() + next_offset);
+        this->putWGS84ToJson(output_json, keys[i], seg_wgs);
+        
+        int seg_id = segment_ids[i];
+        if (output_json.contains("using_midway_lines") && output_json["using_midway_lines"].is_array()) {
+            bool replaced = false;
+            for (auto &line : output_json["using_midway_lines"]) {
+                if (!line.is_array() || line.size() < 2) continue;
+                if (line[0].get<int>() == this->input_data_.uav_leader_id && line[1].get<int>() == seg_id) {
+                    json new_entry = json::array();
+                    new_entry.push_back(this->input_data_.uav_leader_id);
+                    new_entry.push_back(seg_id);
+                    for (const auto &p : seg_wgs) {
+                        json pa = {p.lon, p.lat, p.alt};
+                        new_entry.push_back(pa);
+                    }
+                    line = new_entry;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                this->appendTrajectoryToOutput(output_json, this->input_data_.uav_leader_id, seg_id, seg_wgs);
+            }
+        }
+        current_offset = next_offset;
+    }
+
+    return true;
+}
+
+bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json &output_json)
 {
     try {
         if (elev_file.empty()) return false;
@@ -888,7 +1001,7 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
         // Use a reasonable resolution (e.g. 10m) and margin (e.g. 200m)
         this->buildLocalENUCostMap(1000.0, 10.0);
 
-        if (this->optimizeSegmentAltitudeENU(this->Trajectory_ENU, input_json)) {
+        if (this->optimizeSegmentAltitudeENU(this->Trajectory_ENU)) {
 
             // std::cout << "--- Optimized Trajectory Heights ---" << std::endl;
             // for (size_t i = 0; i < out_z.size(); ++i) {
@@ -905,7 +1018,7 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, json 
             
             // 3. Re-generate follower trajectories
             try {
-                json plane_array = this->generateFollowerTrajectories(input_json, this->input_data_, this->Trajectory_ENU, Trajectory_WGS84);
+                json plane_array = this->generateFollowerTrajectories(this->input_data_, this->Trajectory_ENU, Trajectory_WGS84);
                 output_json["uav_plane1"] = plane_array;
                 std::cerr << "AltitudeOptimizer: updated output_json with new trajectories.\n";
             } catch (const std::exception &e) {
@@ -1603,7 +1716,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         if (!elevation_file.empty()) {
             std::cout << "Running Altitude Optimization with file: " << elevation_file << std::endl;
             auto start_time = std::chrono::high_resolution_clock::now();
-            if (!this->runAltitudeOptimization(elevation_file, output_json, input_json)) {
+            if (!this->runAltitudeOptimization(elevation_file, output_json)) {
                 std::cerr << "Failed to Altitude Optimization!" << std::endl;
             }
             auto end_time = std::chrono::high_resolution_clock::now();
@@ -1647,7 +1760,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     // 生成并写入跟随者轨迹
     if (this->input_data_.formation_using == 1) {
         try {
-            json plane_array = this->generateFollowerTrajectories(input_json, this->input_data_, Trajectory_ENU, Trajectory_WGS84);
+            json plane_array = this->generateFollowerTrajectories(this->input_data_, Trajectory_ENU, Trajectory_WGS84);
             output_json["uav_plane1"] = plane_array;
             
             // 将跟随者轨迹添加到 using_midway_lines
@@ -1714,8 +1827,10 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
 
     // 最后再对第二段和第三段做高度优化
     if (altitude_opt_enabled && elev_cost_map_ && elev_cost_map_->isElevationValid()) {
-        this->optimizeAndApplyOutputSegment(output_json, "uav_leader_plane2", 2, input_json, false);
-        this->optimizeAndApplyOutputSegment(output_json, "uav_leader_plane3", 3, input_json, true);
+        std::vector<std::string> keys = {"uav_leader_plane2", "uav_leader_plane3"};
+        std::vector<int> seg_ids = {2, 3};
+        // 联合优化第二段和第三段，其中第三段（index 1）需要保持等高点高度相同
+        this->optimizeAndApplyJointSegments(output_json, keys, seg_ids, 1);
     }
 
     // ready_id: 需要前往 ready_zone 的无人机。
@@ -1975,10 +2090,9 @@ bool UavPathPlanner::putWGS84ToJson(json &j, const std::string &key, const std::
     }
 }
 //生成僚机编队轨迹
-json UavPathPlanner::generateFollowerTrajectories(const json &input_json, const InputData &input_data,
+json UavPathPlanner::generateFollowerTrajectories(const InputData &input_data,
                                   const std::vector<ENUPoint> &Trajectory_ENU,
                                   const std::vector<WGS84Point> &Trajectory_WGS84) {
-    (void)input_json;
     (void)Trajectory_WGS84;
     json plane_array = json::array();
 
