@@ -43,3 +43,5 @@ WGS84Point:
 构建一个局部可见性图（Visibility Graph），节点包括线段起点、终点以及禁飞区多边形的顶点（向外扩展 50 米以确保安全）。
 使用 Dijkstra 算法在可见性图上搜索从起点到终点的最短路径，绕过禁飞区。
 将绕行路径插入到原路径中。
+![规划二维图](pic/uav31_0_planning_output_2d.png)
+![规划三维图](pic/uav31_0_planning_output_3d.png)
