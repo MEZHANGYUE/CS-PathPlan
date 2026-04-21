@@ -1649,9 +1649,20 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         std::cerr << "Successfully load intput json data." << std::endl;
     }
     // using_midway_lines 采用“输入历史 + 本次新增”的迭代模式（仅使用 loadData 已解析数据）
-    output_json["using_midway_lines"] = this->input_data_.using_midway_lines.is_array()
-        ? this->input_data_.using_midway_lines
-        : json::array();
+    output_json["using_midway_lines"] = json::array();
+    for (const auto &line : this->input_data_.using_midway_lines) {
+        json arr = json::array();
+        arr.push_back(line.uav_id);
+        arr.push_back(line.segment_id);
+        for (const auto &p : line.points) {
+            json pa = json::array();
+            pa.push_back(p.lon);
+            pa.push_back(p.lat);
+            pa.push_back(p.alt);
+            arr.push_back(pa);
+        }
+        output_json["using_midway_lines"].push_back(arr);
+    }
 
     Enu_waypoint = this->preparePlanningWaypoints(midwaypoint_num, zhandoupoint_num);
 
@@ -2749,8 +2760,13 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
     parse_int_list("using_uav_list", input_data.using_uav_list);
 
     // battle_zones 字段解析
-    if (input_json.contains("battle_zone_list")) {
-        input_data.battle_zone_list = input_json["battle_zone_list"];
+    input_data.battle_zone_list.clear();
+    if (input_json.contains("battle_zone_list") && input_json["battle_zone_list"].is_array()) {
+        for (const auto &zone_id : input_json["battle_zone_list"]) {
+            if (zone_id.is_number_integer()) {
+                input_data.battle_zone_list.push_back(zone_id.get<int>());
+            }
+        }
     }
     
     std::vector<double> temp_battle_high_list;
@@ -2886,16 +2902,30 @@ bool UavPathPlanner::loadData(InputData &input_data, json &input_json)
         input_data.min_turning_radius = this->config_.path_planning.min_turning_radius;
     }
 
+    input_data.using_midway_lines.clear();
+    input_data.existing_midway_lines.clear();
     if (input_json.contains("using_midway_lines") && input_json["using_midway_lines"].is_array()) {
-        input_data.using_midway_lines = input_json["using_midway_lines"];
         for (const auto &line : input_json["using_midway_lines"]) {
-            if (!line.is_array() || line.size() <= 2) continue;
+            if (!line.is_array() || line.size() <= 2) {
+                continue;
+            }
+            if (!line[0].is_number_integer() || !line[1].is_number_integer()) {
+                continue;
+            }
+
+            UavTrajectoryLine typed_line;
+            typed_line.uav_id = line[0].get<int>();
+            typed_line.segment_id = line[1].get<int>();
+
             for (size_t i = 2; i < line.size(); ++i) {
                 WGS84Point p;
                 if (parseWGS84PointValue(line[i], p)) {
+                    typed_line.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
                     input_data.existing_midway_lines.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
                 }
             }
+
+            input_data.using_midway_lines.push_back(std::move(typed_line));
         }
     }
 
@@ -3427,4 +3457,108 @@ void UavPathPlanner::appendTrajectoryToOutput(json &output_json, int uav_id, int
     }
 
     output_json["using_midway_lines"].push_back(segment_entry);
+}
+
+bool UavPathPlanner::outputDataToJson(const OutputData &output_data, json &output_json) {
+    output_json = json::object();
+
+    output_json["abnormal_uav_plane"] = output_data.abnormal_uav_plane;
+    output_json["using_uav_list"] = output_data.using_uav_list;
+    output_json["ready_id"] = output_data.ready_id;
+    output_json["midway_point_num"] = output_data.midway_point_num;
+
+    output_json["leader_show_points"] = json::array();
+    for (const auto &p : output_data.leader_show_points) {
+        json pa = json::array();
+        pa.push_back(p.lon);
+        pa.push_back(p.lat);
+        pa.push_back(p.alt);
+        output_json["leader_show_points"].push_back(pa);
+    }
+
+    output_json["uav_leader_plane1"] = json::array();
+    for (const auto &p : output_data.uav_leader_plane1) {
+        json pa = json::array();
+        pa.push_back(p.lon);
+        pa.push_back(p.lat);
+        pa.push_back(p.alt);
+        output_json["uav_leader_plane1"].push_back(pa);
+    }
+
+    output_json["uav_leader_plane2"] = json::array();
+    for (const auto &p : output_data.uav_leader_plane2) {
+        json pa = json::array();
+        pa.push_back(p.lon);
+        pa.push_back(p.lat);
+        pa.push_back(p.alt);
+        output_json["uav_leader_plane2"].push_back(pa);
+    }
+
+    output_json["uav_leader_plane3"] = json::array();
+    for (const auto &p : output_data.uav_leader_plane3) {
+        json pa = json::array();
+        pa.push_back(p.lon);
+        pa.push_back(p.lat);
+        pa.push_back(p.alt);
+        output_json["uav_leader_plane3"].push_back(pa);
+    }
+
+    output_json["uav_plane1"] = json::array();
+    for (const auto &line : output_data.uav_plane1) {
+        json entry = json::array();
+        entry.push_back(line.uav_id);
+        for (const auto &p : line.points) {
+            json pa = json::array();
+            pa.push_back(p.lon);
+            pa.push_back(p.lat);
+            pa.push_back(p.alt);
+            entry.push_back(pa);
+        }
+        output_json["uav_plane1"].push_back(entry);
+    }
+
+    output_json["uav_plane2"] = json::array();
+    for (const auto &line : output_data.uav_plane2) {
+        json entry = json::array();
+        entry.push_back(line.uav_id);
+        for (const auto &p : line.points) {
+            json pa = json::array();
+            pa.push_back(p.lon);
+            pa.push_back(p.lat);
+            pa.push_back(p.alt);
+            entry.push_back(pa);
+        }
+        output_json["uav_plane2"].push_back(entry);
+    }
+
+    output_json["uav_plane3"] = json::array();
+    for (const auto &line : output_data.uav_plane3) {
+        json entry = json::array();
+        entry.push_back(line.uav_id);
+        for (const auto &p : line.points) {
+            json pa = json::array();
+            pa.push_back(p.lon);
+            pa.push_back(p.lat);
+            pa.push_back(p.alt);
+            entry.push_back(pa);
+        }
+        output_json["uav_plane3"].push_back(entry);
+    }
+
+    output_json["using_midway_lines"] = json::array();
+    for (const auto &line : output_data.using_midway_lines) {
+        json entry = json::array();
+        entry.push_back(line.uav_id);
+        entry.push_back(line.segment_id);
+        for (const auto &p : line.points) {
+            json pa = json::array();
+            pa.push_back(p.lon);
+            pa.push_back(p.lat);
+            pa.push_back(p.alt);
+            entry.push_back(pa);
+        }
+        output_json["using_midway_lines"].push_back(entry);
+    }
+
+    return true;
 }

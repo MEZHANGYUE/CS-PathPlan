@@ -37,6 +37,16 @@ struct FlightZone {
     int link_flag = 0;                          // 联结标志或其他自定义数据
 };
 
+// 轨迹行（可用于输入/输出）：
+// - input_json["using_midway_lines"] 的一行
+// - output_json["using_midway_lines"] 的一行
+// 形状为：[uav_id, segment_id, [lon,lat,alt], [lon,lat,alt], ...]
+struct UavTrajectoryLine {
+    int uav_id = 0;
+    int segment_id = 0;
+    std::vector<WGS84Coord> points;
+};
+
 struct InputData
 {
     double distance_points = 0.0;
@@ -55,13 +65,15 @@ struct InputData
     std::vector<int> ready_id;
     std::vector<int> uav_leader_ids;
     std::vector<std::array<int, 3>> uavs_plane_data_list; // [uav_id, segment_id, point_idx]
-    json using_midway_lines = json::array();
+    // 输入历史轨迹（若 input.json 提供 using_midway_lines）
+    std::vector<UavTrajectoryLine> using_midway_lines;
     // input.json 可能提供的“使用中的无人机列表”（为空通常表示使用全部）
     std::vector<int> using_uav_list;
 
     // battle_zone 字段（包含多边形和高度）
     std::vector<FlightZone> battle_zones;
-    json battle_zone_list = json::array();
+    // battle_zone_list：输入可能提供的辅助字段（当前规划逻辑不依赖它），按 int 列表透传解析
+    std::vector<int> battle_zone_list;
     WGS84Coord uav_leader_start_point_wgs84 = {0.0, 0.0, 0.0};
     std::pair<int, std::pair<int, int>> uavs_plane_data;
     bool has_prohibited_zone = false;
@@ -86,17 +98,37 @@ struct InputData
 
 struct OutputData
 {
-    double distance_points;
-    double leader_fly_high;
-    int formation_model;
-    int formation_using;
-    int uav_leader_id;
-    std::pair<double, double> height_list;
-    FlightZone ready_zone;
-    std::vector<WGS84Coord> high_zhandou_point_wgs84;
-    std::vector<WGS84Coord> leader_midway_point_wgs84;
-    WGS84Coord uav_leader_start_point_wgs84 = {0.0, 0.0, 0.0};
-    std::pair<int, std::pair<int, int>> uavs_plane_data;
+    // 这些字段均直接对应 uavPathPlanning.cpp 中构建的 output_json 内容。
+    // 注意：OutputData 本身不包含 json 类型；如需序列化/反序列化，请在 cpp 中做转换。
+
+    // output_json["abnormal_uav_plane"]: [int, ...]
+    std::vector<int> abnormal_uav_plane;
+
+    // output_json["using_uav_list"]: [int, ...]
+    std::vector<int> using_uav_list;
+
+    // output_json["ready_id"]: [int, ...]
+    std::vector<int> ready_id;
+
+    // output_json["midway_point_num"]: [int, ...]
+    std::vector<int> midway_point_num;
+
+    // output_json["leader_show_points"]: [[lon,lat,alt], ...]
+    std::vector<WGS84Coord> leader_show_points;
+
+    // output_json["uav_leader_plane{1,2,3}"]: [[lon,lat,alt], ...]
+    std::vector<WGS84Coord> uav_leader_plane1;
+    std::vector<WGS84Coord> uav_leader_plane2;
+    std::vector<WGS84Coord> uav_leader_plane3;
+
+    // output_json["uav_plane{1,2,3}"]: [[uav_id, [lon,lat,alt], ...], ...]
+    // 这里用 UavTrajectoryLine 统一表达（segment_id 分别固定为 1/2/3）。
+    std::vector<UavTrajectoryLine> uav_plane1;
+    std::vector<UavTrajectoryLine> uav_plane2;
+    std::vector<UavTrajectoryLine> uav_plane3;
+
+    // output_json["using_midway_lines"]: [[uav_id, segment_id, [lon,lat,alt]...], ...]
+    std::vector<UavTrajectoryLine> using_midway_lines;
 };
 // WGS84椭球体参数
 constexpr double WGS84_A = 6378137.0;           // 长半轴 (米)
@@ -198,6 +230,8 @@ public:
     bool runAltitudeOptimization(const std::string &elev_file, json &output_json);
     // 辅助函数
     bool loadData(InputData &input_data, json &input_json);
+    // 将强类型 OutputData 写入 output_json（字段格式与当前约定保持一致）
+    bool outputDataToJson(const OutputData &output_data, json &output_json);
     bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj);
     json generateFollowerTrajectories(const InputData &input_data,
                                       const std::vector<ENUPoint> &Trajectory_ENU,
