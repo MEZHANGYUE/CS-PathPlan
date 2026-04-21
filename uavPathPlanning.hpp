@@ -227,7 +227,7 @@ public:
     // 检查历史/当前航线与 check_prohibited_zone_wgs84 的冲突并输出 abnormal_uav_plane
     bool check_change(const json &input_json, json &output_json);
     //高度优化接口 以 Trajectory_ENU 为主，优化后还要联动 follower
-    bool runAltitudeOptimization(const std::string &elev_file, json &output_json);
+    bool runAltitudeOptimization(const std::string &elev_file, OutputData &output_data);
     // 辅助函数
     bool loadData(InputData &input_data, json &input_json);
     // 将强类型 OutputData 写入 output_json（字段格式与当前约定保持一致）
@@ -250,8 +250,8 @@ public:
                                              double radius, double resolution = 1.0);
 
     // 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
-    void computeTransitionAndRotatePatrol(const ENUPoint& p0, double heading0, double minR, double resolution, 
-                                          const std::vector<ENUPoint>& Patrol_Path, json& output_json);
+    void computeTransitionAndRotatePatrol(const ENUPoint& p0, double heading0, double minR, double resolution,
+                                          const std::vector<ENUPoint>& Patrol_Path, OutputData &output_data);
 
     // 将轨迹信息追加到 output_json 的 using_midway_lines 字段
     void appendTrajectoryToOutput(json &output_json, int uav_id, int segment_id, const std::vector<WGS84Point> &traj);
@@ -326,6 +326,7 @@ private:
     WGS84Point origin_;
     PlannerConfig config_;
     InputData input_data_; // 存储解析后的输入数据，避免重复解析
+    OutputData output_data_; // 存储解析后的输出数据，避免重复解析
     // 提取的高度优化器函数仍在 cpp 中实现为私有方法
     // 现在只输入高程文件路径（例如 .tif），函数直接使用类成员 Trajectory_ENU 进行高度优化
     // bool runAltitudeOptimization(const std::string &elev_file);
@@ -351,10 +352,10 @@ private:
     // Helpers for altitude optimization
     AltitudeParams makeAltitudeParams() const;
     bool optimizeSegmentAltitudeENU(std::vector<ENUPoint> &segment_enu);
-    //  以 output_json 为主，优化后直接回写输出
-    bool optimizeAndApplyOutputSegment(json &output_json, const char *key, int segment_id, bool keep_closed_equal_height);
+    // 以 OutputData 为主，优化后直接回写 OutputData（并同步 using_midway_lines）
+    bool optimizeAndApplyOutputSegment(OutputData &output_data, const char *key, int segment_id, bool keep_closed_equal_height);
     // 联合优化多段路径高度，并支持特定段（如巡逻段）等高约束
-    bool optimizeAndApplyJointSegments(json &output_json, const std::vector<std::string> &keys, const std::vector<int> &segment_ids, int equal_height_segment_idx = -1);
+    bool optimizeAndApplyJointSegments(OutputData &output_data, const std::vector<std::string> &keys, const std::vector<int> &segment_ids, int equal_height_segment_idx = -1);
     bool optimizeHeights(const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
     bool optimizeHeightsGlobalSmooth(const std::vector<double> &input_z, const std::vector<Eigen::Vector3d> &waypoints, const AltitudeParams &p, std::vector<double> &out_z);
 
