@@ -10,6 +10,7 @@ altitude_optimization:
 path_planning:
   patrol_region_shrink_distance: 20.0  #区域内缩距离
   position_misalignment: 100  #无人机定位误差（米）
+  prohibited_zone_conflict_distance: 50.0 #禁飞区冲突判定距离阈值（米）
   min_turning_radius: 300.0 #路径规划时允许的最小转弯半径（米）
   # safe_distance: 50.0 #路径规划中的安全距离 (编队的安全距离) , 改用 formation_distance 参数
   patrol_width: 300.0  #巡逻路径之间的间距

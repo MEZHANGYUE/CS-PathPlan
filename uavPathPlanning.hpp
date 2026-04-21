@@ -194,6 +194,7 @@ public:
             double formation_distance = 50.0;
             int uav_formation_max_row = 8;
             double distance_points = 0.0; // config.yaml -> path_planning.Distance_Points (or distance_points)
+            double prohibited_zone_conflict_distance = 50.0; // 禁飞区冲突判定距离阈值（米）
         } path_planning;
 
         // minimum_snap 轨迹生成参数（config.yaml.minimum_snap）

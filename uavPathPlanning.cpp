@@ -448,6 +448,7 @@ bool UavPathPlanner::loadFromYAML(const std::string &config_path)
             yamlAssignIfPresent(pp, "patrol_mode", cfg.path_planning.patrol_mode);
             yamlAssignIfPresent(pp, "formation_distance", cfg.path_planning.formation_distance);
             yamlAssignIfPresent(pp, "uav_formation_max_row", cfg.path_planning.uav_formation_max_row);
+            yamlAssignIfPresent(pp, "prohibited_zone_conflict_distance", cfg.path_planning.prohibited_zone_conflict_distance);
 
             // 兼容历史字段
             if (pp["Distance_Points"]) {
@@ -3685,7 +3686,7 @@ std::vector<ENUPoint> UavPathPlanner::avoidProhibitedZones(const std::vector<ENU
                 const auto& zone = enu_zones[z];
                 if (seg_max_h < zone.min_h || seg_min_h > zone.max_h) continue;
 
-                if (zone.poly.DistanceTo(segment) < 50) { //距离禁飞区距离小于10,判定为冲突
+                if (zone.poly.DistanceTo(segment) < this->config_.path_planning.prohibited_zone_conflict_distance) { // 判定为冲突的距离阈值（米）
                     intersected_zone_idx = z;
                     break; 
                 }
