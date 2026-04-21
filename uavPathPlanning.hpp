@@ -337,6 +337,15 @@ private:
                                                   const std::string& patrol_mode,
                                                   const std::vector<ENUPoint>& trajectory_enu);
 
+    // 编队结束后：为指定无人机选择一个 battle_zone（通常按 uavs_id 下标映射到 battle_zone_wgs84）。
+    const FlightZone *selectBattleZoneForUav(int uav_id) const;
+
+    // 检查 battle_zone 在给定高度层(target_up, ENU.up)是否可用：
+    // - 高度参数是否有效
+    // - 在该高度层是否与禁飞区(prohibited_zones)水平重叠（且高度范围覆盖该层）
+    // 函数内部会打印检查结果。
+    bool check_battle_zone(int uav_id, const FlightZone &battle_zone, double target_up) const;
+
     // Altitude Optimization Params
     struct AltitudeParams {
         double lambda_smooth = 1.0; // smoothing weight

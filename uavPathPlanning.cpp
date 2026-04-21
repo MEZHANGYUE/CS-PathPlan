@@ -67,6 +67,54 @@ inline bool altitudeRangeOverlap(double a_min, double a_max, double b_min, doubl
     return !(a_max < b_min || b_max < a_min);
 }
 
+inline bool rangeCovers(double v, double lo, double hi) {
+    if (std::isnan(v)) return false;
+    if (std::isnan(lo) || std::isnan(hi)) return false;
+    if (!std::isfinite(lo) && !std::isfinite(hi)) return true;
+    if (!std::isfinite(lo) && std::isfinite(hi)) return v <= hi;
+    if (std::isfinite(lo) && !std::isfinite(hi)) return v >= lo;
+    if (lo <= hi) return (v >= lo && v <= hi);
+    return (v >= hi && v <= lo);
+}
+
+inline Polygon2d makePolygon2dFromWgs84(const std::vector<WGS84Coord> &poly_wgs,
+                                       const WGS84Point &origin,
+                                       UavPathPlanner *planner) {
+    std::vector<Vec2d> pts;
+    pts.reserve(poly_wgs.size());
+    for (const auto &p : poly_wgs) {
+        WGS84Point w{p.lon, p.lat, p.alt};
+        ENUPoint e = planner->wgs84ToENU(w, origin);
+        pts.emplace_back(e.east, e.north);
+    }
+    return Polygon2d(pts);
+}
+
+inline bool polygonsOverlap2D(const Polygon2d &a, const Polygon2d &b) {
+    const auto &ap = a.points();
+    const auto &bp = b.points();
+    if (ap.size() < 3 || bp.size() < 3) return false;
+
+    // 1) any vertex-in-polygon
+    for (const auto &p : ap) {
+        if (b.IsPointIn(p)) return true;
+    }
+    for (const auto &p : bp) {
+        if (a.IsPointIn(p)) return true;
+    }
+
+    // 2) any edge intersection
+    std::vector<Vec2d> intersections;
+    intersections.reserve(4);
+    for (size_t i = 0; i < ap.size(); ++i) {
+        const Vec2d &p1 = ap[i];
+        const Vec2d &p2 = ap[(i + 1) % ap.size()];
+        LineSegment2d seg(p1, p2);
+        if (b.Intersections(seg, &intersections) && !intersections.empty()) return true;
+    }
+    return false;
+}
+
 inline bool parseWGS84PointArray(const json &arr, WGS84Point &out) {
     if (!arr.is_array() || arr.size() < 2 || !arr[0].is_number() || !arr[1].is_number()) {
         return false;
@@ -280,6 +328,72 @@ inline double computeTailHeadingRobust(const std::vector<ENUPoint> &path, double
     return std::atan2(acc.y(), acc.x());
 }
 } // namespace
+
+const FlightZone *UavPathPlanner::selectBattleZoneForUav(int uav_id) const {
+    if (this->input_data_.battle_zones.empty()) return nullptr;
+
+    // Prefer index mapping: uavs_id[i] -> battle_zones[i]
+    for (size_t i = 0; i < this->input_data_.uavs_id.size(); ++i) {
+        if (this->input_data_.uavs_id[i] == uav_id) {
+            if (i < this->input_data_.battle_zones.size()) return &this->input_data_.battle_zones[i];
+            break;
+        }
+    }
+    // Fallback: first battle zone
+    return &this->input_data_.battle_zones.front();
+}
+
+bool UavPathPlanner::check_battle_zone(int uav_id, const FlightZone &battle_zone, double target_up) const {
+    bool height_ok = std::isfinite(target_up);
+    bool poly_ok = (battle_zone.polygon.size() >= 3);
+    bool overlap = false;
+
+    if (!poly_ok) {
+        std::cout << "[BattleZoneCheck] uav_id=" << uav_id
+                  << " zone_id=" << battle_zone.zone_id
+                  << " FAIL: battle_zone polygon invalid (<3 points)." << std::endl;
+        return false;
+    }
+
+    // Build battle polygon in ENU for 2D overlap checks
+    // Note: battle_zone polygon points may have no altitude; we only care about east/north.
+    std::vector<WGS84Coord> battle_poly_wgs = battle_zone.polygon;
+    Polygon2d battle_poly_enu = makePolygon2dFromWgs84(battle_poly_wgs, this->origin_, const_cast<UavPathPlanner *>(this));
+
+    if (!this->input_data_.prohibited_zones.empty()) {
+        for (size_t zi = 0; zi < this->input_data_.prohibited_zones.size(); ++zi) {
+            const auto &pz = this->input_data_.prohibited_zones[zi];
+            if (pz.polygon.size() < 3) continue;
+
+            const double zmin = pz.height_range.first;
+            const double zmax = pz.height_range.second;
+            if (height_ok && !rangeCovers(target_up, zmin, zmax)) {
+                continue; // this altitude layer does not intersect the prohibited zone
+            }
+
+            std::vector<WGS84Coord> pz_poly_wgs = pz.polygon;
+            Polygon2d pz_poly_enu = makePolygon2dFromWgs84(pz_poly_wgs, this->origin_, const_cast<UavPathPlanner *>(this));
+            if (polygonsOverlap2D(battle_poly_enu, pz_poly_enu)) {
+                overlap = true;
+                std::cout << "[BattleZoneCheck] uav_id=" << uav_id
+                          << " zone_id=" << battle_zone.zone_id
+                          << " overlap prohibited_zone idx=" << zi
+                          << " at target_up=" << target_up
+                          << " (pz.height_range=[" << zmin << "," << zmax << "])" << std::endl;
+                break;
+            }
+        }
+    }
+
+    const bool ok = height_ok && !overlap;
+    std::cout << "[BattleZoneCheck] uav_id=" << uav_id
+              << " zone_id=" << battle_zone.zone_id
+              << " target_up=" << target_up
+              << " height_ok=" << (height_ok ? 1 : 0)
+              << " overlap_prohibited=" << (overlap ? 1 : 0)
+              << " => " << (ok ? "OK" : "FAIL") << std::endl;
+    return ok;
+}
 
 // 统一加载 config.yaml（只读一次，其他地方直接用 this->config_ 的参数）
 bool UavPathPlanner::loadFromYAML(const std::string &config_path)
@@ -1848,7 +1962,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     // std::cout << "Final heading: " << final_heading << " rad (" << rad2deg(final_heading) << " deg)" << std::endl;
 
     // 生成并写入跟随者轨迹
-    if (this->input_data_.formation_using == 1) {
+    if (this->input_data_.formation_using == 1) {  //编队模式1   
         try {
             json plane_array = this->generateFollowerTrajectories(this->input_data_, Trajectory_ENU, Trajectory_WGS84);
 
@@ -1938,22 +2052,198 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         this->optimizeAndApplyJointSegments(this->output_data_, keys, seg_ids, 1);
     }
 
-    // ready_id: 需要前往 ready_zone 的无人机。
-    // 参考长机第二/第三段的生成思路，为 ready_id 生成过渡段(2)与巡逻段(3)。
+    // 僚机编队(plane1)执行完后：先决定去 battle_zone_wgs84 还是 ready_zone。
+    // - 输入里有 ready_id 的无人机：直接去 ready_zone（强制）。
+    // - 其它无人机：检查战斗区在当前高度层是否与禁飞区重叠/高度是否有效；不满足则改派去 ready_zone。
     this->output_data_.uav_plane2.clear();
     this->output_data_.uav_plane3.clear();
-    if (!this->input_data_.ready_id.empty() &&
+
+    auto contains_id = [](const std::vector<int> &v, int id) {
+        for (int x : v) if (x == id) return true;
+        return false;
+    };
+    auto append_unique_id_local = [&](std::vector<int> &v, int id) {
+        if (!contains_id(v, id)) v.push_back(id);
+    };
+
+    std::vector<int> final_ready_ids = this->input_data_.ready_id;
+    std::vector<int> battle_ids;
+
+    if (!this->output_data_.uav_plane1.empty()) {
+        for (const auto &line : this->output_data_.uav_plane1) {
+            const int uid = line.uav_id;
+
+            if (contains_id(this->input_data_.ready_id, uid)) {
+                std::cout << "[DestDecide] uav_id=" << uid << " forced to ready_zone (in ready_id)." << std::endl;
+                append_unique_id_local(final_ready_ids, uid);
+                continue;
+            }
+
+            const FlightZone *bz = this->selectBattleZoneForUav(uid);
+            if (bz == nullptr) {
+                std::cout << "[DestDecide] uav_id=" << uid << " no battle_zone_wgs84 provided -> assign to ready_zone." << std::endl;
+                append_unique_id_local(final_ready_ids, uid);
+                continue;
+            }
+
+            // 取 plane1 末点作为当前高度层参考，并按 battle_zone 高度参数生成目标高度
+            if (line.points.size() < 2) {
+                std::cout << "[DestDecide] uav_id=" << uid << " invalid plane1 trajectory -> assign to ready_zone." << std::endl;
+                append_unique_id_local(final_ready_ids, uid);
+                continue;
+            }
+
+            std::vector<WGS84Point> follower_plane1_wgs;
+            follower_plane1_wgs.reserve(line.points.size());
+            for (const auto &pt : line.points) {
+                follower_plane1_wgs.push_back({pt.lon, pt.lat, pt.alt});
+            }
+            std::vector<ENUPoint> follower_plane1_enu = this->wgs84ToENU_Batch(follower_plane1_wgs, this->origin_);
+            if (follower_plane1_enu.size() < 2) {
+                std::cout << "[DestDecide] uav_id=" << uid << " failed to convert plane1 -> assign to ready_zone." << std::endl;
+                append_unique_id_local(final_ready_ids, uid);
+                continue;
+            }
+
+            const ENUPoint p0 = follower_plane1_enu.back();
+            const double battle_relative_h = 0.5 * (bz->height_range.first + bz->height_range.second);
+            const double battle_target_up = p0.up + battle_relative_h;
+
+            const bool battle_ok = this->check_battle_zone(uid, *bz, battle_target_up);
+            if (!battle_ok) {
+                std::cout << "[DestDecide] uav_id=" << uid << " battle_zone check failed -> assign to ready_zone." << std::endl;
+                append_unique_id_local(final_ready_ids, uid);
+                continue;
+            }
+
+            std::cout << "[DestDecide] uav_id=" << uid << " assigned to battle_zone." << std::endl;
+            battle_ids.push_back(uid);
+        }
+    }
+
+    // 先为 battle_ids 生成 plane2/plane3；失败的再回退到 ready_ids。
+    if (!battle_ids.empty()) {
+        for (int rid : battle_ids) {
+            const FlightZone *bz = this->selectBattleZoneForUav(rid);
+            if (bz == nullptr || bz->polygon.size() < 3) {
+                append_unique_id_local(final_ready_ids, rid);
+                continue;
+            }
+
+            const UavTrajectoryLine *follower_line = nullptr;
+            for (const auto &line : this->output_data_.uav_plane1) {
+                if (line.uav_id == rid) { follower_line = &line; break; }
+            }
+            if (follower_line == nullptr || follower_line->points.size() < 2) {
+                append_unique_id_local(final_ready_ids, rid);
+                continue;
+            }
+
+            std::vector<WGS84Point> follower_plane1_wgs;
+            follower_plane1_wgs.reserve(follower_line->points.size());
+            for (const auto &pt : follower_line->points) {
+                follower_plane1_wgs.push_back({pt.lon, pt.lat, pt.alt});
+            }
+            std::vector<ENUPoint> follower_plane1_enu = this->wgs84ToENU_Batch(follower_plane1_wgs, this->origin_);
+            if (follower_plane1_enu.size() < 2) {
+                append_unique_id_local(final_ready_ids, rid);
+                continue;
+            }
+
+            ENUPoint p0 = follower_plane1_enu.back();
+            double heading0 = computeTailHeadingRobust(follower_plane1_enu, final_heading);
+
+            const double battle_relative_h = 0.5 * (bz->height_range.first + bz->height_range.second);
+            const double battle_target_up = p0.up + battle_relative_h;
+            if (!this->check_battle_zone(rid, *bz, battle_target_up)) {
+                append_unique_id_local(final_ready_ids, rid);
+                continue;
+            }
+
+            // battle_zone -> ENU（目标高度层为 battle_target_up）
+            std::vector<WGS84Point> battle_zone_wgs;
+            battle_zone_wgs.reserve(bz->polygon.size());
+            for (const auto &pt : bz->polygon) {
+                battle_zone_wgs.push_back({pt.lon, pt.lat, battle_target_up});
+            }
+            if (battle_zone_wgs.size() < 3) {
+                append_unique_id_local(final_ready_ids, rid);
+                continue;
+            }
+            std::vector<ENUPoint> battle_zone_enu = this->wgs84ToENU_Batch(battle_zone_wgs, this->origin_);
+
+            // 第三段：战斗区域巡逻轨迹
+            std::vector<ENUPoint> battle_patrol = this->computePatrolPathByMode(
+                battle_zone_enu,
+                static_cast<int>(battle_zone_enu.size()),
+                distance,
+                this->config_.path_planning.patrol_mode,
+                follower_plane1_enu);
+
+            if (battle_patrol.empty()) {
+                std::cerr << "battle_id=" << rid << " failed to generate battle patrol path, fallback to ready_zone." << std::endl;
+                append_unique_id_local(final_ready_ids, rid);
+                continue;
+            }
+            for (auto &pt : battle_patrol) pt.up = battle_target_up;
+
+            // 第二段：过渡轨迹
+            ENUPoint p1 = battle_patrol.front();
+            ENUPoint p2 = (battle_patrol.size() >= 2) ? battle_patrol[1] : battle_patrol.front();
+            const double radius = std::max(0.0, this->input_data_.min_turning_radius);
+            const double resolution = (distance > 0.0) ? distance : 300.0;
+            std::vector<ENUPoint> battle_transition = this->generateArcLineArc(p0, heading0, p1, p2, radius, resolution);
+            if (battle_transition.empty()) {
+                std::cerr << "battle_id=" << rid << " failed to generate battle transition path, fallback to ready_zone." << std::endl;
+                append_unique_id_local(final_ready_ids, rid);
+                continue;
+            }
+
+            std::vector<WGS84Point> battle_transition_wgs = this->enuToWGS84_Batch(battle_transition, this->origin_);
+            std::vector<WGS84Point> battle_patrol_wgs = this->enuToWGS84_Batch(battle_patrol, this->origin_);
+
+            upsertUsingMidwayLine(rid, 2, battle_transition_wgs);
+            upsertUsingMidwayLine(rid, 3, battle_patrol_wgs);
+
+            {
+                UavTrajectoryLine line2;
+                line2.uav_id = rid;
+                line2.segment_id = 2;
+                line2.points.reserve(battle_transition_wgs.size());
+                for (const auto &p : battle_transition_wgs) {
+                    line2.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
+                }
+                this->output_data_.uav_plane2.push_back(std::move(line2));
+            }
+            {
+                UavTrajectoryLine line3;
+                line3.uav_id = rid;
+                line3.segment_id = 3;
+                line3.points.reserve(battle_patrol_wgs.size());
+                for (const auto &p : battle_patrol_wgs) {
+                    line3.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
+                }
+                this->output_data_.uav_plane3.push_back(std::move(line3));
+            }
+        }
+    }
+
+    // 再为 final_ready_ids 生成 plane2/plane3
+    if (!final_ready_ids.empty() &&
         this->input_data_.ready_zone.polygon.size() >= 3 &&
         !this->output_data_.uav_plane1.empty()) {
 
-        std::vector<int> ready_ids = this->input_data_.ready_id;
-
         // ready_zone 相对高度：使用 ready_high_list 的平均值
-        double ready_relative_h = 0.0;
-        ready_relative_h = 0.5 * (this->input_data_.ready_zone.height_range.first + this->input_data_.ready_zone.height_range.second);
+        const double ready_relative_h = 0.5 * (this->input_data_.ready_zone.height_range.first + this->input_data_.ready_zone.height_range.second);
 
-        for (int rid : ready_ids) {
-            // 从 uav_plane1 中找到该 ready 无人机第一段轨迹
+        for (int rid : final_ready_ids) {
+            // 如果该机已经生成了 battle plane2/3，则跳过 ready 生成
+            bool already_has_plane2 = false;
+            for (const auto &l2 : this->output_data_.uav_plane2) {
+                if (l2.uav_id == rid) { already_has_plane2 = true; break; }
+            }
+            if (already_has_plane2) continue;
+
             const UavTrajectoryLine *follower_line = nullptr;
             for (const auto &line : this->output_data_.uav_plane1) {
                 if (line.uav_id == rid) {
@@ -1979,12 +2269,10 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             std::vector<ENUPoint> follower_plane1_enu = this->wgs84ToENU_Batch(follower_plane1_wgs, this->origin_);
             if (follower_plane1_enu.size() < 2) continue;
 
-            // 第二段起点与起始航向：取该无人机第一段末点
             ENUPoint p0 = follower_plane1_enu.back();
             double heading0 = computeTailHeadingRobust(follower_plane1_enu, final_heading);
             const double ready_target_up = p0.up + ready_relative_h;
 
-            // ready_zone -> ENU（高度继承第一段末点高度）
             std::vector<WGS84Point> ready_zone_wgs;
             ready_zone_wgs.reserve(this->input_data_.ready_zone.polygon.size());
             for (const auto &pt : this->input_data_.ready_zone.polygon) {
@@ -1997,7 +2285,6 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
 
             std::vector<ENUPoint> ready_zone_enu = this->wgs84ToENU_Batch(ready_zone_wgs, this->origin_);
 
-            // 第三段：准备区域巡逻轨迹（复用长机巡逻生成策略）
             std::vector<ENUPoint> ready_patrol = this->computePatrolPathByMode(
                 ready_zone_enu,
                 static_cast<int>(ready_zone_enu.size()),
@@ -2010,12 +2297,10 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
                 continue;
             }
 
-            // 巡逻段高度设置为 ready_zone 相对高度目标
             for (auto &pt : ready_patrol) {
                 pt.up = ready_target_up;
             }
 
-            // 第二段：过渡轨迹（复用 arc-line-arc 生成）
             ENUPoint p1 = ready_patrol.front();
             ENUPoint p2 = (ready_patrol.size() >= 2) ? ready_patrol[1] : ready_patrol.front();
 
@@ -2031,11 +2316,9 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             std::vector<WGS84Point> ready_transition_wgs = this->enuToWGS84_Batch(ready_transition, this->origin_);
             std::vector<WGS84Point> ready_patrol_wgs = this->enuToWGS84_Batch(ready_patrol, this->origin_);
 
-            // 写入 using_midway_lines（段2/段3）
             upsertUsingMidwayLine(rid, 2, ready_transition_wgs);
             upsertUsingMidwayLine(rid, 3, ready_patrol_wgs);
 
-            // 同时写入可视化数组 uav_plane2 / uav_plane3
             {
                 UavTrajectoryLine line2;
                 line2.uav_id = rid;
@@ -2073,11 +2356,12 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         for (int id : this->input_data_.using_uav_list) append_unique_id(id);
     } else {
         for (int id : this->input_data_.uavs_id) append_unique_id(id);
-        for (int id : this->input_data_.ready_id) append_unique_id(id);
+        for (int id : final_ready_ids) append_unique_id(id);
     }
 
     // ready_id
-    this->output_data_.ready_id = this->input_data_.ready_id;
+    // 输出时回填“最终 ready_id”（包含 battle_zone 不满足而改派的无人机）
+    this->output_data_.ready_id = final_ready_ids;
 
     // leader_show_points：leader_midway_point_wgs84 + high_zhandou_point_wgs84（继承最后高度）
     this->output_data_.leader_show_points.clear();
