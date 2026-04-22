@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <cctype>
 #include "math_util/polygon2d.hpp"
+#include "algorithms/clipper.hpp"
 
 #ifdef HAVE_GDAL
 #include <gdal_priv.h>
@@ -442,6 +443,7 @@ bool UavPathPlanner::loadFromYAML(const std::string &config_path)
 
         if (root["path_planning"]) {
             auto pp = root["path_planning"];
+            yamlAssignIfPresent(pp, "patrol_region_shrink_distance", cfg.path_planning.patrol_region_shrink_distance);
             yamlAssignIfPresent(pp, "position_misalignment", cfg.path_planning.position_misalignment);
             yamlAssignIfPresent(pp, "min_turning_radius", cfg.path_planning.min_turning_radius);
             yamlAssignIfPresent(pp, "patrol_width", cfg.path_planning.patrol_width);
@@ -1560,12 +1562,73 @@ std::vector<ENUPoint> UavPathPlanner::gen_circular_patrol(const std::vector<ENUP
     return patrol_path;
 }
 
+void UavPathPlanner::shrinkPolygon(std::vector<ENUPoint> &polygon, double shrink_meters) const
+{
+    if (shrink_meters <= 0.0) return;
+    if (polygon.size() < 3) return;
+
+    constexpr double kScale = 1000.0; // 与 algorithms/lloydsVoronoiPartition.h 一致
+
+    ClipperLib::Path subj;
+    subj.reserve(polygon.size());
+    for (const auto &pt : polygon) {
+        subj.emplace_back(
+            static_cast<ClipperLib::cInt>(std::llround(pt.east * kScale)),
+            static_cast<ClipperLib::cInt>(std::llround(pt.north * kScale))
+        );
+    }
+
+    ClipperLib::ClipperOffset co;
+    co.AddPath(subj, ClipperLib::jtMiter, ClipperLib::etClosedPolygon);
+
+    ClipperLib::Paths solution;
+    const double offset = -shrink_meters * kScale; // 向内收缩
+    co.Execute(solution, offset);
+
+    if (solution.empty()) {
+        std::cerr << "shrinkPolygon: offset produced empty result (shrink_meters="
+                  << shrink_meters << ")" << std::endl;
+        return;
+    }
+
+    // 若产生多个多边形，取面积绝对值最大的一个
+    size_t best_idx = 0;
+    double best_area = 0.0;
+    for (size_t i = 0; i < solution.size(); ++i) {
+        const double a = std::abs(ClipperLib::Area(solution[i]));
+        if (a > best_area) {
+            best_area = a;
+            best_idx = i;
+        }
+    }
+
+    const double keep_up = polygon.empty() ? 0.0 : polygon.front().up;
+    std::vector<ENUPoint> out;
+    out.reserve(solution[best_idx].size());
+    for (const auto &ipt : solution[best_idx]) {
+        ENUPoint p;
+        p.east = static_cast<double>(ipt.X) / kScale;
+        p.north = static_cast<double>(ipt.Y) / kScale;
+        p.up = keep_up;
+        out.push_back(p);
+    }
+
+    if (out.size() < 3) {
+        std::cerr << "shrinkPolygon: shrunk polygon has <3 points, keep original (points="
+                  << out.size() << ")" << std::endl;
+        return;
+    }
+
+    polygon.swap(out);
+}
+
 std::vector<ENUPoint> UavPathPlanner::computePatrolPathByMode(const std::vector<ENUPoint>& patrol_zone,
                                                               double distance,
                                                               const std::string& patrol_mode,
                                                               const std::vector<ENUPoint>& trajectory_enu)
 {
     std::vector<ENUPoint> patrol_path;
+    std::vector<ENUPoint> shrunk_zone = patrol_zone;
     if (patrol_zone.size() < 3) {
         std::cerr << "computePatrolPathByMode failed: patrol_zone.size() < 3 (size="
                   << patrol_zone.size() << ")" << std::endl;
@@ -1578,24 +1641,24 @@ std::vector<ENUPoint> UavPathPlanner::computePatrolPathByMode(const std::vector<
     }
     std::transform(mode.begin(), mode.end(), mode.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-
+    shrinkPolygon(shrunk_zone, this->config_.path_planning.patrol_region_shrink_distance); // 先对巡逻区域进行适当收缩，避免生成的路径过于贴近边界
     if (mode == "SINGLE") {
-        patrol_path = this->gen_single_patrol(patrol_zone, distance, trajectory_enu);
+        patrol_path = this->gen_single_patrol(shrunk_zone, distance, trajectory_enu);
     } else if (mode == "BOW") {
-        patrol_path = this->gen_bow_patrol(patrol_zone, distance, trajectory_enu);
+        patrol_path = this->gen_bow_patrol(shrunk_zone, distance, trajectory_enu);
         if (patrol_path.empty()) {
             std::cerr << "patrol_mode='BOW' is not implemented yet, fallback to SINGLE." << std::endl;
-            patrol_path = this->gen_single_patrol(patrol_zone, distance, trajectory_enu);
+            patrol_path = this->gen_single_patrol(shrunk_zone, distance, trajectory_enu);
         }
     } else if (mode == "CIRCULAR") {
-        patrol_path = this->gen_circular_patrol(patrol_zone, distance, trajectory_enu);
+        patrol_path = this->gen_circular_patrol(shrunk_zone, distance, trajectory_enu);
         if (patrol_path.empty()) {
             std::cerr << "patrol_mode='CIRCULAR' is not implemented yet, fallback to SINGLE." << std::endl;
-            patrol_path = this->gen_single_patrol(patrol_zone, distance, trajectory_enu);
+            patrol_path = this->gen_single_patrol(shrunk_zone, distance, trajectory_enu);
         }
     } else {
         std::cerr << "Unknown patrol_mode='" << mode << "', fallback to SINGLE." << std::endl;
-        patrol_path = this->gen_single_patrol(patrol_zone, distance, trajectory_enu);
+        patrol_path = this->gen_single_patrol(shrunk_zone, distance, trajectory_enu);
     }
 
     return patrol_path;

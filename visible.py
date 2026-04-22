@@ -269,6 +269,53 @@ def extract_prohibited_zones(data):
                     })
     return zones
 
+
+def _extract_polygon_points(raw):
+    """将多种点格式归一化为 [(x,y), ...]。"""
+    pts = []
+    if not isinstance(raw, list):
+        return pts
+    for p in raw:
+        if isinstance(p, (list, tuple)) and len(p) >= 2 and isinstance(p[0], (int, float)) and isinstance(p[1], (int, float)):
+            pts.append((p[0], p[1]))
+        elif isinstance(p, dict):
+            if 'lat' in p and 'lng' in p:
+                pts.append((p.get('lng'), p.get('lat')))
+            elif 'latitude' in p and 'longitude' in p:
+                pts.append((p.get('longitude'), p.get('latitude')))
+            elif 'x' in p and 'y' in p:
+                pts.append((p.get('x'), p.get('y')))
+    return pts
+
+
+def extract_polygons(data, key):
+    """从 JSON 中提取多边形列表。
+
+    支持两种结构：
+    - key: [[x,y], [x,y], ...] （单个多边形）
+    - key: [ [[x,y],...], [[x,y],...], ... ] （多个多边形）
+
+    返回: [ [(x,y),...], ... ]
+    """
+    if not isinstance(data, dict) or key not in data:
+        return []
+    raw = data.get(key)
+    if not isinstance(raw, list) or not raw:
+        return []
+
+    # 单个 polygon: [[x,y],...]
+    if isinstance(raw[0], (list, tuple)) and len(raw[0]) >= 2 and isinstance(raw[0][0], (int, float)):
+        pts = _extract_polygon_points(raw)
+        return [pts] if pts else []
+
+    # 多个 polygon: [ [[x,y],...], ... ]
+    polys = []
+    for poly in raw:
+        pts = _extract_polygon_points(poly)
+        if pts:
+            polys.append(pts)
+    return polys
+
 def extract_all_plane_trajectories(data, prefix_regex=r'^uav_plane'):
     """解析 JSON 中所有以 uav_plane 开头的键，返回列表 [(id, [(lon,lat), ...]), ...]
 
@@ -333,13 +380,16 @@ def extract_all_leader_trajectories(data, prefix_regex=r'^uav_leader_plane'):
 
     return leader_trajs
 
-def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, prohibited_zones=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True, plot_3d=None, bg_img=None, bg_extent=None, bg_cmap='gray', elevation_data=None, elevation_extent=None):
+def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None, prohibited_zones=None, battle_zones=None, ready_zone=None, high_zhandou_zone=None, title="Path and Trajectory Visualization", save_path=None, show_plot=True, plot_3d=None, bg_img=None, bg_extent=None, bg_cmap='gray', elevation_data=None, elevation_extent=None):
     """绘制路径点、leader 轨迹（可选）以及多条 plane 轨迹（plane_trajs 为 [(id, [(lon,lat),...]), ...]）。
 
     - waypoints: 列表 [(lon,lat), ...]
     - leader_traj: 列表 [(lon,lat), ...]
     - plane_trajs: 列表 [(id, [(lon,lat), ...]), ...]
     - prohibited_zones: 列表 [{'polygon': [[lon,lat],...], 'height_range': [min, max]}, ...]
+    - battle_zones: 列表 [ [(lon,lat),...], ...]
+    - ready_zone: 单个区域 [(lon,lat), ...]
+    - high_zhandou_zone: 单个区域 [(lon,lat), ...]
     """
     # 自动检测是否需要 3D 绘图：如果任何坐标包含第三维度，则切换为 3D
     need_3d = False
@@ -503,6 +553,37 @@ def plot_path_and_trajectory(waypoints=None, leader_traj=None, plane_trajs=None,
                 try:
                     ax.text(cx, cy, "No Fly", color='red', ha='center', va='center', fontsize=8, fontweight='bold')
                 except: pass
+
+    # 绘制 battle/ready/zhandou 区域（按需求：只绘制二维，不在 3D 图里画这三类区域）
+    if (not need_3d) and (battle_zones or ready_zone or high_zhandou_zone):
+        from matplotlib.patches import Polygon
+
+        def draw_flat_polygons(polys, facecolor, edgecolor, label, text=None):
+            if not polys:
+                return
+            added = False
+            for pts in polys:
+                if not pts:
+                    continue
+                use_label = label if not added else None
+                poly = Polygon(pts, closed=True, facecolor=facecolor, edgecolor=edgecolor, alpha=0.15, label=use_label)
+                ax.add_patch(poly)
+
+                if text:
+                    try:
+                        cx = sum(p[0] for p in pts) / len(pts)
+                        cy = sum(p[1] for p in pts) / len(pts)
+                        ax.text(cx, cy, text, color=edgecolor, ha='center', va='center', fontsize=8, fontweight='bold')
+                    except Exception:
+                        pass
+
+                added = True
+
+        # battle_zone_wgs84: 可能是多个 polygon
+        draw_flat_polygons(battle_zones, facecolor='orange', edgecolor='orange', label='battle zone', text='battle zone')
+        # ready_zone/high_zhandou_point_wgs84: 通常是单个 polygon
+        draw_flat_polygons([ready_zone] if ready_zone else None, facecolor='green', edgecolor='green', label='ready zone', text='ready zone')
+        draw_flat_polygons([high_zhandou_zone] if high_zhandou_zone else None, facecolor='purple', edgecolor='purple', label='zhandou zone', text='zhandou zone')
 
     # 绘制背景高程图（如果提供）
     # Modified: Use elevation_data (OVR) if available and crop to path range for 2D
@@ -849,6 +930,16 @@ def main(file_path, mode='both'):
     prohibited_zones = extract_prohibited_zones(input_data)
     print(f"Found {len(prohibited_zones)} prohibited zones")
 
+    # 额外区域：battle_zone_wgs84 / ready_zone / high_zhandou_point_wgs84
+    battle_zones = extract_polygons(input_data, 'battle_zone_wgs84')
+    ready_zone_list = extract_polygons(input_data, 'ready_zone')
+    high_zhandou_list = extract_polygons(input_data, 'high_zhandou_point_wgs84')
+    ready_zone = ready_zone_list[0] if ready_zone_list else None
+    high_zhandou_zone = high_zhandou_list[0] if high_zhandou_list else None
+    print(f"Found {len(battle_zones)} battle zones")
+    print(f"Found {1 if ready_zone else 0} ready zone")
+    print(f"Found {1 if high_zhandou_zone else 0} high_zhandou zone")
+
     if not waypoints and not leader_traj and not plane_trajs:
         print("No valid waypoint or trajectory data found")
         return
@@ -899,6 +990,9 @@ def main(file_path, mode='both'):
             leader_traj=leader_traj if leader_traj else None, 
             plane_trajs=plane_trajs, 
             prohibited_zones=prohibited_zones, 
+            battle_zones=battle_zones,
+            ready_zone=ready_zone,
+            high_zhandou_zone=high_zhandou_zone,
             title=f"{uav_id} Path Planning and Execution Trajectory ({suffix.upper()})", 
             save_path=save_path, 
             plot_3d=is_3d, 

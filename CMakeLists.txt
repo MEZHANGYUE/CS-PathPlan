@@ -17,6 +17,7 @@ find_package(GDAL)
 add_library(algo
     uavPathPlanning.cpp
     elevation_cost_map.cpp
+    algorithms/clipper.cpp
 )
 
 add_library(math_util 

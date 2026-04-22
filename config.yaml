@@ -8,7 +8,7 @@ altitude_optimization:
   safe_distance: 50.0 #相对于地形的最小安全垂直距离（米）
 
 path_planning:
-  patrol_region_shrink_distance: 20.0  #区域内缩距离
+  patrol_region_shrink_distance: 200.0  #区域内缩距离
   position_misalignment: 100  #无人机定位误差（米）
   prohibited_zone_conflict_distance: 50.0 #禁飞区冲突判定距离阈值（米）
   min_turning_radius: 300.0 #路径规划时允许的最小转弯半径（米）
@@ -24,7 +24,7 @@ minimum_snap:
   # 多项式导数阶数（d_order）
   order: 2
   # 每个路径点的 0 速度约束权重（经过路径点减速）
-  vel_zero_weight: 0.01
+  vel_zero_weight: 0.02
   # 偏离直线段惩罚权重
   path_weight: 0.0000001
   # 平均巡航速度 (m/s)

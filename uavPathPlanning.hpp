@@ -191,6 +191,7 @@ public:
             double min_turning_radius = 0.0;
             double patrol_width = 0.0;
             std::string patrol_mode = "BOW";
+            double patrol_region_shrink_distance = 0.0; // 巡逻区域内缩距离（米），0 表示不内缩
             double formation_distance = 50.0;
             int uav_formation_max_row = 8;
             double distance_points = 0.0; // config.yaml -> path_planning.Distance_Points (or distance_points)
@@ -358,6 +359,9 @@ private:
     std::vector<ENUPoint> gen_circular_patrol(const std::vector<ENUPoint> &patrol_zone,
                                               double distance,
                                               const std::vector<ENUPoint> &trajectory_enu);
+
+    // 巡逻区域内缩（仅对 east/north 做 2D 内缩；up 保持不变）
+    void shrinkPolygon(std::vector<ENUPoint> &polygon, double shrink_meters) const;
 
     // 编队结束后：为指定无人机选择一个 battle_zone（通常按 uavs_id 下标映射到 battle_zone_wgs84）。
     const FlightZone *selectBattleZoneForUav(int uav_id) const;
