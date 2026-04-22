@@ -733,75 +733,108 @@ std::vector<ENUPoint> UavPathPlanner::generateArcLineArc(const ENUPoint &p0, dou
         else return std::make_pair(ay, -ax); // -90
     };
 
-    // Try combinations of left/right circle sides to find a feasible tangent
+    // Try combinations of left/right turn directions to find a feasible tangent
+    // s = +1 => left-turn (CCW), s = -1 => right-turn (CW)
     bool found = false;
     std::pair<double,double> C1, C2; // centers
     std::pair<double,double> T1, T2; // tangent points
     int best_s0 = 0;
     int best_s1 = 0;
+    double best_cost = std::numeric_limits<double>::infinity();
 
     auto tangent_at = [&](double theta, int sign)->std::pair<double,double>{
         if (sign > 0) return std::make_pair(-sin(theta), cos(theta));
         else return std::make_pair(sin(theta), -cos(theta));
     };
 
-    // Determine which side p1 is relative to p0's heading
-    double dx_chk = p1.east - p0.east;
-    double dy_chk = p1.north - p0.north;
-    double cross_chk = std::cos(h0) * dy_chk - std::sin(h0) * dx_chk;
-    int forced_s0 = (cross_chk >= 0) ? 1 : -1;
+    struct TangentLine { std::pair<double,double> t1, t2; };
 
-    for (int s0 : {forced_s0}) {
+    for (int s0 : {1, -1}) {
         auto n0 = rotate90(std::cos(h0), std::sin(h0), s0);
         std::pair<double,double> c1 = {p0.east + radius * n0.first, p0.north + radius * n0.second};
-        int s1 = s0;
-        {
+
+        for (int s1 : {1, -1}) {
             auto n1 = rotate90(std::cos(h1), std::sin(h1), s1);
             std::pair<double,double> c2 = {p1.east + radius * n1.first, p1.north + radius * n1.second};
 
-            double vx = c2.first - c1.first; double vy = c2.second - c1.second;
+            double vx = c2.first - c1.first;
+            double vy = c2.second - c1.second;
             double d = std::hypot(vx, vy);
-            
-            if (d >= 1e-6) {
-                struct TangentLine { std::pair<double,double> t1, t2; };
-                std::vector<TangentLine> candidates;
+            if (d < 1e-6) continue;
 
-                // External tangents only (since s1 == s0)
+            std::vector<TangentLine> candidates;
+
+            if (s0 == s1) {
+                // External tangents (equal radius)
                 for (int sign : {1, -1}) {
-                    auto vperp = rotate90(vx/d, vy/d, sign);
-                    candidates.push_back({ 
+                    auto vperp = rotate90(vx / d, vy / d, sign);
+                    candidates.push_back({
                         {c1.first + radius * vperp.first, c1.second + radius * vperp.second},
                         {c2.first + radius * vperp.first, c2.second + radius * vperp.second}
                     });
                 }
+            } else {
+                // Internal tangents (equal radius) exist only when circles are separated enough
+                if (d <= 2.0 * radius + 1e-9) continue;
+                double phi = std::atan2(vy, vx);
+                double alpha = std::acos((2.0 * radius) / d);
+                for (int sign : {1, -1}) {
+                    double ang = phi + sign * alpha;
+                    double ux = std::cos(ang);
+                    double uy = std::sin(ang);
+                    candidates.push_back({
+                        {c1.first + radius * ux, c1.second + radius * uy},
+                        {c2.first - radius * ux, c2.second - radius * uy}
+                    });
+                }
+            }
 
-                for (const auto& line : candidates) {
-                     double lx = line.t2.first - line.t1.first;
-                     double ly = line.t2.second - line.t1.second;
-                     double l_len = std::hypot(lx, ly);
-                     if (l_len < 1e-6) continue;
-                     double l_dx = lx / l_len;
-                     double l_dy = ly / l_len;
+            for (const auto &line : candidates) {
+                double lx = line.t2.first - line.t1.first;
+                double ly = line.t2.second - line.t1.second;
+                double l_len = std::hypot(lx, ly);
+                if (l_len < 1e-6) continue;
+                double l_dx = lx / l_len;
+                double l_dy = ly / l_len;
 
-                     // Check alignment at T1
-                     double theta_t1 = std::atan2(line.t1.second - c1.second, line.t1.first - c1.first);
-                     auto tan1 = tangent_at(theta_t1, s0);
-                     if (tan1.first * l_dx + tan1.second * l_dy < 0.99) continue;
+                // Check alignment at T1
+                double theta_t1 = std::atan2(line.t1.second - c1.second, line.t1.first - c1.first);
+                auto tan1 = tangent_at(theta_t1, s0);
+                if (tan1.first * l_dx + tan1.second * l_dy < 0.99) continue;
 
-                     // Check alignment at T2
-                     double theta_t2 = std::atan2(line.t2.second - c2.second, line.t2.first - c2.first);
-                     auto tan2 = tangent_at(theta_t2, s1);
-                     if (tan2.first * l_dx + tan2.second * l_dy < 0.99) continue;
+                // Check alignment at T2
+                double theta_t2 = std::atan2(line.t2.second - c2.second, line.t2.first - c2.first);
+                auto tan2 = tangent_at(theta_t2, s1);
+                if (tan2.first * l_dx + tan2.second * l_dy < 0.99) continue;
 
-                     // Found valid
-                     found = true;
-                     C1 = c1; C2 = c2; T1 = line.t1; T2 = line.t2;
-                     best_s0 = s0; best_s1 = s1;
-                     break;
+                // Evaluate total cost (arc lengths + line)
+                double theta0 = std::atan2(p0.north - c1.second, p0.east - c1.first);
+                double delta0 = theta_t1 - theta0;
+                while (delta0 <= -M_PI) delta0 += 2 * M_PI;
+                while (delta0 > M_PI) delta0 -= 2 * M_PI;
+                if (s0 > 0 && delta0 < 0) delta0 += 2 * M_PI;
+                if (s0 < 0 && delta0 > 0) delta0 -= 2 * M_PI;
+
+                double theta1 = std::atan2(p1.north - c2.second, p1.east - c2.first);
+                double delta1 = theta1 - theta_t2;
+                while (delta1 <= -M_PI) delta1 += 2 * M_PI;
+                while (delta1 > M_PI) delta1 -= 2 * M_PI;
+                if (s1 > 0 && delta1 < 0) delta1 += 2 * M_PI;
+                if (s1 < 0 && delta1 > 0) delta1 -= 2 * M_PI;
+
+                double cost = std::fabs(delta0) * radius + l_len + std::fabs(delta1) * radius;
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    found = true;
+                    C1 = c1;
+                    C2 = c2;
+                    T1 = line.t1;
+                    T2 = line.t2;
+                    best_s0 = s0;
+                    best_s1 = s1;
                 }
             }
         }
-        if (found) break;
     }
 
     if (!found) {
