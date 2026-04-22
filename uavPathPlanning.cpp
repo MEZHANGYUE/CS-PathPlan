@@ -1502,7 +1502,7 @@ bool UavPathPlanner::optimizeHeightsGlobalSmooth(const std::vector<double> &inpu
     std::cerr << "AltitudeOptimizer: second pass (global smoothing) took " << elapsed.count() << "s\n";
     return true;
 }
-// patrol_mode 支持"CIRCULAR"（回形）和"BOW"（弓形）,"SINGLE"(原始的单圈巡逻)
+// patrol_mode 支持"CIRCULAR"（回形）和"BOW"（弓形）,"SINGLE"(原始的单圈巡逻)  ,传入的区域 patrol_zone 已经经过收缩处理
 std::vector<ENUPoint> UavPathPlanner::gen_single_patrol(const std::vector<ENUPoint> &patrol_zone,
                                                         double distance,
                                                         const std::vector<ENUPoint> &trajectory_enu)
@@ -1577,10 +1577,396 @@ std::vector<ENUPoint> UavPathPlanner::gen_bow_patrol(const std::vector<ENUPoint>
                                                      double distance,
                                                      const std::vector<ENUPoint> &trajectory_enu)
 {
-    (void)patrol_zone;
-    (void)distance;
-    (void)trajectory_enu;
     std::vector<ENUPoint> patrol_path;
+    if (patrol_zone.size() < 3) {
+        std::cerr << "gen_bow_patrol failed: patrol_zone.size() < 3 (size=" << patrol_zone.size() << ")" << std::endl;
+        return patrol_path;
+    }
+
+    const double patrol_width = this->config_.path_planning.patrol_width;
+    if (!(patrol_width > 1e-6)) {
+        std::cerr << "gen_bow_patrol failed: invalid patrol_width=" << patrol_width << std::endl;
+        return patrol_path;
+    }
+
+    const double resolution = (distance > 1e-6) ? distance : 1.0;
+    const double keep_up = !trajectory_enu.empty() ? trajectory_enu.back().up : patrol_zone.front().up;
+
+    // Build polygon (already shrunk by caller)
+    std::vector<Vec2d> poly_pts;
+    poly_pts.reserve(patrol_zone.size());
+    for (const auto &p : patrol_zone) {
+        poly_pts.emplace_back(p.east, p.north);
+    }
+    Polygon2d poly(poly_pts);
+    if (poly.points().size() < 3) {
+        std::cerr << "gen_bow_patrol failed: Polygon2d has <3 points." << std::endl;
+        return patrol_path;
+    }
+
+    // 1) Scan along polygon long-edge direction (min-area bounding box).
+    Box2d mab = poly.MinAreaBoundingBox();
+    double scan_heading = mab.heading();
+    if (mab.width() > mab.length()) {
+        scan_heading += M_PI_2;
+    }
+    while (scan_heading > M_PI) scan_heading -= 2.0 * M_PI;
+    while (scan_heading <= -M_PI) scan_heading += 2.0 * M_PI;
+
+    const Vec2d d = Vec2d::CreateUnitVec2d(scan_heading);
+    const Vec2d n(-d.y(), d.x());
+    const Vec2d origin(mab.center_x(), mab.center_y());
+
+    auto toLocal = [&](const Vec2d &p) -> Vec2d {
+        Vec2d q = p - origin;
+        return Vec2d(q.InnerProd(d), q.InnerProd(n));
+    };
+
+    auto toWorld = [&](const Vec2d &pl) -> Vec2d {
+        return origin + d * pl.x() + n * pl.y();
+    };
+
+    auto appendPoint = [&](const ENUPoint &p) {
+        if (!patrol_path.empty()) {
+            const ENUPoint &last = patrol_path.back();
+            const double dx = p.east - last.east;
+            const double dy = p.north - last.north;
+            const double dz = p.up - last.up;
+            if (dx * dx + dy * dy + dz * dz < 1e-12) return;
+        }
+        patrol_path.push_back(p);
+    };
+
+    auto appendLine = [&](const ENUPoint &a, const ENUPoint &b) {
+        const double dx = b.east - a.east;
+        const double dy = b.north - a.north;
+        const double dz = b.up - a.up;
+        const double len = std::hypot(dx, dy);
+        const int steps = std::max(1, static_cast<int>(std::ceil(len / resolution)));
+        for (int i = 0; i <= steps; ++i) {
+            const double t = static_cast<double>(i) / static_cast<double>(steps);
+            ENUPoint p{a.east + t * dx, a.north + t * dy, a.up + t * dz};
+            appendPoint(p);
+        }
+    };
+
+    auto appendUTurnArcLocal = [&](const Vec2d &p0_l, int dir_sign, const Vec2d &p1_l, const ENUPoint &p0_world_ref) {
+        // Rounded U-turn: half circle between scanlines at x = p0_l.x().
+        // p0_l and p1_l are expected to differ mainly in y.
+        const double x_c = p0_l.x();
+        const double y_c = 0.5 * (p0_l.y() + p1_l.y());
+        const double r = 0.5 * std::abs(p1_l.y() - p0_l.y());
+        if (!(r > 1e-6)) {
+            return;
+        }
+
+        const double theta0 = std::atan2(p0_l.y() - y_c, p0_l.x() - x_c);
+        const double theta1_raw = std::atan2(p1_l.y() - y_c, p1_l.x() - x_c);
+
+        // Decide CW/CCW so that tangent at start matches dir_sign.
+        const Vec2d tan_ccw(-std::sin(theta0), std::cos(theta0));
+        const bool ccw = (tan_ccw.x() * static_cast<double>(dir_sign) > 0.0);
+
+        double theta1 = theta1_raw;
+        double delta = 0.0;
+        if (ccw) {
+            while (theta1 < theta0) theta1 += 2.0 * M_PI;
+            delta = theta1 - theta0;
+        } else {
+            while (theta1 > theta0) theta1 -= 2.0 * M_PI;
+            delta = theta1 - theta0;
+        }
+
+        const double arc_len = std::abs(delta) * r;
+        const int steps = std::max(1, static_cast<int>(std::ceil(arc_len / resolution)));
+        for (int i = 1; i <= steps; ++i) {
+            const double t = static_cast<double>(i) / static_cast<double>(steps);
+            const double theta = theta0 + delta * t;
+            Vec2d pl(x_c + r * std::cos(theta), y_c + r * std::sin(theta));
+            Vec2d pw = toWorld(pl);
+            ENUPoint p{pw.x(), pw.y(), p0_world_ref.up};
+            appendPoint(p);
+        }
+    };
+
+    struct OrientedSeg {
+        Vec2d a_w;
+        Vec2d b_w;
+        double xmin_l = 0.0;
+        double xmax_l = 0.0;
+        double y_l = 0.0;
+    };
+
+    // Determine scanline range in local frame
+    double min_x = std::numeric_limits<double>::infinity();
+    double max_x = -std::numeric_limits<double>::infinity();
+    double min_y = std::numeric_limits<double>::infinity();
+    double max_y = -std::numeric_limits<double>::infinity();
+    for (const auto &pt : poly.points()) {
+        Vec2d pl = toLocal(pt);
+        min_x = std::min(min_x, pl.x());
+        max_x = std::max(max_x, pl.x());
+        min_y = std::min(min_y, pl.y());
+        max_y = std::max(max_y, pl.y());
+    }
+    if (!(std::isfinite(min_x) && std::isfinite(max_x) && std::isfinite(min_y) && std::isfinite(max_y))) {
+        std::cerr << "gen_bow_patrol failed: invalid polygon bounds." << std::endl;
+        return patrol_path;
+    }
+
+    const double margin = std::max(patrol_width * 2.0, 10.0);
+    const double x0 = min_x - margin;
+    const double x1 = max_x + margin;
+
+    // Extra scanline rule (towards max_y side):
+    // if remaining margin to top edge + shrink_distance > patrol_width,
+    // add one more scanline by expanding the already-shrunk polygon outward.
+    const double shrink_dist = this->config_.path_planning.patrol_region_shrink_distance;
+    bool need_extra_scanline = false;
+    Polygon2d expanded_poly;
+    if (shrink_dist > 1e-6) {
+        const double k = std::floor((max_y - min_y) / patrol_width);
+        const double last_y = min_y + k * patrol_width;
+        const double remain = max_y - last_y;
+        if (remain + shrink_dist > patrol_width + 1e-6) {
+            need_extra_scanline = true;
+
+            auto expandPolygon = [&](const std::vector<ENUPoint> &polygon, double expand_meters) -> std::vector<ENUPoint> {
+                std::vector<ENUPoint> out;
+                if (!(expand_meters > 0.0) || polygon.size() < 3) return out;
+
+                constexpr double kScale = 1000.0;
+                ClipperLib::Path subj;
+                subj.reserve(polygon.size());
+                for (const auto &pt : polygon) {
+                    subj.emplace_back(
+                        static_cast<ClipperLib::cInt>(std::llround(pt.east * kScale)),
+                        static_cast<ClipperLib::cInt>(std::llround(pt.north * kScale))
+                    );
+                }
+
+                ClipperLib::ClipperOffset co;
+                co.AddPath(subj, ClipperLib::jtMiter, ClipperLib::etClosedPolygon);
+                ClipperLib::Paths solution;
+                const double offset = expand_meters * kScale;
+                co.Execute(solution, offset);
+                if (solution.empty()) return out;
+
+                size_t best_idx = 0;
+                double best_area = 0.0;
+                for (size_t i = 0; i < solution.size(); ++i) {
+                    const double a = std::abs(ClipperLib::Area(solution[i]));
+                    if (a > best_area) {
+                        best_area = a;
+                        best_idx = i;
+                    }
+                }
+
+                out.reserve(solution[best_idx].size());
+                for (const auto &ipt : solution[best_idx]) {
+                    ENUPoint p;
+                    p.east = static_cast<double>(ipt.X) / kScale;
+                    p.north = static_cast<double>(ipt.Y) / kScale;
+                    p.up = keep_up;
+                    out.push_back(p);
+                }
+                return out;
+            };
+
+            std::vector<ENUPoint> expanded_zone = expandPolygon(patrol_zone, shrink_dist);
+            if (expanded_zone.size() >= 3) {
+                std::vector<Vec2d> epts;
+                epts.reserve(expanded_zone.size());
+                for (const auto &p : expanded_zone) {
+                    epts.emplace_back(p.east, p.north);
+                }
+                expanded_poly = Polygon2d(epts);
+            } else {
+                need_extra_scanline = false;
+            }
+        }
+    }
+
+    bool has_prev = false;
+    ENUPoint prev_end{};
+    Vec2d prev_end_l{};
+    int prev_dir_sign = +1;
+
+    // 2) Cover-all: keep all overlap segments per scanline.
+    const double scan_y_max = need_extra_scanline ? (max_y + patrol_width + 1e-6) : (max_y + 1e-6);
+    for (double y = min_y; y <= scan_y_max; y += patrol_width) {
+        Vec2d p_start_w = toWorld(Vec2d(x0, y));
+        Vec2d p_end_w = toWorld(Vec2d(x1, y));
+        LineSegment2d scan_seg(p_start_w, p_end_w);
+
+        const bool use_expanded = (need_extra_scanline && (y > max_y + 1e-6));
+        std::vector<LineSegment2d> overlaps = use_expanded ? expanded_poly.GetAllOverlaps(scan_seg)
+                                                           : poly.GetAllOverlaps(scan_seg);
+        // For the extra scanline, we only extend outward in the scanline-spacing direction (local y).
+        // Do NOT extend the segment length along the scan direction: trim overlaps back to the shrunk
+        // polygon's local x-range [min_x, max_x].
+        if (use_expanded && !overlaps.empty()) {
+            std::vector<LineSegment2d> trimmed;
+            trimmed.reserve(overlaps.size());
+            for (const auto &seg : overlaps) {
+                const Vec2d a = seg.start();
+                const Vec2d b = seg.end();
+                const Vec2d al = toLocal(a);
+                const Vec2d bl = toLocal(b);
+                double sx0 = std::min(al.x(), bl.x());
+                double sx1 = std::max(al.x(), bl.x());
+                const double ix0 = std::max(sx0, min_x);
+                const double ix1 = std::min(sx1, max_x);
+                if (ix1 - ix0 <= 1e-6) continue;
+                Vec2d ta_w = toWorld(Vec2d(ix0, y));
+                Vec2d tb_w = toWorld(Vec2d(ix1, y));
+                trimmed.emplace_back(ta_w, tb_w);
+            }
+            overlaps.swap(trimmed);
+        }
+        if (overlaps.empty()) {
+            continue;
+        }
+
+        std::vector<OrientedSeg> row;
+        row.reserve(overlaps.size());
+        for (const auto &seg : overlaps) {
+            const Vec2d a = seg.start();
+            const Vec2d b = seg.end();
+            Vec2d al = toLocal(a);
+            Vec2d bl = toLocal(b);
+            OrientedSeg os;
+            os.a_w = a;
+            os.b_w = b;
+            os.xmin_l = std::min(al.x(), bl.x());
+            os.xmax_l = std::max(al.x(), bl.x());
+            os.y_l = y;
+            row.push_back(os);
+        }
+
+        // Determine snake direction for this row
+        const int row_idx = static_cast<int>(std::llround((y - min_y) / patrol_width));
+        const bool forward = (row_idx % 2 == 0);
+        const int dir_sign = forward ? +1 : -1;
+
+        std::sort(row.begin(), row.end(), [&](const OrientedSeg &s1, const OrientedSeg &s2) {
+            if (forward) {
+                return s1.xmin_l < s2.xmin_l;
+            }
+            return s1.xmax_l > s2.xmax_l;
+        });
+
+        auto segStartEnd = [&](const OrientedSeg &s) -> std::pair<ENUPoint, ENUPoint> {
+            Vec2d al = toLocal(s.a_w);
+            Vec2d bl = toLocal(s.b_w);
+            Vec2d start_w = s.a_w;
+            Vec2d end_w = s.b_w;
+            if (dir_sign > 0) {
+                if (al.x() > bl.x()) {
+                    start_w = s.b_w;
+                    end_w = s.a_w;
+                }
+            } else {
+                if (al.x() < bl.x()) {
+                    start_w = s.b_w;
+                    end_w = s.a_w;
+                }
+            }
+            ENUPoint s0{start_w.x(), start_w.y(), keep_up};
+            ENUPoint s1p{end_w.x(), end_w.y(), keep_up};
+            return {s0, s1p};
+        };
+
+        // 3) Rounded connection between rows (U-turn arc); do not close the curve for now.
+        // Connect from previous row end to this row start.
+        {
+            auto [row_first_start, row_first_end] = segStartEnd(row.front());
+            if (has_prev) {
+                Vec2d cur_start_l = toLocal(Vec2d(row_first_start.east, row_first_start.north));
+
+                // U-turn arc between scanlines at x = prev_end_l.x(), then optional x-align to current start.
+                Vec2d align_end_l(prev_end_l.x(), cur_start_l.y());
+                appendUTurnArcLocal(prev_end_l, prev_dir_sign, align_end_l, prev_end);
+
+                Vec2d align_end_w = toWorld(align_end_l);
+                ENUPoint align_end{align_end_w.x(), align_end_w.y(), keep_up};
+                if (std::hypot(align_end.east - row_first_start.east, align_end.north - row_first_start.north) > 1e-6) {
+                    appendLine(align_end, row_first_start);
+                }
+            } else {
+                appendPoint(row_first_start);
+            }
+        }
+
+        // Traverse all segments in this row, keeping all overlaps.
+        for (size_t j = 0; j < row.size(); ++j) {
+            auto [s0, s1p] = segStartEnd(row[j]);
+
+            // If we're not exactly at this segment start, connect with a straight line.
+            if (!patrol_path.empty()) {
+                const ENUPoint &last = patrol_path.back();
+                if (std::hypot(last.east - s0.east, last.north - s0.north) > 1e-6) {
+                    appendLine(last, s0);
+                }
+            } else {
+                appendPoint(s0);
+            }
+
+            appendLine(s0, s1p);
+        }
+
+        // Update prev
+        if (!patrol_path.empty()) {
+            prev_end = patrol_path.back();
+            prev_end_l = toLocal(Vec2d(prev_end.east, prev_end.north));
+            prev_dir_sign = dir_sign;
+            has_prev = true;
+        }
+    }
+
+    // Ensure all points share the same altitude as the optimized previous segment.
+    for (auto &pt : patrol_path) {
+        pt.up = keep_up;
+    }
+
+    // 最后一个点到第一个点的路径用generateArcLineArc生成，确保切向连续和平滑过渡
+    if (patrol_path.size() >= 3) {
+        const ENUPoint p0 = patrol_path[patrol_path.size() - 1];
+        const ENUPoint p0_prev = patrol_path[patrol_path.size() - 2];
+        const ENUPoint p1 = patrol_path.front();
+        const ENUPoint p2 = patrol_path[1];
+
+        const double close_dx = p1.east - p0.east;
+        const double close_dy = p1.north - p0.north;
+        if (std::hypot(close_dx, close_dy) > 1e-3) {
+            const double seg_dx = p0.east - p0_prev.east;
+            const double seg_dy = p0.north - p0_prev.north;
+            double heading0 = 0.0;
+            if (std::hypot(seg_dx, seg_dy) > 1e-6) {
+                heading0 = std::atan2(seg_dy, seg_dx);
+            } else {
+                // fallback: use first segment direction
+                heading0 = std::atan2(p2.north - p1.north, p2.east - p1.east) + M_PI;
+            }
+
+            double radius = this->config_.path_planning.min_turning_radius;
+            if (!(radius > 1e-6)) {
+                radius = 0.5 * patrol_width;
+            }
+
+            ENUPoint sp0{p0.east, p0.north, keep_up};
+            ENUPoint sp1{p1.east, p1.north, keep_up};
+            ENUPoint sp2{p2.east, p2.north, keep_up};
+            std::vector<ENUPoint> close_path = this->generateArcLineArc(sp0, heading0, sp1, sp2, radius, resolution);
+            if (!close_path.empty()) {
+                // avoid duplicating the starting point
+                for (size_t i = 1; i < close_path.size(); ++i) {
+                    appendPoint(close_path[i]);
+                }
+            }
+        }
+    }
+
     return patrol_path;
 }
 
@@ -1693,6 +2079,8 @@ std::vector<ENUPoint> UavPathPlanner::computePatrolPathByMode(const std::vector<
         std::cerr << "Unknown patrol_mode='" << mode << "', fallback to SINGLE." << std::endl;
         patrol_path = this->gen_single_patrol(shrunk_zone, distance, trajectory_enu);
     }
+    //最后一个点到第一个点的路径用Minisnap_3D生成，确保切向连续和平滑过渡
+    // patrol_path.push_back(patrol_path.front()); // 确保路径闭合
 
     return patrol_path;
 }
