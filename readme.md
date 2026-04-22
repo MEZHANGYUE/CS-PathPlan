@@ -1,9 +1,9 @@
 测试: /UAV/pathPlanningAlgorithm/build 目录下
 cmake .  
 make
-./uavPathPlanningTest 
+./uavPathPlanningTest uav31_0
 可视化:/UAV/pathPlanningAlgorithm
-python3 visible.py ./data/uav34_0_planning
+python3 visible.py ./data/uav31_0_planning
 
 经纬高和东北天坐标之间的转换
 输出测试结果:

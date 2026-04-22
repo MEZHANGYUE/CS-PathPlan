@@ -331,12 +331,33 @@ private:
     // 提取的高度优化器函数仍在 cpp 中实现为私有方法
     // 现在只输入高程文件路径（例如 .tif），函数直接使用类成员 Trajectory_ENU 进行高度优化
     // bool runAltitudeOptimization(const std::string &elev_file);
-    // 第三段巡逻轨迹：按 patrol_mode 选择计算方法（当前仅实现 SINGLE）
-    std::vector<ENUPoint> computePatrolPathByMode(const std::vector<ENUPoint>& enu_waypoints,
-                                                  int zhandoupoint_num,
+    // 第三段巡逻轨迹：按 patrol_mode 选择计算方法（巡逻区域点集直接传入）
+    std::vector<ENUPoint> computePatrolPathByMode(const std::vector<ENUPoint>& patrol_zone,
                                                   double distance,
                                                   const std::string& patrol_mode,
                                                   const std::vector<ENUPoint>& trajectory_enu);
+
+    // 兼容封装：从 enu_waypoints 尾部截取 patrolpoint_num 个点作为巡逻区域，然后调用 computePatrolPathByMode。
+    std::vector<ENUPoint> computePatrolPathFromWaypoints(const std::vector<ENUPoint>& enu_waypoints,
+                                                         int patrolpoint_num,
+                                                         double distance,
+                                                         const std::string& patrol_mode,
+                                                         const std::vector<ENUPoint>& trajectory_enu);
+
+    // SINGLE 巡逻路径生成（从巡逻区域多边形点集生成闭合巡逻轨迹）
+    std::vector<ENUPoint> gen_single_patrol(const std::vector<ENUPoint> &patrol_zone,
+                                            double distance,
+                                            const std::vector<ENUPoint> &trajectory_enu);
+
+    // BOW 巡逻路径生成（暂未实现，先留空结构）
+    std::vector<ENUPoint> gen_bow_patrol(const std::vector<ENUPoint> &patrol_zone,
+                                         double distance,
+                                         const std::vector<ENUPoint> &trajectory_enu);
+
+    // CIRCULAR 巡逻路径生成（暂未实现，先留空结构）
+    std::vector<ENUPoint> gen_circular_patrol(const std::vector<ENUPoint> &patrol_zone,
+                                              double distance,
+                                              const std::vector<ENUPoint> &trajectory_enu);
 
     // 编队结束后：为指定无人机选择一个 battle_zone（通常按 uavs_id 下标映射到 battle_zone_wgs84）。
     const FlightZone *selectBattleZoneForUav(int uav_id) const;
