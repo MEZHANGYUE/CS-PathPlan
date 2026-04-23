@@ -331,6 +331,13 @@ private:
     PlannerConfig config_;
     InputData input_data_; // 存储解析后的输入数据，避免重复解析
     OutputData output_data_; // 存储解析后的输出数据，避免重复解析
+
+    // getPlan 内部拆分出的 helper（避免所有逻辑挤在 getPlan 中）
+    void upsertUsingMidwayLine(int uav_id, int segment_id, const std::vector<WGS84Point> &traj);
+    bool getFollowerStartWgs84(int uid, WGS84Point &out) const;
+    void adjustFollowerStartAltitudeIfNeeded(WGS84Point &p, bool formation_enabled) const;
+    bool getFollowerCurrentState(int uid, bool formation_enabled, double final_heading,
+                                 ENUPoint &p0, double &heading0, std::vector<ENUPoint> &ctx_enu);
     // 提取的高度优化器函数仍在 cpp 中实现为私有方法
     // 现在只输入高程文件路径（例如 .tif），函数直接使用类成员 Trajectory_ENU 进行高度优化
     // bool runAltitudeOptimization(const std::string &elev_file);
