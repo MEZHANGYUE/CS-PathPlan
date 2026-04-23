@@ -5,7 +5,7 @@
 #include <vector>
 #include <string>
 
-// minimum-snap 配置（合并自 minimum_snap_config.ymal / config.yaml.minimum_snap）
+// minimum-snap 配置（通常由上层从 minimum_snap_config.yaml 加载后传入）
 struct MinimumSnapConfig {
     // 多项式导数阶数（d_order），min-snap 常用 order=3
     int order = 3;

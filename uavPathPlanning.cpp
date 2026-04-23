@@ -443,6 +443,7 @@ bool UavPathPlanner::loadFromYAML(const std::string &config_path)
 
         if (root["path_planning"]) {
             auto pp = root["path_planning"];
+            yamlAssignIfPresent(pp, "minimum_snap_config_file", cfg.path_planning.minimum_snap_config_file);
             yamlAssignIfPresent(pp, "patrol_region_shrink_distance", cfg.path_planning.patrol_region_shrink_distance);
             yamlAssignIfPresent(pp, "position_misalignment", cfg.path_planning.position_misalignment);
             yamlAssignIfPresent(pp, "min_turning_radius", cfg.path_planning.min_turning_radius);
@@ -460,20 +461,35 @@ bool UavPathPlanner::loadFromYAML(const std::string &config_path)
             }
         }
 
-        if (root["minimum_snap"]) {
-            auto ms = root["minimum_snap"];
-            yamlAssignIfPresent(ms, "order", cfg.minimum_snap.order);
-            yamlAssignIfPresent(ms, "path_weight", cfg.minimum_snap.path_weight);
-            yamlAssignIfPresent(ms, "vel_zero_weight", cfg.minimum_snap.vel_zero_weight);
-            yamlAssignIfPresent(ms, "V_avg", cfg.minimum_snap.V_avg);
-            yamlAssignIfPresent(ms, "min_time_s", cfg.minimum_snap.min_time_s);
-            yamlAssignIfPresent(ms, "sample_distance", cfg.minimum_snap.sample_distance);
-            yamlAssignVec3IfPresent(ms, "start_vel", cfg.minimum_snap.start_vel);
-            yamlAssignVec3IfPresent(ms, "end_vel", cfg.minimum_snap.end_vel);
-            yamlAssignVec3IfPresent(ms, "start_acc", cfg.minimum_snap.start_acc);
-            yamlAssignVec3IfPresent(ms, "end_acc", cfg.minimum_snap.end_acc);
-        }
+        // minimum_snap 参数：仅从 path_planning.minimum_snap_config_file 指向的独立配置文件读取
+        if (!cfg.path_planning.minimum_snap_config_file.empty()) {
+            std::string resolved = cfg.path_planning.minimum_snap_config_file;
+            try {
+                if (!fileExists(resolved)) {
+                    std::cerr << "Warning: minimum_snap_config_file not found: " << resolved << std::endl;
+                } else {
+                    YAML::Node ms_root = YAML::LoadFile(resolved);
+                    YAML::Node ms = ms_root;
+                    // allow wrapper style: minimum_snap: { ... }
+                    if (ms_root["minimum_snap"]) ms = ms_root["minimum_snap"];
 
+                    yamlAssignIfPresent(ms, "order", cfg.minimum_snap.order);
+                    yamlAssignIfPresent(ms, "path_weight", cfg.minimum_snap.path_weight);
+                    yamlAssignIfPresent(ms, "vel_zero_weight", cfg.minimum_snap.vel_zero_weight);
+                    yamlAssignIfPresent(ms, "V_avg", cfg.minimum_snap.V_avg);
+                    yamlAssignIfPresent(ms, "min_time_s", cfg.minimum_snap.min_time_s);
+                    yamlAssignIfPresent(ms, "sample_distance", cfg.minimum_snap.sample_distance);
+                    yamlAssignVec3IfPresent(ms, "start_vel", cfg.minimum_snap.start_vel);
+                    yamlAssignVec3IfPresent(ms, "end_vel", cfg.minimum_snap.end_vel);
+                    yamlAssignVec3IfPresent(ms, "start_acc", cfg.minimum_snap.start_acc);
+                    yamlAssignVec3IfPresent(ms, "end_acc", cfg.minimum_snap.end_acc);
+
+                    std::cerr << "Loaded minimum_snap config from " << resolved << std::endl;
+                }
+            } catch (const std::exception &e) {
+                std::cerr << "Warning: failed to load minimum_snap config from " << resolved << ": " << e.what() << std::endl;
+            }
+        }
         this->config_ = cfg;
         std::cerr << "Loaded config from " << cfg.loaded_from << std::endl;
         return true;
@@ -1606,6 +1622,17 @@ std::vector<ENUPoint> UavPathPlanner::gen_bow_patrol(const std::vector<ENUPoint>
 
     // 1) Scan along polygon long-edge direction (min-area bounding box).
     Box2d mab = poly.MinAreaBoundingBox();
+
+    // 如果巡逻区域短边宽度不足以容纳至少两条巡逻线间距，则直接返回空轨迹
+    // 短边宽度使用最小面积包围盒的 min(width, length)
+    const double short_side = std::min(mab.width(), mab.length());
+    if (!(std::isfinite(short_side)) || short_side < 2.0 * patrol_width - 1e-6) {
+        std::cerr << "gen_bow_patrol: short side (" << short_side
+                  << ") < 2*patrol_width (" << (2.0 * patrol_width)
+                  << "), return empty patrol path." << std::endl;
+        return patrol_path;
+    }
+
     double scan_heading = mab.heading();
     if (mab.width() > mab.length()) {
         scan_heading += M_PI_2;
@@ -3505,7 +3532,7 @@ std::vector<ENUPoint> UavPathPlanner::Minisnap_EN (std::vector<ENUPoint> Enu_way
         route(i, 2) = 0.0;                     // z -> 0 (忽略高度)
     }
 
-    // use global generator (config.yaml.minimum_snap)
+    // use global generator (loaded from path_planning.minimum_snap_config_file)
     if (distance_ > 0) {
         std::cerr << "Using input JSON distance_points as sampling distance: " << distance_ << " m" << std::endl;
     }
@@ -3543,7 +3570,7 @@ std::vector<ENUPoint> UavPathPlanner::Minisnap_3D(std::vector<ENUPoint> Enu_wayp
         route(i, 2) = Enu_waypoint_[i].up;     // z -> up
     }
 
-    // use global generator (config.yaml.minimum_snap)
+    // use global generator (loaded from path_planning.minimum_snap_config_file)
     if (distance_ > 0) {
         std::cerr << "Using input JSON distance_points as sampling distance: " << distance_ << " m" << std::endl;
     }

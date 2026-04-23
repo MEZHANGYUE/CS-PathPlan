@@ -191,6 +191,8 @@ public:
             double min_turning_radius = 0.0;
             double patrol_width = 0.0;
             std::string patrol_mode = "BOW";
+            // minimum_snap 轨迹生成参数配置文件路径（相对路径以 config.yaml 所在目录为基准）
+            std::string minimum_snap_config_file;
             double patrol_region_shrink_distance = 0.0; // 巡逻区域内缩距离（米），0 表示不内缩
             double formation_distance = 50.0;
             int uav_formation_max_row = 8;

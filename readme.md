@@ -45,3 +45,10 @@ WGS84Point:
 将绕行路径插入到原路径中。
 ![规划二维图](./pic/uav31_0_planning_output_2d.png)
 ![规划三维图](./pic/uav31_0_planning_output_3d.png)
+
+所有巡逻路径先内缩 patrol_region_shrink_distance 距离
+单圈巡逻:沿着内缩区域的边界点用 minisnap 平滑路径
+弓形路径生成:
+如果短边的长度小于两倍patrol_region_shrink_distance,直接返回空轨迹,后用单圈巡逻.
+沿着内缩区域的长边扫描切割线段,再用圆弧段连接,首尾用弧形加线段形成封闭路径.
+回形路径:暂时为空
