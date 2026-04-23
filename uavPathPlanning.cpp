@@ -1116,6 +1116,19 @@ bool UavPathPlanner::optimizeAndApplyJointSegments(OutputData &output_data, cons
         }
     }
 
+    // 保证分段衔接点高度连续：如果前一段末点与后一段起点在平面位置上相同/极近，则强制两者高度一致。
+    // 典型场景：plane2 末尾切入点 == plane3 起点。
+    for (size_t si = 1; si < segment_end_indices.size(); ++si) {
+        const size_t boundary = segment_end_indices[si - 1];
+        if (boundary == 0 || boundary >= joint_enu.size()) continue;
+        const ENUPoint &a = joint_enu[boundary - 1];
+        const ENUPoint &b = joint_enu[boundary];
+        const double dxy = std::hypot(a.east - b.east, a.north - b.north);
+        if (dxy < 0.5) {
+            out_z[boundary - 1] = out_z[boundary];
+        }
+    }
+
     for (size_t i = 0; i < out_z.size(); ++i) {
         joint_enu[i].up = out_z[i];
     }
@@ -2134,17 +2147,16 @@ std::vector<ENUPoint> UavPathPlanner::computePatrolPathFromWaypoints(const std::
     return this->computePatrolPathByMode(patrol_zone, distance, patrol_mode, trajectory_enu);
 }
 //检查历史和当前航段是否进入异常区域
-bool UavPathPlanner::check_change(const json &input_json, json &output_json)
+bool UavPathPlanner::check_change(const InputData &input_data, OutputData &output_data)
 {
-    (void)input_json;
-    output_json["abnormal_uav_plane"] = json::array();
+    output_data.abnormal_uav_plane.clear();
 
-    if (!output_json.contains("using_midway_lines") || !output_json["using_midway_lines"].is_array()) {
-        std::cout << "check_change: no using_midway_lines in output_json, skipping check.\n";
+    if (output_data.using_midway_lines.empty()) {
+        std::cout << "check_change: no using_midway_lines in output_data, skipping check.\n";
         return true;
     }
 
-    const auto zones_wgs = parseCheckZonesFromInputData(this->input_data_);
+    const auto zones_wgs = parseCheckZonesFromInputData(input_data);
     if (zones_wgs.empty()) {
         std::cout << "check_change: no check zones defined in input_data, skipping check.\n";
         return true;
@@ -2152,14 +2164,13 @@ bool UavPathPlanner::check_change(const json &input_json, json &output_json)
 
     // 若 origin_ 仍为默认值，尝试从 using_midway_lines 第一个点初始化一个参考点
     if (std::abs(this->origin_.lon) < 1e-12 && std::abs(this->origin_.lat) < 1e-12) {
-        for (const auto &line : output_json["using_midway_lines"]) {
-            if (!line.is_array() || line.size() < 3) continue;
-            WGS84Point p;
-            if (parseWGS84PointArray(line[2], p)) {
-                this->origin_ = p;
-                this->origin_.alt = 0.0;
-                break;
-            }
+        for (const auto &line : output_data.using_midway_lines) {
+            if (line.points.empty()) continue;
+            const auto &p0 = line.points.front();
+            this->origin_.lon = p0.lon;
+            this->origin_.lat = p0.lat;
+            this->origin_.alt = 0.0;
+            break;
         }
     }
 
@@ -2185,23 +2196,17 @@ bool UavPathPlanner::check_change(const json &input_json, json &output_json)
         return true;
     }
 
-    const auto progress_map = parseUavProgressFromInputData(this->input_data_);
+    const auto progress_map = parseUavProgressFromInputData(input_data);
     std::set<int> bad_uavs;
 
-    for (const auto &line : output_json["using_midway_lines"]) {
-        if (!line.is_array() || line.size() < 4) continue; // 至少 2 个点
-        if (!line[0].is_number_integer() || !line[1].is_number_integer()) continue;
-
-        const int uav_id = line[0].get<int>();
-        const int segment_id = line[1].get<int>();
+    for (const auto &line : output_data.using_midway_lines) {
+        const int uav_id = line.uav_id;
+        const int segment_id = line.segment_id;
 
         std::vector<WGS84Point> wpts;
-        wpts.reserve(line.size() - 2);
-        for (size_t i = 2; i < line.size(); ++i) {
-            WGS84Point p;
-            if (parseWGS84PointArray(line[i], p)) {
-                wpts.push_back(p);
-            }
+        wpts.reserve(line.points.size());
+        for (const auto &pt : line.points) {
+            wpts.push_back({pt.lon, pt.lat, pt.alt});
         }
         if (wpts.size() < 2) continue;
 
@@ -2265,9 +2270,7 @@ bool UavPathPlanner::check_change(const json &input_json, json &output_json)
         }
     }
 
-    for (int uid : bad_uavs) {
-        output_json["abnormal_uav_plane"].push_back(uid);
-    }
+    output_data.abnormal_uav_plane.assign(bad_uavs.begin(), bad_uavs.end());
     return true;
 }
 
@@ -2977,22 +2980,11 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         std::cout << "]" << std::endl;
     }
 
-    // check_change 仍使用旧接口（json），这里用局部 work_json 进行转换
-    {
-        json work_json;
-        this->outputDataToJson(this->output_data_, work_json);
-        if (!this->check_change(input_json, work_json)) {
+    // check_change：使用结构化数据接口（InputData/OutputData）
+    if (!this->check_change(this->input_data_, this->output_data_)) {
         std::cerr << "check_change failed." << std::endl;
-        } else {
-            std::cerr << "check_change succeeded." << std::endl;
-        }
-        // 回填 abnormal_uav_plane
-        this->output_data_.abnormal_uav_plane.clear();
-        if (work_json.contains("abnormal_uav_plane") && work_json["abnormal_uav_plane"].is_array()) {
-            for (const auto &v : work_json["abnormal_uav_plane"]) {
-                if (v.is_number_integer()) this->output_data_.abnormal_uav_plane.push_back(v.get<int>());
-            }
-        }
+    } else {
+        std::cerr << "check_change succeeded." << std::endl;
     }
 /*   -------------------规划结果的辅助输出，主要给前端/可视化/标注用，不影响路径求解本身-----------------------   */
     //输出结果增加 midway_point_num（编队结果里才有）

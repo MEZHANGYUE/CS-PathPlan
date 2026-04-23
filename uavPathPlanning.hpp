@@ -229,7 +229,7 @@ public:
     std::vector<ENUPoint> preparePlanningWaypoints(int &midwaypoint_num, int &zhandoupoint_num);
 
     // 检查历史/当前航线与 check_prohibited_zone_wgs84 的冲突并输出 abnormal_uav_plane
-    bool check_change(const json &input_json, json &output_json);
+    bool check_change(const InputData &input_data, OutputData &output_data);
     //高度优化接口 以 Trajectory_ENU 为主，优化后还要联动 follower
     bool runAltitudeOptimization(const std::string &elev_file, OutputData &output_data);
     // 辅助函数
