@@ -309,6 +309,10 @@ private:
     void adjustFollowerStartAltitudeIfNeeded(WGS84Point &p, bool formation_enabled) const;
     bool getFollowerCurrentState(int uid, bool formation_enabled, double final_heading,
                                  ENUPoint &p0, double &heading0, std::vector<ENUPoint> &ctx_enu);
+    bool buildTransitionAndRotatePatrol(const ENUPoint& p0, double heading0, double minR, double resolution,
+                                        const std::vector<ENUPoint>& patrol_path,
+                                        std::vector<ENUPoint> &out_transition_path,
+                                        std::vector<ENUPoint> &out_rotated_patrol) const;
 
     struct AltitudeOptContext {
         bool enabled = false;

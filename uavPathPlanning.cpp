@@ -2517,6 +2517,142 @@ void UavPathPlanner::appendUavSegmentLine(std::vector<UavTrajectoryLine> &dst, i
     dst.push_back(std::move(line));
 }
 
+bool UavPathPlanner::buildTransitionAndRotatePatrol(const ENUPoint& p0, double heading0, double minR, double resolution,
+                                                    const std::vector<ENUPoint>& patrol_path,
+                                                    std::vector<ENUPoint> &out_transition_path,
+                                                    std::vector<ENUPoint> &out_rotated_patrol) const {
+    out_transition_path.clear();
+    out_rotated_patrol.clear();
+    if (patrol_path.empty()) return false;
+
+    double best_score = std::numeric_limits<double>::max();
+    size_t best_idx = 0;
+    double best_arc_len = 0.0;
+    double best_line_len = 0.0;
+    int best_s = 0;
+    double best_cx = 0.0;
+    double best_cy = 0.0;
+    double best_theta_start = 0.0;
+    bool found_any = false;
+
+    for (int s : {1, -1}) {
+        double cx = p0.east - s * minR * std::sin(heading0);
+        double cy = p0.north + s * minR * std::cos(heading0);
+        double theta_start = std::atan2(p0.north - cy, p0.east - cx);
+
+        for (size_t i = 0; i < patrol_path.size(); ++i) {
+            const auto &pt = patrol_path[i];
+            const auto &next_pt = patrol_path[(i + 1) % patrol_path.size()];
+            double patrol_dx = next_pt.east - pt.east;
+            double patrol_dy = next_pt.north - pt.north;
+            double patrol_len = std::hypot(patrol_dx, patrol_dy);
+            if (patrol_len < 1e-3) continue;
+            patrol_dx /= patrol_len;
+            patrol_dy /= patrol_len;
+
+            double v_cx = pt.east - cx;
+            double v_cy = pt.north - cy;
+            double dist_cp = std::hypot(v_cx, v_cy);
+            if (dist_cp <= minR) continue;
+
+            double alpha = std::atan2(v_cy, v_cx);
+            double beta = std::acos(minR / dist_cp);
+            double candidates[2] = {alpha + beta, alpha - beta};
+            for (double theta : candidates) {
+                double tx = cx + minR * std::cos(theta);
+                double ty = cy + minR * std::sin(theta);
+
+                double lx = pt.east - tx;
+                double ly = pt.north - ty;
+                double l_len = std::hypot(lx, ly);
+                if (l_len < 1e-3) continue;
+                double l_dx = lx / l_len;
+                double l_dy = ly / l_len;
+
+                double tan_x = -s * std::sin(theta);
+                double tan_y = s * std::cos(theta);
+                if (tan_x * l_dx + tan_y * l_dy < 0.99) continue;
+
+                double alignment = l_dx * patrol_dx + l_dy * patrol_dy;
+                if (alignment < 0.8) continue;
+
+                double d_theta = theta - theta_start;
+                if (s > 0) {
+                    while (d_theta <= 0) d_theta += 2 * M_PI;
+                    while (d_theta > 2 * M_PI) d_theta -= 2 * M_PI;
+                } else {
+                    while (d_theta >= 0) d_theta -= 2 * M_PI;
+                    while (d_theta < -2 * M_PI) d_theta += 2 * M_PI;
+                }
+                double arc_len = std::abs(d_theta) * minR;
+                double penalty = 1000.0 * (1.0 - alignment);
+                double total_cost = arc_len + l_len + penalty;
+
+                if (total_cost < best_score) {
+                    best_score = total_cost;
+                    best_idx = i;
+                    best_arc_len = arc_len;
+                    best_line_len = l_len;
+                    best_s = s;
+                    best_cx = cx;
+                    best_cy = cy;
+                    best_theta_start = theta_start;
+                    found_any = true;
+                }
+            }
+        }
+    }
+
+    if (found_any) {
+        int steps_arc = std::max(1, static_cast<int>(std::ceil(best_arc_len / resolution)));
+        double d_theta_total = (best_s > 0) ? (best_arc_len / minR) : -(best_arc_len / minR);
+        for (int i = 0; i <= steps_arc; ++i) {
+            double t = static_cast<double>(i) / steps_arc;
+            double ang = best_theta_start + d_theta_total * t;
+            ENUPoint pt;
+            pt.east = best_cx + minR * std::cos(ang);
+            pt.north = best_cy + minR * std::sin(ang);
+            pt.up = p0.up + (patrol_path[best_idx].up - p0.up) * (t * best_arc_len / (best_arc_len + best_line_len));
+            out_transition_path.push_back(pt);
+        }
+
+        ENUPoint t_end = out_transition_path.back();
+        ENUPoint p_target = patrol_path[best_idx];
+        int steps_line = std::max(1, static_cast<int>(std::ceil(best_line_len / resolution)));
+        for (int i = 1; i <= steps_line; ++i) {
+            double t = static_cast<double>(i) / steps_line;
+            ENUPoint pt;
+            pt.east = t_end.east + t * (p_target.east - t_end.east);
+            pt.north = t_end.north + t * (p_target.north - t_end.north);
+            pt.up = t_end.up + t * (p_target.up - t_end.up);
+            out_transition_path.push_back(pt);
+        }
+
+        out_rotated_patrol.reserve(patrol_path.size() + 1);
+        for (size_t i = 0; i < patrol_path.size(); ++i) {
+            out_rotated_patrol.push_back(patrol_path[(best_idx + i) % patrol_path.size()]);
+        }
+        if (!out_rotated_patrol.empty()) {
+            out_rotated_patrol.push_back(out_rotated_patrol.front());
+        }
+        return true;
+    }
+
+    std::cerr << "Warning: Failed to find valid tangent transition, falling back to straight line." << std::endl;
+    ENUPoint p1 = patrol_path[0];
+    double dx = p1.east - p0.east;
+    double dy = p1.north - p0.north;
+    double dist = std::hypot(dx, dy);
+    int steps = std::max(1, static_cast<int>(std::ceil(dist / resolution)));
+    for (int i = 0; i <= steps; ++i) {
+        double t = static_cast<double>(i) / steps;
+        ENUPoint q{p0.east + t * dx, p0.north + t * dy, p0.up + t * (p1.up - p0.up)};
+        out_transition_path.push_back(q);
+    }
+    out_rotated_patrol = patrol_path;
+    return false;
+}
+
 void UavPathPlanner::generateLeaderPlane2Plane3NonFormation(const WGS84Point &leader_start_wgs, double distance) {
     this->output_data_.uav_leader_plane2.clear();
     this->output_data_.uav_leader_plane3.clear();
@@ -2546,25 +2682,23 @@ void UavPathPlanner::generateLeaderPlane2Plane3NonFormation(const WGS84Point &le
         return;
     }
 
-    // plane3
-    std::vector<WGS84Point> patrol_wgs = this->enuToWGS84_Batch(patrol_path, this->origin_);
-    this->writeLeaderSegment(this->output_data_.uav_leader_plane3, this->output_data_, 3, patrol_wgs);
-
-    // plane2: transition p0 -> patrol
-    ENUPoint p1 = patrol_path.front();
-    ENUPoint p2 = (patrol_path.size() >= 2) ? patrol_path[1] : patrol_path.front();
     double heading0 = 0.0;
     {
+        const ENUPoint &p1 = patrol_path.front();
         const double dx = p1.east - p0.east;
         const double dy = p1.north - p0.north;
         heading0 = (std::hypot(dx, dy) > 1e-6) ? std::atan2(dy, dx) : 0.0;
     }
     const double radius = std::max(0.0, this->input_data_.min_turning_radius);
     const double resolution = (distance > 0.0) ? distance : 300.0;
-    std::vector<ENUPoint> transition = this->generateArcLineArc(p0, heading0, p1, p2, radius, resolution);
+    std::vector<ENUPoint> transition;
+    std::vector<ENUPoint> rotated_patrol;
+    this->buildTransitionAndRotatePatrol(p0, heading0, radius, resolution, patrol_path, transition, rotated_patrol);
     if (transition.empty()) return;
 
     std::vector<WGS84Point> trans_wgs = this->enuToWGS84_Batch(transition, this->origin_);
+    std::vector<WGS84Point> patrol_wgs = this->enuToWGS84_Batch(rotated_patrol.empty() ? patrol_path : rotated_patrol, this->origin_);
+    this->writeLeaderSegment(this->output_data_.uav_leader_plane3, this->output_data_, 3, patrol_wgs);
     this->writeLeaderSegment(this->output_data_.uav_leader_plane2, this->output_data_, 2, trans_wgs);
 }
 
@@ -2682,12 +2816,9 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
             }
             for (auto &pt : battle_patrol) pt.up = battle_target_up;
 
-            // 第二段：过渡轨迹
-            ENUPoint p1 = battle_patrol.front();
-            ENUPoint p2 = (battle_patrol.size() >= 2) ? battle_patrol[1] : battle_patrol.front();
-
             // 非编队/无历史航段时，用指向巡逻起点的方向作为 heading0
             if (!std::isfinite(heading0) || ctx_enu.size() < 2) {
+                ENUPoint p1 = battle_patrol.front();
                 const double dx = p1.east - p0.east;
                 const double dy = p1.north - p0.north;
                 if (std::hypot(dx, dy) > 1e-6) {
@@ -2699,7 +2830,10 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
 
             const double radius = std::max(0.0, this->input_data_.min_turning_radius);
             const double resolution = (distance > 0.0) ? distance : 300.0;
-            std::vector<ENUPoint> battle_transition = this->generateArcLineArc(p0, heading0, p1, p2, radius, resolution);
+            std::vector<ENUPoint> battle_transition;
+            std::vector<ENUPoint> rotated_battle_patrol;
+            this->buildTransitionAndRotatePatrol(p0, heading0, radius, resolution,
+                                                 battle_patrol, battle_transition, rotated_battle_patrol);
             if (battle_transition.empty()) {
                 std::cerr << "battle_id=" << rid << " failed to generate battle transition path, fallback to ready_zone." << std::endl;
                 appendUniqueIdLocal(out_final_ready_ids, rid);
@@ -2707,7 +2841,8 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
             }
 
             std::vector<WGS84Point> battle_transition_wgs = this->enuToWGS84_Batch(battle_transition, this->origin_);
-            std::vector<WGS84Point> battle_patrol_wgs = this->enuToWGS84_Batch(battle_patrol, this->origin_);
+            std::vector<WGS84Point> battle_patrol_wgs = this->enuToWGS84_Batch(
+                rotated_battle_patrol.empty() ? battle_patrol : rotated_battle_patrol, this->origin_);
 
             this->upsertUsingMidwayLine(rid, 2, battle_transition_wgs);
             this->upsertUsingMidwayLine(rid, 3, battle_patrol_wgs);
@@ -2768,10 +2903,8 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
                 pt.up = ready_target_up;
             }
 
-            ENUPoint p1 = ready_patrol.front();
-            ENUPoint p2 = (ready_patrol.size() >= 2) ? ready_patrol[1] : ready_patrol.front();
-
             if (!std::isfinite(heading0) || ctx_enu.size() < 2) {
+                ENUPoint p1 = ready_patrol.front();
                 const double dx = p1.east - p0.east;
                 const double dy = p1.north - p0.north;
                 if (std::hypot(dx, dy) > 1e-6) {
@@ -2783,7 +2916,10 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
 
             const double radius = std::max(0.0, this->input_data_.min_turning_radius);
             const double resolution = (distance > 0.0) ? distance : 300.0;
-            std::vector<ENUPoint> ready_transition = this->generateArcLineArc(p0, heading0, p1, p2, radius, resolution);
+            std::vector<ENUPoint> ready_transition;
+            std::vector<ENUPoint> rotated_ready_patrol;
+            this->buildTransitionAndRotatePatrol(p0, heading0, radius, resolution,
+                                                 ready_patrol, ready_transition, rotated_ready_patrol);
 
             if (ready_transition.empty()) {
                 std::cerr << "ready_id=" << rid << " failed to generate ready transition path." << std::endl;
@@ -2791,7 +2927,8 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
             }
 
             std::vector<WGS84Point> ready_transition_wgs = this->enuToWGS84_Batch(ready_transition, this->origin_);
-            std::vector<WGS84Point> ready_patrol_wgs = this->enuToWGS84_Batch(ready_patrol, this->origin_);
+            std::vector<WGS84Point> ready_patrol_wgs = this->enuToWGS84_Batch(
+                rotated_ready_patrol.empty() ? ready_patrol : rotated_ready_patrol, this->origin_);
 
             this->upsertUsingMidwayLine(rid, 2, ready_transition_wgs);
             this->upsertUsingMidwayLine(rid, 3, ready_patrol_wgs);
@@ -4155,167 +4292,14 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
                                                       const std::vector<ENUPoint>& Patrol_Path, OutputData &output_data)
 {
     std::cout<<"开始计算第二段任务区域过渡轨迹 (切圆切入优化)"<<std::endl;
-
-    // 3. 寻找最佳切入点 (遍历左右转弯及所有巡逻点)
-    double best_score = std::numeric_limits<double>::max();
-    size_t best_idx = 0;
-    double best_arc_len = 0;
-    double best_line_len = 0;
-    double best_theta_end = 0;
-    int best_s = 0;
-    double best_cx = 0;
-    double best_cy = 0;
-    double best_theta_start = 0;
-    bool found_any = false;
-
-    // 尝试左右两种转弯方向，寻找最优解
-    for (int s : {1, -1}) {
-        // 计算切圆圆心
-        // 左转(s=1): (-sin, cos); 右转(s=-1): (sin, -cos)
-        double cx = p0.east - s * minR * std::sin(heading0);
-        double cy = p0.north + s * minR * std::cos(heading0);
-        double theta_start = std::atan2(p0.north - cy, p0.east - cx);
-
-        for(size_t i = 0; i < Patrol_Path.size(); ++i) {
-            const auto& pt = Patrol_Path[i];
-            // 计算该点处的巡逻方向 (指向下一点)
-            const auto& next_pt = Patrol_Path[(i + 1) % Patrol_Path.size()];
-            double patrol_dx = next_pt.east - pt.east;
-            double patrol_dy = next_pt.north - pt.north;
-            double patrol_len = std::hypot(patrol_dx, patrol_dy);
-            if(patrol_len < 1e-3) continue;
-            patrol_dx /= patrol_len;
-            patrol_dy /= patrol_len;
-
-            // 计算从圆心到目标点的向量及距离
-            double v_cx = pt.east - cx;
-            double v_cy = pt.north - cy;
-            double dist_cp = std::hypot(v_cx, v_cy);
-            
-            if(dist_cp <= minR) continue; // 目标点在圆内，无法做切线
-
-            // 计算切点
-            // 我们需要的是“沿圆弧运动方向”飞出的切线
-            double alpha = std::atan2(v_cy, v_cx);
-            double beta = std::acos(minR / dist_cp);
-            
-            // 两个可能的切点角度
-            double candidates[2] = {alpha + beta, alpha - beta};
-            for(double theta : candidates) {
-                // 切点坐标
-                double tx = cx + minR * std::cos(theta);
-                double ty = cy + minR * std::sin(theta);
-                
-                // 切线向量 (T -> P)
-                double lx = pt.east - tx;
-                double ly = pt.north - ty;
-                double l_len = std::hypot(lx, ly);
-                if (l_len < 1e-3) continue;
-                double l_dx = lx / l_len;
-                double l_dy = ly / l_len;
-
-                // 圆在该切点处的切线方向 (运动方向)
-                double tan_x = -s * std::sin(theta);
-                double tan_y = s * std::cos(theta);
-
-                // 检查1: 直线方向必须与圆的切线方向一致 (cos theta > 0)
-                if (tan_x * l_dx + tan_y * l_dy < 0.99) continue; 
-
-                // 检查2: 切入角度与巡逻方向的对齐程度
-                double alignment = l_dx * patrol_dx + l_dy * patrol_dy;
-                // 严格限制切入角度，例如必须小于 36 度 (cos > 0.8)
-                if (alignment < 0.8) continue;
-
-                // 计算弧长
-                double d_theta = theta - theta_start;
-                if (s > 0) { // Left, CCW
-                    while (d_theta <= 0) d_theta += 2 * M_PI;
-                    while (d_theta > 2 * M_PI) d_theta -= 2 * M_PI;
-                } else { // Right, CW
-                    while (d_theta >= 0) d_theta -= 2 * M_PI;
-                    while (d_theta < -2 * M_PI) d_theta += 2 * M_PI;
-                }
-                double arc_len = std::abs(d_theta) * minR;
-                
-                // 评分: 路径长度 + 角度惩罚
-                // 角度惩罚权重: 使得算法更倾向于切向切入 (alignment -> 1)
-                // 假设 1000m 的惩罚系数，意味着 10度偏差 (cos~0.985, 1-cos~0.015) => 15m 惩罚
-                double penalty = 1000.0 * (1.0 - alignment);
-                double total_cost = arc_len + l_len + penalty;
-                
-                if(total_cost < best_score) {
-                    best_score = total_cost;
-                    best_idx = i;
-                    best_arc_len = arc_len;
-                    best_line_len = l_len;
-                    best_theta_end = theta;
-                    best_s = s;
-                    best_cx = cx;
-                    best_cy = cy;
-                    best_theta_start = theta_start;
-                    found_any = true;
-                }
-            }
-        }
-    }
-
     std::vector<ENUPoint> Transition_Path;
-    if(found_any) {
-        // 生成圆弧部分
-        int steps_arc = std::max(1, (int)std::ceil(best_arc_len / resolution));
-        double d_theta_total = (best_s > 0) ? (best_arc_len / minR) : -(best_arc_len / minR);
-        
-        for(int i=0; i<=steps_arc; ++i) {
-            double t = (double)i / steps_arc;
-            double ang = best_theta_start + d_theta_total * t;
-            ENUPoint pt;
-            pt.east = best_cx + minR * std::cos(ang);
-            pt.north = best_cy + minR * std::sin(ang);
-            // 高度线性插值
-            pt.up = p0.up + (Patrol_Path[best_idx].up - p0.up) * (t * best_arc_len / (best_arc_len + best_line_len));
-            Transition_Path.push_back(pt);
-        }
+    std::vector<ENUPoint> Rotated_Patrol;
+    this->buildTransitionAndRotatePatrol(p0, heading0, minR, resolution, Patrol_Path,
+                                         Transition_Path, Rotated_Patrol);
 
-        // 生成直线部分
-        ENUPoint T_end = Transition_Path.back();
-        ENUPoint P_target = Patrol_Path[best_idx];
-        int steps_line = std::max(1, (int)std::ceil(best_line_len / resolution));
-        for(int i=1; i<=steps_line; ++i) {
-            double t = (double)i / steps_line;
-            ENUPoint pt;
-            pt.east = T_end.east + t * (P_target.east - T_end.east);
-            pt.north = T_end.north + t * (P_target.north - T_end.north);
-            pt.up = T_end.up + t * (P_target.up - T_end.up);
-            Transition_Path.push_back(pt);
-        }
-        
-        // 关键步骤: 重新调整巡逻路径 (Plane 3) 的起点，使其从 best_idx 开始
-        // 这样无人机飞完 Plane 2 后能无缝衔接 Plane 3
-        std::vector<ENUPoint> Rotated_Patrol;
-        Rotated_Patrol.reserve(Patrol_Path.size());
-        for(size_t i=0; i<Patrol_Path.size(); ++i) {
-            Rotated_Patrol.push_back(Patrol_Path[(best_idx + i) % Patrol_Path.size()]);
-        }
-        // 闭合
-        Rotated_Patrol.push_back(Rotated_Patrol[0]);
-        
+    if (!Rotated_Patrol.empty()) {
         std::vector<WGS84Point> Rotated_Patrol_WGS84 = this->enuToWGS84_Batch(Rotated_Patrol, this->origin_);
-
         this->writeLeaderSegment(output_data.uav_leader_plane3, output_data, 3, Rotated_Patrol_WGS84);
-        
-    } else {
-        std::cerr << "Warning: Failed to find valid tangent transition, falling back to straight line." << std::endl;
-        // Fallback: 直接连线到最近点
-        ENUPoint p1 = Patrol_Path[0];
-        double dx = p1.east - p0.east;
-        double dy = p1.north - p0.north;
-        double dist = std::hypot(dx, dy);
-        int steps = std::max(1, (int)std::ceil(dist / resolution));
-        for (int i = 0; i <= steps; ++i) {
-            double t = (double)i / steps;
-            ENUPoint q{p0.east + t * dx, p0.north + t * dy, p0.up + t * (p1.up - p0.up)};
-            Transition_Path.push_back(q);
-        }
     }
 
     std::vector<WGS84Point> Transition_Path_WGS84 = this->enuToWGS84_Batch(Transition_Path,this->origin_);
