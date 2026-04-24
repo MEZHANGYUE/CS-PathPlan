@@ -1556,8 +1556,8 @@ std::vector<ENUPoint> UavPathPlanner::gen_bow_patrol(const std::vector<ENUPoint>
         return patrol_path;
     }
 
-    const double resolution = (distance > 1e-6) ? distance : 1.0;
-    const double keep_up = !trajectory_enu.empty() ? trajectory_enu.back().up : patrol_zone.front().up;
+    const double resolution = (distance > 1e-6) ? distance : 1.0;   //轨迹点密度
+    const double keep_up = !trajectory_enu.empty() ? trajectory_enu.back().up : patrol_zone.front().up;  //起始点(如果有的话)的高度
 
     // Build polygon (already shrunk by caller)
     std::vector<Vec2d> poly_pts;
@@ -1565,35 +1565,43 @@ std::vector<ENUPoint> UavPathPlanner::gen_bow_patrol(const std::vector<ENUPoint>
     for (const auto &p : patrol_zone) {
         poly_pts.emplace_back(p.east, p.north);
     }
-    Polygon2d poly(poly_pts);
+    Polygon2d poly(poly_pts);  //二维点向量转换成多边形
     if (poly.points().size() < 3) {
         std::cerr << "gen_bow_patrol failed: Polygon2d has <3 points." << std::endl;
         return patrol_path;
     }
 
-    // 1) Scan along polygon long-edge direction (min-area bounding box).
-    Box2d mab = poly.MinAreaBoundingBox();
-
-    // 如果巡逻区域短边宽度不足以容纳至少两条巡逻线间距，则直接返回空轨迹
-    // 短边宽度使用最小面积包围盒的 min(width, length)
-    const double short_side = std::min(mab.width(), mab.length());
-    if (!(std::isfinite(short_side)) || short_side < 2.0 * patrol_width - 1e-6) {
-        std::cerr << "gen_bow_patrol: short side (" << short_side
-                  << ") < 2*patrol_width (" << (2.0 * patrol_width)
-                  << "), return empty patrol path." << std::endl;
+    // 1) Scan along the dominant direction of the ACTUAL polygon boundary.
+    // 不再使用最小外接矩形，而是用实际边界最长边作为扫描主方向。
+    double scan_heading = 0.0;
+    double longest_edge_len = 0.0;
+    const auto &poly_boundary = poly.points();
+    for (size_t i = 0; i < poly_boundary.size(); ++i) {
+        const Vec2d &a = poly_boundary[i];
+        const Vec2d &b = poly_boundary[(i + 1) % poly_boundary.size()];
+        const double dx = b.x() - a.x();
+        const double dy = b.y() - a.y();
+        const double edge_len = std::hypot(dx, dy);
+        if (edge_len > longest_edge_len + 1e-6) {
+            longest_edge_len = edge_len;
+            scan_heading = std::atan2(dy, dx);
+        }
+    }
+    if (!(longest_edge_len > 1e-6) || !std::isfinite(scan_heading)) {
+        std::cerr << "gen_bow_patrol failed: invalid dominant boundary edge." << std::endl;
         return patrol_path;
     }
 
-    double scan_heading = mab.heading();
-    if (mab.width() > mab.length()) {
-        scan_heading += M_PI_2;
-    }
     while (scan_heading > M_PI) scan_heading -= 2.0 * M_PI;
     while (scan_heading <= -M_PI) scan_heading += 2.0 * M_PI;
 
     const Vec2d d = Vec2d::CreateUnitVec2d(scan_heading);
     const Vec2d n(-d.y(), d.x());
-    const Vec2d origin(mab.center_x(), mab.center_y());
+    Vec2d origin(0.0, 0.0);
+    for (const auto &pt : poly_boundary) {
+        origin += pt;
+    }
+    origin /= static_cast<double>(poly_boundary.size());
 
     auto toLocal = [&](const Vec2d &p) -> Vec2d {
         Vec2d q = p - origin;
@@ -1689,6 +1697,15 @@ std::vector<ENUPoint> UavPathPlanner::gen_bow_patrol(const std::vector<ENUPoint>
     }
     if (!(std::isfinite(min_x) && std::isfinite(max_x) && std::isfinite(min_y) && std::isfinite(max_y))) {
         std::cerr << "gen_bow_patrol failed: invalid polygon bounds." << std::endl;
+        return patrol_path;
+    }
+
+    // 如果巡逻区域在“实际边界主方向”的法向投影宽度不足以容纳至少两条巡逻线间距，则直接返回空轨迹。
+    const double short_side = max_y - min_y;
+    if (!(std::isfinite(short_side)) || short_side < 2.0 * patrol_width - 1e-6) {
+        std::cerr << "gen_bow_patrol: short side (" << short_side
+                  << ") < 2*patrol_width (" << (2.0 * patrol_width)
+                  << "), return empty patrol path." << std::endl;
         return patrol_path;
     }
 
