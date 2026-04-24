@@ -1180,9 +1180,15 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, ::Out
             return false;
         }
 
-        if (!elev_cost_map_ || !elev_cost_map_->loadElevationData(elev_file)) {
-            std::cerr << "AltitudeOptimizer: failed to load elevation file: " << elev_file << "\n";
-            return false;
+        if (!elev_cost_map_) {
+            elev_cost_map_ = std::make_unique<ElevationCostMap>();
+        }
+        // Avoid redundant I/O: if already loaded/valid, reuse it.
+        if (!elev_cost_map_->isElevationValid()) {
+            if (!elev_cost_map_->loadElevationData(elev_file)) {
+                std::cerr << "AltitudeOptimizer: failed to load elevation file: " << elev_file << "\n";
+                return false;
+            }
         }
 
         // Instead of copying the whole map (which is in WGS84), build a local ENU costmap
@@ -1197,71 +1203,9 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, ::Out
         // Convert updated ENU trajectory to WGS84
         std::vector<WGS84Point> Trajectory_WGS84 = this->enuToWGS84_Batch(this->Trajectory_ENU, this->origin_);
 
-        auto upsertUsingMidwayLine = [&](int uav_id, int segment_id, const std::vector<WGS84Point> &traj) {
-            std::vector<WGS84Coord> pts;
-            pts.reserve(traj.size());
-            for (const auto &p : traj) {
-                pts.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-            }
-
-            for (auto &line : output_data.using_midway_lines) {
-                if (line.uav_id == uav_id && line.segment_id == segment_id) {
-                    line.points = std::move(pts);
-                    return;
-                }
-            }
-            UavTrajectoryLine new_line;
-            new_line.uav_id = uav_id;
-            new_line.segment_id = segment_id;
-            new_line.points = std::move(pts);
-            output_data.using_midway_lines.push_back(std::move(new_line));
-        };
-
-        // Update leader trajectory in output_data
-        output_data.uav_leader_plane1.clear();
-        output_data.uav_leader_plane1.reserve(Trajectory_WGS84.size());
-        for (const auto &p : Trajectory_WGS84) {
-            output_data.uav_leader_plane1.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-        }
-        upsertUsingMidwayLine(this->input_data_.uav_leader_id, 1, Trajectory_WGS84);
-
-        // Re-generate follower trajectories and update output_data.uav_plane1
-        try {
-            json plane_array = this->generateFollowerTrajectories(this->input_data_, this->Trajectory_ENU, Trajectory_WGS84);
-
-            output_data.uav_plane1.clear();
-            if (plane_array.is_array()) {
-                for (const auto &follower : plane_array) {
-                    if (!follower.is_array() || follower.size() < 2 || !follower[0].is_number_integer()) {
-                        continue;
-                    }
-
-                    const int uid = follower[0].get<int>();
-                    UavTrajectoryLine line;
-                    line.uav_id = uid;
-                    line.segment_id = 1;
-
-                    std::vector<WGS84Point> follower_traj;
-                    follower_traj.reserve(follower.size() - 1);
-                    for (size_t i = 1; i < follower.size(); ++i) {
-                        WGS84Point p;
-                        if (!parseWGS84PointValue(follower[i], p)) {
-                            continue;
-                        }
-                        follower_traj.push_back(p);
-                        line.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-                    }
-                    output_data.uav_plane1.push_back(std::move(line));
-                    if (!follower_traj.empty()) {
-                        upsertUsingMidwayLine(uid, 1, follower_traj);
-                    }
-                }
-            }
-
-            std::cerr << "AltitudeOptimizer: updated output_data with new trajectories.\n";
-        } catch (const std::exception &e) {
-            std::cerr << "AltitudeOptimizer: failed to update follower trajectories: " << e.what() << std::endl;
-        }
+        this->writeLeaderPlane1(output_data, Trajectory_WGS84);
+        this->writeFollowerPlane1(output_data, this->Trajectory_ENU, Trajectory_WGS84);
+        std::cerr << "AltitudeOptimizer: updated output_data with new trajectories.\n";
 
         return true;
     } catch (const std::exception &e) {
@@ -2119,27 +2063,6 @@ std::vector<ENUPoint> UavPathPlanner::computePatrolPathByMode(const std::vector<
     return patrol_path;
 }
 
-std::vector<ENUPoint> UavPathPlanner::computePatrolPathFromWaypoints(const std::vector<ENUPoint>& enu_waypoints,
-                                                                     int patrolpoint_num,
-                                                                     double distance,
-                                                                     const std::string& patrol_mode,
-                                                                     const std::vector<ENUPoint>& trajectory_enu)
-{
-    if (patrolpoint_num <= 0) {
-        std::cerr << "computePatrolPathFromWaypoints failed: patrolpoint_num <= 0 (patrolpoint_num="
-                  << patrolpoint_num << ")" << std::endl;
-        return {};
-    }
-
-    if (enu_waypoints.size() < static_cast<size_t>(patrolpoint_num)) {
-        std::cerr << "computePatrolPathFromWaypoints failed: insufficient enu_waypoints, enu_waypoints.size()="
-                  << enu_waypoints.size() << ", patrolpoint_num=" << patrolpoint_num << std::endl;
-        return {};
-    }
-
-    std::vector<ENUPoint> patrol_zone(enu_waypoints.end() - patrolpoint_num, enu_waypoints.end());
-    return this->computePatrolPathByMode(patrol_zone, distance, patrol_mode, trajectory_enu);
-}
 //检查历史和当前航段是否进入异常区域
 bool UavPathPlanner::check_change(const InputData &input_data, OutputData &output_data)
 {
@@ -2332,8 +2255,6 @@ std::vector<ENUPoint> UavPathPlanner::preparePlanningWaypoints(int &midwaypoint_
 
     wgs84_points.insert(wgs84_points.end(), add_wgs84_points.begin(), add_wgs84_points.end());
     if (!wgs84_points.empty()) {
-        this->origin_ = wgs84_points[0];
-        this->origin_.alt = 0.0;
         Enu_waypoint = this->wgs84ToENU_Batch(wgs84_points, this->origin_);
     }
 
@@ -2382,13 +2303,18 @@ inline void appendUniqueIdLocal(std::vector<int> &v, int id) {
 } // namespace
 
 void UavPathPlanner::upsertUsingMidwayLine(int uav_id, int segment_id, const std::vector<WGS84Point> &traj) {
+    this->upsertUsingMidwayLine(this->output_data_, uav_id, segment_id, traj);
+}
+
+void UavPathPlanner::upsertUsingMidwayLine(OutputData &output_data, int uav_id, int segment_id,
+                                           const std::vector<WGS84Point> &traj) const {
     std::vector<WGS84Coord> pts;
     pts.reserve(traj.size());
     for (const auto &p : traj) {
         pts.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
     }
 
-    for (auto &line : this->output_data_.using_midway_lines) {
+    for (auto &line : output_data.using_midway_lines) {
         if (line.uav_id == uav_id && line.segment_id == segment_id) {
             line.points = std::move(pts);
             return;
@@ -2399,7 +2325,73 @@ void UavPathPlanner::upsertUsingMidwayLine(int uav_id, int segment_id, const std
     new_line.uav_id = uav_id;
     new_line.segment_id = segment_id;
     new_line.points = std::move(pts);
-    this->output_data_.using_midway_lines.push_back(std::move(new_line));
+    output_data.using_midway_lines.push_back(std::move(new_line));
+}
+
+void UavPathPlanner::writeLeaderPlane1(OutputData &output_data, const std::vector<WGS84Point> &traj) const {
+    output_data.uav_leader_plane1.clear();
+    output_data.uav_leader_plane1.reserve(traj.size());
+    for (const auto &p : traj) {
+        output_data.uav_leader_plane1.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
+    }
+    this->upsertUsingMidwayLine(output_data, this->input_data_.uav_leader_id, 1, traj);
+}
+
+void UavPathPlanner::writeLeaderSegment(std::vector<WGS84Coord> &dst_segment, OutputData &output_data,
+                                        int segment_id, const std::vector<WGS84Point> &traj,
+                                        bool sync_using_midway_line) const {
+    dst_segment.clear();
+    dst_segment.reserve(traj.size());
+    for (const auto &p : traj) {
+        dst_segment.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
+    }
+
+    if (sync_using_midway_line) {
+        this->upsertUsingMidwayLine(output_data, this->input_data_.uav_leader_id, segment_id, traj);
+    }
+}
+
+void UavPathPlanner::writeFollowerPlane1(OutputData &output_data, const std::vector<ENUPoint> &leader_traj_enu,
+                                         const std::vector<WGS84Point> &leader_traj_wgs) {
+    if (this->input_data_.formation_using != 1) {
+        output_data.uav_plane1.clear();
+        return;
+    }
+
+    try {
+        json plane_array = this->generateFollowerTrajectories(this->input_data_, leader_traj_enu, leader_traj_wgs);
+
+        output_data.uav_plane1.clear();
+        if (plane_array.is_array()) {
+            for (const auto &follower : plane_array) {
+                if (!follower.is_array() || follower.size() < 2 || !follower[0].is_number_integer()) {
+                    continue;
+                }
+
+                const int uid = follower[0].get<int>();
+                UavTrajectoryLine line;
+                line.uav_id = uid;
+                line.segment_id = 1;
+
+                std::vector<WGS84Point> follower_traj;
+                follower_traj.reserve(follower.size() - 1);
+                for (size_t i = 1; i < follower.size(); ++i) {
+                    WGS84Point p;
+                    if (!parseWGS84PointValue(follower[i], p)) {
+                        continue;
+                    }
+                    follower_traj.push_back(p);
+                    line.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
+                }
+                output_data.uav_plane1.push_back(std::move(line));
+                if (!follower_traj.empty()) {
+                    this->upsertUsingMidwayLine(output_data, uid, 1, follower_traj);
+                }
+            }
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "调用 generateFollowerTrajectories 出错: " << e.what() << std::endl;
+    }
 }
 
 bool UavPathPlanner::getFollowerStartWgs84(int uid, WGS84Point &out) const {
@@ -2424,6 +2416,13 @@ void UavPathPlanner::adjustFollowerStartAltitudeIfNeeded(WGS84Point &p, bool for
     if (!this->output_data_.uav_leader_plane1.empty() &&
         std::isfinite(this->output_data_.uav_leader_plane1.front().alt)) {
         leader_ref_alt = this->output_data_.uav_leader_plane1.front().alt;
+    }
+    // 非编队时，输入可能只给了长机起点经纬度（alt=0）。此时使用 leader_midway 的首点高度作为参考高度（仅高度基准，不参与路径）。
+    if ((!std::isfinite(leader_ref_alt) || std::abs(leader_ref_alt) < 1e-6) &&
+        !this->input_data_.leader_midway_point_wgs84.empty() &&
+        std::isfinite(this->input_data_.leader_midway_point_wgs84.front().alt) &&
+        this->input_data_.leader_midway_point_wgs84.front().alt > 0.0) {
+        leader_ref_alt = this->input_data_.leader_midway_point_wgs84.front().alt;
     }
 
     // 先保证“至少与长机同高”（仅抬升，不下调）
@@ -2459,307 +2458,110 @@ void UavPathPlanner::adjustFollowerStartAltitudeIfNeeded(WGS84Point &p, bool for
     }
 }
 
-bool UavPathPlanner::getFollowerCurrentState(int uid, bool formation_enabled, double final_heading,
-                                             ENUPoint &p0, double &heading0, std::vector<ENUPoint> &ctx_enu) {
-    heading0 = 0.0;
-    ctx_enu.clear();
+UavPathPlanner::AltitudeOptContext UavPathPlanner::prepareAltitudeOptimizationContext(bool ensure_elevation_loaded,
+                                                                                      bool print_config_log) {
+    AltitudeOptContext ctx;
+    ctx.enabled = this->config_.altitude_optimization.enabled;
+    ctx.elevation_file = this->config_.altitude_optimization.elevation_file;
 
-    // 1) 优先使用 plane1（仅在编队模式且 plane1 存在时）
-    if (formation_enabled && !this->output_data_.uav_plane1.empty()) {
-        const UavTrajectoryLine *follower_line = nullptr;
-        for (const auto &line : this->output_data_.uav_plane1) {
-            if (line.uav_id == uid) { follower_line = &line; break; }
-        }
-        if (follower_line != nullptr && follower_line->points.size() >= 2) {
-            std::vector<WGS84Point> wgs;
-            wgs.reserve(follower_line->points.size());
-            for (const auto &pt : follower_line->points) {
-                wgs.push_back({pt.lon, pt.lat, pt.alt});
-            }
-            ctx_enu = this->wgs84ToENU_Batch(wgs, this->origin_);
-            if (ctx_enu.size() >= 2) {
-                p0 = ctx_enu.back();
-                heading0 = computeTailHeadingRobust(ctx_enu, final_heading);
-                return true;
+    if (ensure_elevation_loaded && ctx.enabled && !ctx.elevation_file.empty()) {
+        if (!elev_cost_map_) elev_cost_map_ = std::make_unique<ElevationCostMap>();
+        if (!elev_cost_map_->isElevationValid()) {
+            if (!elev_cost_map_->loadElevationData(ctx.elevation_file)) {
+                std::cerr << "Warning: failed to load elevation file: " << ctx.elevation_file << std::endl;
             }
         }
     }
 
-    // 2) 回退：使用起点
-    WGS84Point start_wgs;
-    if (!this->getFollowerStartWgs84(uid, start_wgs)) return false;
-    this->adjustFollowerStartAltitudeIfNeeded(start_wgs, formation_enabled);
-    p0 = this->wgs84ToENU(start_wgs, this->origin_);
-    ctx_enu.push_back(p0);
-    heading0 = 0.0;
-    return true;
+    if (print_config_log) {
+        if (!this->config_.loaded) {
+            std::cerr << "Warning: config.yaml not loaded (" << this->config_.load_error << ")" << std::endl;
+        } else {
+            std::cout << "Loaded config from " << this->config_.loaded_from << std::endl;
+            std::cout << "altitude_opt_enabled: " << ctx.enabled << std::endl;
+            if (ctx.enabled && ctx.elevation_file.empty()) {
+                std::cerr << "Warning: 'elevation_file' parameter missing in config.yaml" << std::endl;
+            }
+        }
+    }
+
+    return ctx;
 }
-//规划函数 用于总调用
-bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, std::string algorithm)
-{
-    std::vector<ENUPoint> Enu_waypoint;
-    int midwaypoint_num = 0;
-    int zhandoupoint_num = 0;
-    double distance;
-    // InputData input_data; // Removed local variable
-    if (!loadData(this->input_data_, input_json)) // Use member variable
+
+void UavPathPlanner::appendUavSegmentLine(std::vector<UavTrajectoryLine> &dst, int uid, int segment_id,
+                                         const std::vector<WGS84Point> &traj) const {
+    UavTrajectoryLine line;
+    line.uav_id = uid;
+    line.segment_id = segment_id;
+    line.points.reserve(traj.size());
+    for (const auto &p : traj) {
+        line.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
+    }
+    dst.push_back(std::move(line));
+}
+
+void UavPathPlanner::generateLeaderPlane2Plane3NonFormation(const WGS84Point &leader_start_wgs, double distance) {
+    this->output_data_.uav_leader_plane2.clear();
+    this->output_data_.uav_leader_plane3.clear();
+
+    ENUPoint p0 = this->wgs84ToENU(leader_start_wgs, this->origin_);
+    const double zhandou_target_up = p0.up + this->input_data_.leader_fly_high;
+
+    std::vector<WGS84Point> leader_battle_wgs;
+    leader_battle_wgs.reserve(this->input_data_.high_zhandou_point_wgs84.size());
+    for (const auto &pt : this->input_data_.high_zhandou_point_wgs84) {
+        leader_battle_wgs.push_back({pt.lon, pt.lat, 0.0});
+    }
+    std::vector<ENUPoint> leader_battle_enu = this->wgs84ToENU_Batch(leader_battle_wgs, this->origin_);
+    for (auto &pt : leader_battle_enu) pt.up = zhandou_target_up;
+
+    std::vector<ENUPoint> ctx_enu;
+    ctx_enu.push_back(p0);
+    std::vector<ENUPoint> patrol_path = this->computePatrolPathByMode(
+        leader_battle_enu,
+        distance,
+        this->config_.path_planning.patrol_mode,
+        ctx_enu);
+    for (auto &pt : patrol_path) pt.up = zhandou_target_up;
+
+    if (patrol_path.empty()) {
+        std::cerr << "Warning: non-formation leader patrol (plane3) empty; leader plane2/3 not generated." << std::endl;
+        return;
+    }
+
+    // plane3
+    std::vector<WGS84Point> patrol_wgs = this->enuToWGS84_Batch(patrol_path, this->origin_);
+    this->writeLeaderSegment(this->output_data_.uav_leader_plane3, this->output_data_, 3, patrol_wgs);
+
+    // plane2: transition p0 -> patrol
+    ENUPoint p1 = patrol_path.front();
+    ENUPoint p2 = (patrol_path.size() >= 2) ? patrol_path[1] : patrol_path.front();
+    double heading0 = 0.0;
     {
-        std::cerr << "Failed to load intput json data." << std::endl;
+        const double dx = p1.east - p0.east;
+        const double dy = p1.north - p0.north;
+        heading0 = (std::hypot(dx, dy) > 1e-6) ? std::atan2(dy, dx) : 0.0;
     }
-    else
-    {
-        std::cerr << "Successfully load intput json data." << std::endl;
-    }
+    const double radius = std::max(0.0, this->input_data_.min_turning_radius);
+    const double resolution = (distance > 0.0) ? distance : 300.0;
+    std::vector<ENUPoint> transition = this->generateArcLineArc(p0, heading0, p1, p2, radius, resolution);
+    if (transition.empty()) return;
 
-    // 输出结果统一写入 output_data_，最后再一次性转换为 output_json
-    this->output_data_ = OutputData{};
-    // using_midway_lines 采用“输入历史 + 本次新增”的迭代模式（仅使用 loadData 已解析数据）
-    this->output_data_.using_midway_lines = this->input_data_.using_midway_lines;
+    std::vector<WGS84Point> trans_wgs = this->enuToWGS84_Batch(transition, this->origin_);
+    this->writeLeaderSegment(this->output_data_.uav_leader_plane2, this->output_data_, 2, trans_wgs);
+}
 
-    Enu_waypoint = this->preparePlanningWaypoints(midwaypoint_num, zhandoupoint_num);
+void UavPathPlanner::generateFollowerPlane1(const std::vector<ENUPoint> &leader_traj_enu,
+                                           const std::vector<WGS84Point> &leader_traj_wgs) {
+    this->writeFollowerPlane1(this->output_data_, leader_traj_enu, leader_traj_wgs);
+}
 
-    distance = this->input_data_.distance_points;
-    if (!(distance > 0.0)) {
-        // 最终兜底默认值
-        distance = 300.0;
-        std::cout << "Distance_Points not provided; using default distance_points=" << distance << std::endl;
-    }
-
-    
-    // 提取用于轨迹生成的点（排除末尾的 zhandou points）
-    std::vector<ENUPoint> planning_waypoints;
-    if (Enu_waypoint.size() >= zhandoupoint_num) {
-        planning_waypoints.assign(Enu_waypoint.begin(), Enu_waypoint.end() - zhandoupoint_num );
-    } else {
-        planning_waypoints = Enu_waypoint;
-    }
-
-    // 避障处理
-    if (this->input_data_.has_prohibited_zone) {
-        std::cout << "Applying prohibited zone avoidance..." << std::endl;
-        planning_waypoints = this->avoidProhibitedZones(planning_waypoints);
-    }
-
-    if (algorithm == "minimum_snap") {
-        if (use3D) {
-            Trajectory_ENU = this->Minisnap_3D(planning_waypoints, distance, this->input_data_.leader_speed);
-        } else {
-            Trajectory_ENU = this->Minisnap_EN(planning_waypoints, distance, this->input_data_.leader_speed);
-        }
-    } else if (algorithm == "bspline") {
-        std::cerr << "bspline algorithm not implemented yet." << std::endl;
-        return false;
-    } else if (algorithm == "bezier") {
-        Trajectory_ENU = this->Bezier_3D(planning_waypoints, distance, this->input_data_.leader_speed, this->input_data_.min_turning_radius);
-    } else {
-        std::cerr << "Unknown algorithm: " << algorithm << ". Please use one of: minimum_snap, bspline, bezier" << std::endl;
-        return false;
-    }
-    // std::cout << "trajectory point number:" << Trajectory_ENU.size() << std::endl;
-    //东北天坐标转换为经纬高
-    std::vector<WGS84Point> Trajectory_WGS84 = this->enuToWGS84_Batch(Trajectory_ENU,this->origin_);
-    // 将经纬高路径写入 output_data_ —— leader
-    this->output_data_.uav_leader_plane1.clear();
-    this->output_data_.uav_leader_plane1.reserve(Trajectory_WGS84.size());
-    for (const auto &p : Trajectory_WGS84) {
-        this->output_data_.uav_leader_plane1.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-    }
-
-    // 同步长机第一段到 using_midway_lines
-    this->upsertUsingMidwayLine(this->input_data_.uav_leader_id, 1, Trajectory_WGS84);
-
-    // ---------- 高度优化（先优化第一段，再生成第二/三段） ----------
-    bool altitude_opt_enabled = this->config_.altitude_optimization.enabled;
-    std::string elevation_file = this->config_.altitude_optimization.elevation_file;
-
-    if (!this->config_.loaded) {
-        std::cerr << "Warning: config.yaml not loaded (" << this->config_.load_error << ")" << std::endl;
-    } else {
-        std::cout << "Loaded config from " << this->config_.loaded_from << std::endl;
-        std::cout << "altitude_opt_enabled: " << altitude_opt_enabled << std::endl;
-        if (altitude_opt_enabled && elevation_file.empty()) {
-            std::cerr << "Warning: 'elevation_file' parameter missing in config.yaml" << std::endl;
-        }
-    }
-
-    if (altitude_opt_enabled) {
-        if (!elevation_file.empty()) {
-            std::cout << "Running Altitude Optimization with file: " << elevation_file << std::endl;
-            auto start_time = std::chrono::high_resolution_clock::now();
-            if (!this->runAltitudeOptimization(elevation_file, this->output_data_)) {
-                std::cerr << "Failed to Altitude Optimization!" << std::endl;
-            }
-            auto end_time = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double> elapsed = end_time - start_time;
-            std::cout << "Altitude optimization time: " << elapsed.count() << "s" << std::endl;
-        } else {
-            std::cerr << "Altitude optimization enabled but no elevation file specified." << std::endl;
-        }
-    } else {
-        std::cout << "Altitude optimization skipped." << std::endl;
-    }
-
-    // 统一使用（可能已优化后的）第一段轨迹
-    Trajectory_WGS84 = this->enuToWGS84_Batch(Trajectory_ENU, this->origin_);
-    this->output_data_.uav_leader_plane1.clear();
-    this->output_data_.uav_leader_plane1.reserve(Trajectory_WGS84.size());
-    for (const auto &p : Trajectory_WGS84) {
-        this->output_data_.uav_leader_plane1.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-    }
-    this->upsertUsingMidwayLine(this->input_data_.uav_leader_id, 1, Trajectory_WGS84);
-
-    // 计算并输出最小转弯半径
-    double min_radius = this->calculateMinTurningRadius(Trajectory_ENU);
-    if (min_radius > 0) {
-        std::cout << "Minimum turning radius: " << min_radius << " m" << std::endl;
-    } else {
-        std::cout << "Minimum turning radius: N/A (Straight line or insufficient points)" << std::endl;
-    }
-
-    // 计算 Trajectory_ENU 最终点的朝向
-    double final_heading = 0.0;
-    if (Trajectory_ENU.size() >= 2) {
-        final_heading = computeTailHeadingRobust(Trajectory_ENU, final_heading);
-    } else if (!planning_waypoints.empty()) {
-        // 如果轨迹点不足，尝试使用规划点的最后两个点
-        if (planning_waypoints.size() >= 2) {
-             final_heading = computeTailHeadingRobust(planning_waypoints, final_heading);
-        }
-    }
-    // std::cout << "Final heading: " << final_heading << " rad (" << rad2deg(final_heading) << " deg)" << std::endl;
-
-    // 生成并写入跟随者轨迹
-    if (this->input_data_.formation_using == 1) {  //编队模式1   
-        try {
-            json plane_array = this->generateFollowerTrajectories(this->input_data_, Trajectory_ENU, Trajectory_WGS84);
-
-            this->output_data_.uav_plane1.clear();
-            if (plane_array.is_array()) {
-                for (const auto &follower : plane_array) {
-                    if (!follower.is_array() || follower.size() < 2 || !follower[0].is_number_integer()) {
-                        continue;
-                    }
-
-                    const int uid = follower[0].get<int>();
-                    UavTrajectoryLine line;
-                    line.uav_id = uid;
-                    line.segment_id = 1;
-
-                    std::vector<WGS84Point> follower_traj;
-                    follower_traj.reserve(follower.size() - 1);
-                    for (size_t i = 1; i < follower.size(); ++i) {
-                        WGS84Point p;
-                        if (!parseWGS84PointValue(follower[i], p)) {
-                            continue;
-                        }
-                        follower_traj.push_back(p);
-                        line.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-                    }
-                    this->output_data_.uav_plane1.push_back(std::move(line));
-                    this->upsertUsingMidwayLine(uid, 1, follower_traj);
-                }
-            }
-        } catch (const std::exception &e) {
-            std::cerr << "调用 generateFollowerTrajectories 出错: " << e.what() << std::endl;
-        }
-    }
-    else{ // 不需要编队
-
-        // 无编队模式：僚机 plane1 必须为空（避免输出/历史残留造成误解）
-        this->output_data_.uav_plane1.clear();
-
-        // 输入历史不清除：不再主动删除 using_midway_lines 中的历史 segment=1。
-    }
-
-    std::vector<ENUPoint> Patrol_Path; // 提升作用域以供第二段轨迹计算使用
-
-    /*                   第三段段任务区域巡逻轨迹计算               */
-    if (zhandoupoint_num != 0)   //存在高战斗区域点
-    {
-        std::cout<<"开始计算第三段任务区域巡逻轨迹"<<std::endl;
-        if (Enu_waypoint.size() < static_cast<size_t>(zhandoupoint_num)) {
-            std::cerr << "plane3 leader patrol failed: Enu_waypoint.size()=" << Enu_waypoint.size()
-                      << " < zhandoupoint_num=" << zhandoupoint_num << std::endl;
-        } else {
-            std::vector<ENUPoint> zhandou_zone_enu(Enu_waypoint.end() - zhandoupoint_num, Enu_waypoint.end());
-
-            // 长机战斗区域目标高度：和僚机一致，基于 plane1 末点高度抬高 leader_fly_high
-            double base_up = 0.0;
-            if (!Trajectory_ENU.empty()) {
-                base_up = Trajectory_ENU.back().up;
-            } else if (midwaypoint_num > 0 && Enu_waypoint.size() >= static_cast<size_t>(midwaypoint_num)) {
-                base_up = Enu_waypoint[static_cast<size_t>(midwaypoint_num - 1)].up;
-            }
-            const double zhandou_target_up = base_up + this->input_data_.leader_fly_high;
-            for (auto &pt : zhandou_zone_enu) {
-                pt.up = zhandou_target_up;
-            }
-
-            Patrol_Path = this->computePatrolPathByMode(
-                zhandou_zone_enu,
-                distance,
-                this->config_.path_planning.patrol_mode,
-                Trajectory_ENU
-            );
-
-            // 第三段巡逻高度统一赋值为战斗区域目标高度
-            for (auto &pt : Patrol_Path) {
-                pt.up = zhandou_target_up;
-            }
-        }
-
-        if (!Patrol_Path.empty()) {
-            std::vector<WGS84Point> Patrol_Path_WGS84 = this->enuToWGS84_Batch(Patrol_Path, this->origin_);
-            this->output_data_.uav_leader_plane3.clear();
-            this->output_data_.uav_leader_plane3.reserve(Patrol_Path_WGS84.size());
-            for (const auto &p : Patrol_Path_WGS84) {
-                this->output_data_.uav_leader_plane3.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-            }
-
-            if (Trajectory_ENU.empty()) {
-                this->upsertUsingMidwayLine(this->input_data_.uav_leader_id, 3, Patrol_Path_WGS84);
-            }
-        } else {
-            std::cerr << "Warning: failed to generate patrol path in plane3." << std::endl;
-        }
-    }
-
-
-    /*                   第二段任务区域过渡轨迹计算      zhandoupoint_num           */
-    if(zhandoupoint_num != 0 && !Trajectory_ENU.empty() && !Patrol_Path.empty())   //存在高战斗区域点且有前序轨迹
-    {
-        std::cout<<"开始计算第二段任务区域过渡轨迹 (切圆切入优化)"<<std::endl;
-        ENUPoint p0 = Trajectory_ENU.back(); // 起点 ENU
-        double heading0 = final_heading; // 起点朝向
-
-        //僚机和长机巡逻区域不一样,所以注释掉
-        // // 计算并更新跟随者轨迹
-        // json plane_array = this->generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
-        // output_json["uav_plane1"] = plane_array;
-
-        // 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
-        computeTransitionAndRotatePatrol(p0, heading0, this->input_data_.min_turning_radius, distance, Patrol_Path, this->output_data_);
-    }
-
-    // 最后再对第二段和第三段做高度优化
-    if (altitude_opt_enabled && elev_cost_map_ && elev_cost_map_->isElevationValid()) {
-        std::vector<std::string> keys = {"uav_leader_plane2", "uav_leader_plane3"};
-        std::vector<int> seg_ids = {2, 3};
-        // 联合优化第二段和第三段，其中第三段（index 1）需要保持等高点高度相同
-        this->optimizeAndApplyJointSegments(this->output_data_, keys, seg_ids, 1);
-    }
-
-    // 僚机编队(plane1)执行完后：先决定去 battle_zone_wgs84 还是 ready_zone。
-    // - 输入里有 ready_id 的无人机：直接去 ready_zone（强制）。
-    // - 其它无人机：检查战斗区在当前高度层是否与禁飞区重叠/高度是否有效；不满足则改派去 ready_zone。
+void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double final_heading, double distance,
+                                                  std::vector<int> &out_final_ready_ids) {
     this->output_data_.uav_plane2.clear();
     this->output_data_.uav_plane3.clear();
 
-    const bool formation_enabled = (this->input_data_.formation_using == 1);
-
-    // NOTE: helper functions moved out of getPlan to keep this function readable.
-
-    std::vector<int> final_ready_ids = this->input_data_.ready_id;
+    out_final_ready_ids = this->input_data_.ready_id;
     std::vector<int> battle_ids;
 
     // 决定每个僚机去 ready_zone 还是 battle_zone
@@ -2778,14 +2580,14 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
 
             if (containsIdLocal(this->input_data_.ready_id, uid)) {
                 std::cout << "[DestDecide] uav_id=" << uid << " forced to ready_zone (in ready_id)." << std::endl;
-                appendUniqueIdLocal(final_ready_ids, uid);
+                appendUniqueIdLocal(out_final_ready_ids, uid);
                 continue;
             }
 
             const FlightZone *bz = this->selectBattleZoneForUav(uid);
             if (bz == nullptr) {
                 std::cout << "[DestDecide] uav_id=" << uid << " no battle_zone_wgs84 provided -> assign to ready_zone." << std::endl;
-                appendUniqueIdLocal(final_ready_ids, uid);
+                appendUniqueIdLocal(out_final_ready_ids, uid);
                 continue;
             }
 
@@ -2794,7 +2596,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             std::vector<ENUPoint> ctx_enu;
             if (!this->getFollowerCurrentState(uid, formation_enabled, final_heading, p0, heading0, ctx_enu)) {
                 std::cout << "[DestDecide] uav_id=" << uid << " no valid current state -> assign to ready_zone." << std::endl;
-                appendUniqueIdLocal(final_ready_ids, uid);
+                appendUniqueIdLocal(out_final_ready_ids, uid);
                 continue;
             }
 
@@ -2804,7 +2606,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             const bool battle_ok = this->check_battle_zone(uid, *bz, battle_target_up);
             if (!battle_ok) {
                 std::cout << "[DestDecide] uav_id=" << uid << " battle_zone check failed -> assign to ready_zone." << std::endl;
-                appendUniqueIdLocal(final_ready_ids, uid);
+                appendUniqueIdLocal(out_final_ready_ids, uid);
                 continue;
             }
 
@@ -2818,7 +2620,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
         for (int rid : battle_ids) {
             const FlightZone *bz = this->selectBattleZoneForUav(rid);
             if (bz == nullptr || bz->polygon.size() < 3) {
-                appendUniqueIdLocal(final_ready_ids, rid);
+                appendUniqueIdLocal(out_final_ready_ids, rid);
                 continue;
             }
 
@@ -2826,14 +2628,14 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             double heading0 = 0.0;
             std::vector<ENUPoint> ctx_enu;
             if (!this->getFollowerCurrentState(rid, formation_enabled, final_heading, p0, heading0, ctx_enu)) {
-                appendUniqueIdLocal(final_ready_ids, rid);
+                appendUniqueIdLocal(out_final_ready_ids, rid);
                 continue;
             }
 
             const double battle_relative_h = 0.5 * (bz->height_range.first + bz->height_range.second);
             const double battle_target_up = p0.up + battle_relative_h;
             if (!this->check_battle_zone(rid, *bz, battle_target_up)) {
-                appendUniqueIdLocal(final_ready_ids, rid);
+                appendUniqueIdLocal(out_final_ready_ids, rid);
                 continue;
             }
 
@@ -2844,7 +2646,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
                 battle_zone_wgs.push_back({pt.lon, pt.lat, battle_target_up});
             }
             if (battle_zone_wgs.size() < 3) {
-                appendUniqueIdLocal(final_ready_ids, rid);
+                appendUniqueIdLocal(out_final_ready_ids, rid);
                 continue;
             }
             std::vector<ENUPoint> battle_zone_enu = this->wgs84ToENU_Batch(battle_zone_wgs, this->origin_);
@@ -2858,7 +2660,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
 
             if (battle_patrol.empty()) {
                 std::cerr << "battle_id=" << rid << " failed to generate battle patrol path, fallback to ready_zone." << std::endl;
-                appendUniqueIdLocal(final_ready_ids, rid);
+                appendUniqueIdLocal(out_final_ready_ids, rid);
                 continue;
             }
             for (auto &pt : battle_patrol) pt.up = battle_target_up;
@@ -2883,7 +2685,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             std::vector<ENUPoint> battle_transition = this->generateArcLineArc(p0, heading0, p1, p2, radius, resolution);
             if (battle_transition.empty()) {
                 std::cerr << "battle_id=" << rid << " failed to generate battle transition path, fallback to ready_zone." << std::endl;
-                appendUniqueIdLocal(final_ready_ids, rid);
+                appendUniqueIdLocal(out_final_ready_ids, rid);
                 continue;
             }
 
@@ -2893,37 +2695,18 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             this->upsertUsingMidwayLine(rid, 2, battle_transition_wgs);
             this->upsertUsingMidwayLine(rid, 3, battle_patrol_wgs);
 
-            {
-                UavTrajectoryLine line2;
-                line2.uav_id = rid;
-                line2.segment_id = 2;
-                line2.points.reserve(battle_transition_wgs.size());
-                for (const auto &p : battle_transition_wgs) {
-                    line2.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-                }
-                this->output_data_.uav_plane2.push_back(std::move(line2));
-            }
-            {
-                UavTrajectoryLine line3;
-                line3.uav_id = rid;
-                line3.segment_id = 3;
-                line3.points.reserve(battle_patrol_wgs.size());
-                for (const auto &p : battle_patrol_wgs) {
-                    line3.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-                }
-                this->output_data_.uav_plane3.push_back(std::move(line3));
-            }
+            this->appendUavSegmentLine(this->output_data_.uav_plane2, rid, 2, battle_transition_wgs);
+            this->appendUavSegmentLine(this->output_data_.uav_plane3, rid, 3, battle_patrol_wgs);
         }
     }
 
-    // 再为 final_ready_ids 生成 plane2/plane3
-    if (!final_ready_ids.empty() &&
-        this->input_data_.ready_zone.polygon.size() >= 3) {
+    // 再为 out_final_ready_ids 生成 plane2/plane3
+    if (!out_final_ready_ids.empty() && this->input_data_.ready_zone.polygon.size() >= 3) {
 
         // ready_zone 相对高度：使用 ready_high_list 的平均值
         const double ready_relative_h = 0.5 * (this->input_data_.ready_zone.height_range.first + this->input_data_.ready_zone.height_range.second);
 
-        for (int rid : final_ready_ids) {
+        for (int rid : out_final_ready_ids) {
             // 如果该机已经生成了 battle plane2/3，则跳过 ready 生成
             bool already_has_plane2 = false;
             for (const auto &l2 : this->output_data_.uav_plane2) {
@@ -2996,65 +2779,348 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             this->upsertUsingMidwayLine(rid, 2, ready_transition_wgs);
             this->upsertUsingMidwayLine(rid, 3, ready_patrol_wgs);
 
-            {
-                UavTrajectoryLine line2;
-                line2.uav_id = rid;
-                line2.segment_id = 2;
-                line2.points.reserve(ready_transition_wgs.size());
-                for (const auto &p : ready_transition_wgs) {
-                    line2.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-                }
-                this->output_data_.uav_plane2.push_back(std::move(line2));
+            this->appendUavSegmentLine(this->output_data_.uav_plane2, rid, 2, ready_transition_wgs);
+            this->appendUavSegmentLine(this->output_data_.uav_plane3, rid, 3, ready_patrol_wgs);
+        }
+    }
+}
+
+bool UavPathPlanner::getFollowerCurrentState(int uid, bool formation_enabled, double final_heading,
+                                             ENUPoint &p0, double &heading0, std::vector<ENUPoint> &ctx_enu) {
+    heading0 = 0.0;
+    ctx_enu.clear();
+
+    // 1) 优先使用 plane1（仅在编队模式且 plane1 存在时）
+    if (formation_enabled && !this->output_data_.uav_plane1.empty()) {
+        const UavTrajectoryLine *follower_line = nullptr;
+        for (const auto &line : this->output_data_.uav_plane1) {
+            if (line.uav_id == uid) { follower_line = &line; break; }
+        }
+        if (follower_line != nullptr && follower_line->points.size() >= 2) {
+            std::vector<WGS84Point> wgs;
+            wgs.reserve(follower_line->points.size());
+            for (const auto &pt : follower_line->points) {
+                wgs.push_back({pt.lon, pt.lat, pt.alt});
             }
-            {
-                UavTrajectoryLine line3;
-                line3.uav_id = rid;
-                line3.segment_id = 3;
-                line3.points.reserve(ready_patrol_wgs.size());
-                for (const auto &p : ready_patrol_wgs) {
-                    line3.points.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-                }
-                this->output_data_.uav_plane3.push_back(std::move(line3));
+            ctx_enu = this->wgs84ToENU_Batch(wgs, this->origin_);
+            if (ctx_enu.size() >= 2) {
+                p0 = ctx_enu.back();
+                heading0 = computeTailHeadingRobust(ctx_enu, final_heading);
+                return true;
             }
         }
     }
 
-    // using_uav_list：若 input_json 提供非空 using_uav_list，则优先透传（并保证包含长机）；否则用默认的并集。
-    this->output_data_.using_uav_list.clear();
-    auto append_unique_id = [&](int id) {
-        for (int existing : this->output_data_.using_uav_list) {
-            if (existing == id) return;
-        }
-        this->output_data_.using_uav_list.push_back(id);
-    };
+    // 2) 回退：使用起点
+    WGS84Point start_wgs;
+    if (!this->getFollowerStartWgs84(uid, start_wgs)) return false;
+    this->adjustFollowerStartAltitudeIfNeeded(start_wgs, formation_enabled);
+    p0 = this->wgs84ToENU(start_wgs, this->origin_);
+    ctx_enu.push_back(p0);
+    heading0 = 0.0;
+    return true;
+}
+//规划函数 用于总调用
+bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, std::string algorithm)
+{
+    std::vector<ENUPoint> Enu_waypoint;
+    int midwaypoint_num = 0;
+    int zhandoupoint_num = 0;
+    double distance;
+    // InputData input_data; // Removed local variable
+    if (!loadData(this->input_data_, input_json)) // Use member variable
+    {
+        std::cerr << "Failed to load intput json data." << std::endl;
+    }
+    else
+    {
+        std::cerr << "Successfully load intput json data." << std::endl;
+    }
 
-    for (int id : this->input_data_.uav_leader_ids) append_unique_id(id);
-    if (!this->input_data_.using_uav_list.empty()) {
-        for (int id : this->input_data_.using_uav_list) append_unique_id(id);
+    // 输出结果统一写入 output_data_，最后再一次性转换为 output_json
+    this->output_data_ = OutputData{};
+    // using_midway_lines 采用“输入历史 + 本次新增”的迭代模式（仅使用 loadData 已解析数据）
+    this->output_data_.using_midway_lines = this->input_data_.using_midway_lines;
+
+    const bool formation_enabled = (this->input_data_.formation_using == 1);
+
+    // 长机起点（非编队时用于 origin_ 与长机 plane2/3 起点复用；高度优化逻辑只在非编队时修改）
+    WGS84Point leader_start_wgs{this->input_data_.uav_leader_start_point_wgs84.lon,
+                                this->input_data_.uav_leader_start_point_wgs84.lat,
+                                this->input_data_.uav_leader_start_point_wgs84.alt};
+
+    // ---------- 高度优化开关 / 高程数据加载（非编队也可能依赖地形查询用于起点抬升与后续 plane2/3 优化） ----------
+    const auto altitude_ctx = this->prepareAltitudeOptimizationContext(
+        /*ensure_elevation_loaded=*/true,
+        /*print_config_log=*/false);
+    const bool altitude_opt_enabled = altitude_ctx.enabled;
+    const std::string elevation_file = altitude_ctx.elevation_file;
+
+    // ---------- 原点选择 ----------
+    // 统一使用长机起点作为 origin_（仅经纬度参与 ENU 原点，alt 置 0）
+    // 非编队时仍保留现有起点高度优化，用于后续 plane2/3 起点与离地净空约束。
+    if (!formation_enabled) {
+        // 若输入未提供起点高度，优先用 leader_midway 的首点高度作为参考高度（仅用于高度基准，不参与路径）
+        if ((!std::isfinite(leader_start_wgs.alt) || std::abs(leader_start_wgs.alt) < 1e-6) &&
+            !this->input_data_.leader_midway_point_wgs84.empty() &&
+            std::isfinite(this->input_data_.leader_midway_point_wgs84.front().alt) &&
+            this->input_data_.leader_midway_point_wgs84.front().alt > 0.0) {
+            leader_start_wgs.alt = this->input_data_.leader_midway_point_wgs84.front().alt;
+        }
+        // 如果高程可用，保证起点不贴地（至少 safe_distance）
+        if (elev_cost_map_ && elev_cost_map_->isElevationValid()) {
+            AltitudeParams params = this->makeAltitudeParams();
+            double min_clearance = params.safe_distance;
+            if (!(min_clearance > 0.0) && (params.uav_R > 0.0)) min_clearance = params.uav_R;
+            if (min_clearance > 0.0) {
+                double elev = 0.0;
+                if (elev_cost_map_->getElevationAt(leader_start_wgs.lon, leader_start_wgs.lat, elev)) {
+                    const double min_alt = elev + min_clearance;
+                    if (std::isfinite(min_alt) && (!std::isfinite(leader_start_wgs.alt) || leader_start_wgs.alt < min_alt)) {
+                        leader_start_wgs.alt = min_alt;
+                    }
+                }
+            }
+        }
+    }
+    this->origin_ = leader_start_wgs;
+    this->origin_.alt = 0.0;
+
+    // ---------- 规划点准备（仅编队模式才需要 leader_midway_point_wgs84） ----------
+    if (formation_enabled) {
+        Enu_waypoint = this->preparePlanningWaypoints(midwaypoint_num, zhandoupoint_num);
     } else {
-        for (int id : this->input_data_.uavs_id) append_unique_id(id);
-        for (int id : final_ready_ids) append_unique_id(id);
+        midwaypoint_num = 0;
+        zhandoupoint_num = static_cast<int>(this->input_data_.high_zhandou_point_wgs84.size());
+        std::cout << "formation_using!=1: skip leader_midway_point_wgs84; high_zhandou_point_wgs84 count: "
+                  << zhandoupoint_num << std::endl;
     }
+
+    distance = this->input_data_.distance_points;
+    if (!(distance > 0.0)) {
+        // 最终兜底默认值
+        distance = 300.0;
+        std::cout << "Distance_Points not provided; using default distance_points=" << distance << std::endl;
+    }
+
+    std::vector<WGS84Point> Trajectory_WGS84;
+
+    // ---------- 长机 plane1（仅编队模式才生成/优化） ----------
+    if (formation_enabled) {
+
+        // 提取用于轨迹生成的点（排除末尾的 zhandou points）
+        std::vector<ENUPoint> planning_waypoints;
+        if (Enu_waypoint.size() >= static_cast<size_t>(zhandoupoint_num)) {
+            planning_waypoints.assign(Enu_waypoint.begin(), Enu_waypoint.end() - zhandoupoint_num);
+        } else {
+            planning_waypoints = Enu_waypoint;
+        }
+
+        // 避障处理  todo : 所有的轨迹都需要避障处理，而不仅仅是长机 plane1
+        if (this->input_data_.has_prohibited_zone) {
+            std::cout << "Applying prohibited zone avoidance..." << std::endl;
+            planning_waypoints = this->avoidProhibitedZones(planning_waypoints);
+        }
+
+        if (algorithm == "minimum_snap") {
+            if (use3D) {
+                Trajectory_ENU = this->Minisnap_3D(planning_waypoints, distance, this->input_data_.leader_speed);
+            } else {
+                Trajectory_ENU = this->Minisnap_EN(planning_waypoints, distance, this->input_data_.leader_speed);
+            }
+        } else if (algorithm == "bspline") {
+            std::cerr << "bspline algorithm not implemented yet." << std::endl;
+            return false;
+        } else if (algorithm == "bezier") {
+            Trajectory_ENU = this->Bezier_3D(planning_waypoints, distance, this->input_data_.leader_speed, this->input_data_.min_turning_radius);
+        } else {
+            std::cerr << "Unknown algorithm: " << algorithm << ". Please use one of: minimum_snap, bspline, bezier" << std::endl;
+            return false;
+        }
+
+        // ENU -> WGS84，并写入长机 plane1
+        Trajectory_WGS84 = this->enuToWGS84_Batch(Trajectory_ENU, this->origin_);
+        this->writeLeaderPlane1(this->output_data_, Trajectory_WGS84);
+    } else {
+        // 非编队：长机 plane1 必须为空
+        this->Trajectory_ENU.clear();
+        this->output_data_.uav_leader_plane1.clear();
+    }
+
+    this->prepareAltitudeOptimizationContext(
+        /*ensure_elevation_loaded=*/false,
+        /*print_config_log=*/true);
+
+    // 仅在编队模式对长机 plane1 做高度优化（非编队不走 leader_midway/plane1）
+    if (formation_enabled) {
+        if (altitude_opt_enabled) {
+            if (!elevation_file.empty()) {
+                std::cout << "Running Altitude Optimization with file: " << elevation_file << std::endl;
+                auto start_time = std::chrono::high_resolution_clock::now();
+                if (!this->runAltitudeOptimization(elevation_file, this->output_data_)) {
+                    std::cerr << "Failed to Altitude Optimization!" << std::endl;
+                }
+                auto end_time = std::chrono::high_resolution_clock::now();
+                std::chrono::duration<double> elapsed = end_time - start_time;
+                std::cout << "Altitude optimization time: " << elapsed.count() << "s" << std::endl;
+            } else {
+                std::cerr << "Altitude optimization enabled but no elevation file specified." << std::endl;
+            }
+        } else {
+            std::cout << "Altitude optimization skipped." << std::endl;
+        }
+    }
+
+    if (formation_enabled) {
+        // 高度优化可能更新了 output_data_.uav_leader_plane1；这里仅同步一份 WGS84Point 供后续生成僚机 plane1 使用。
+        Trajectory_WGS84.clear();
+        Trajectory_WGS84.reserve(this->output_data_.uav_leader_plane1.size());
+        for (const auto &p : this->output_data_.uav_leader_plane1) {
+            Trajectory_WGS84.push_back({p.lon, p.lat, p.alt});
+        }
+    }
+
+    // 计算并输出最小转弯半径（仅对 plane1 轨迹有意义）
+    if (formation_enabled) {
+        double min_radius = this->calculateMinTurningRadius(Trajectory_ENU);
+        if (min_radius > 0) {
+            std::cout << "Minimum turning radius: " << min_radius << " m" << std::endl;
+        } else {
+            std::cout << "Minimum turning radius: N/A (Straight line or insufficient points)" << std::endl;
+        }
+    }
+
+    // 计算 Trajectory_ENU 最终点的朝向（仅编队会用到）
+    double final_heading = 0.0;
+    if (formation_enabled) {
+        if (Trajectory_ENU.size() >= 2) {
+            final_heading = computeTailHeadingRobust(Trajectory_ENU, final_heading);
+        }
+    }
+    // std::cout << "Final heading: " << final_heading << " rad (" << rad2deg(final_heading) << " deg)" << std::endl;
+
+    // 生成并写入僚机 plane1（编队才有）
+    this->generateFollowerPlane1(Trajectory_ENU, Trajectory_WGS84);
+
+    std::vector<ENUPoint> Patrol_Path; // 提升作用域以供第二段轨迹计算使用
+
+    // ---------- 非编队：长机直接去自己的战斗区域（high_zhandou_point_wgs84） ----------
+    if (!formation_enabled) {
+        // 非编队：长机直接去自己的战斗区域（high_zhandou_point_wgs84）
+        this->generateLeaderPlane2Plane3NonFormation(leader_start_wgs, distance);
+    }
+
+    /*                   第三段段任务区域巡逻轨迹计算（仅编队模式）               */
+    if (formation_enabled && zhandoupoint_num != 0)   //存在高战斗区域点
+    {
+        std::cout<<"开始计算第三段任务区域巡逻轨迹"<<std::endl;
+        if (Enu_waypoint.size() < static_cast<size_t>(zhandoupoint_num)) {
+            std::cerr << "plane3 leader patrol failed: Enu_waypoint.size()=" << Enu_waypoint.size()
+                      << " < zhandoupoint_num=" << zhandoupoint_num << std::endl;
+        } else {
+            std::vector<ENUPoint> zhandou_zone_enu(Enu_waypoint.end() - zhandoupoint_num, Enu_waypoint.end());
+
+            // 长机战斗区域目标高度：和僚机一致，基于 plane1 末点高度抬高 leader_fly_high
+            double base_up = 0.0;
+            if (!Trajectory_ENU.empty()) {
+                base_up = Trajectory_ENU.back().up;
+            } else if (midwaypoint_num > 0 && Enu_waypoint.size() >= static_cast<size_t>(midwaypoint_num)) {
+                base_up = Enu_waypoint[static_cast<size_t>(midwaypoint_num - 1)].up;
+            }
+            const double zhandou_target_up = base_up + this->input_data_.leader_fly_high;
+            for (auto &pt : zhandou_zone_enu) {
+                pt.up = zhandou_target_up;
+            }
+
+            Patrol_Path = this->computePatrolPathByMode(
+                zhandou_zone_enu,
+                distance,
+                this->config_.path_planning.patrol_mode,
+                Trajectory_ENU
+            );
+
+            // 第三段巡逻高度统一赋值为战斗区域目标高度
+            for (auto &pt : Patrol_Path) {
+                pt.up = zhandou_target_up;
+            }
+        }
+
+        if (!Patrol_Path.empty()) {
+            std::vector<WGS84Point> Patrol_Path_WGS84 = this->enuToWGS84_Batch(Patrol_Path, this->origin_);
+            this->writeLeaderSegment(this->output_data_.uav_leader_plane3, this->output_data_, 3,
+                                     Patrol_Path_WGS84, /*sync_using_midway_line=*/Trajectory_ENU.empty());
+        } else {
+            std::cerr << "Warning: failed to generate patrol path in plane3." << std::endl;
+        }
+    }
+
+
+    /*                   第二段任务区域过渡轨迹计算      zhandoupoint_num           */
+    if(formation_enabled && zhandoupoint_num != 0 && !Trajectory_ENU.empty() && !Patrol_Path.empty())   //存在高战斗区域点且有前序轨迹
+    {
+        std::cout<<"开始计算第二段任务区域过渡轨迹 (切圆切入优化)"<<std::endl;
+        ENUPoint p0 = Trajectory_ENU.back(); // 起点 ENU
+        double heading0 = final_heading; // 起点朝向
+
+        //僚机和长机巡逻区域不一样,所以注释掉
+        // // 计算并更新跟随者轨迹
+        // json plane_array = this->generateFollowerTrajectories(input_json, input_data, Trajectory_ENU, Trajectory_WGS84);
+        // output_json["uav_plane1"] = plane_array;
+
+        // 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
+        computeTransitionAndRotatePatrol(p0, heading0, this->input_data_.min_turning_radius, distance, Patrol_Path, this->output_data_);
+    }
+
+    // 最后再对第二段和第三段做高度优化
+    if (altitude_opt_enabled && elev_cost_map_ && elev_cost_map_->isElevationValid()) {
+        std::vector<std::string> keys = {"uav_leader_plane2", "uav_leader_plane3"};
+        std::vector<int> seg_ids = {2, 3};
+        // 联合优化第二段和第三段，其中第三段（index 1）需要保持等高点高度相同
+        this->optimizeAndApplyJointSegments(this->output_data_, keys, seg_ids, 1);
+    }
+
+    // 僚机 plane2/3（战斗区/准备区）生成：内部会完成目的地分配并写入 output_data_.uav_plane2/uav_plane3，
+    // 同时返回“最终 ready_id”（包含 battle_zone 不满足而改派的无人机）。
+    std::vector<int> final_ready_ids;
+    this->generateFollowerPlane2Plane3(formation_enabled, final_heading, distance, final_ready_ids);
 
     // ready_id
     // 输出时回填“最终 ready_id”（包含 battle_zone 不满足而改派的无人机）
     this->output_data_.ready_id = final_ready_ids;
 
-    // leader_show_points：leader_midway_point_wgs84 + high_zhandou_point_wgs84（战斗区点使用 plane1 末点高度 + leader_fly_high）
+    // leader_show_points：编队模式显示 leader_midway_point_wgs84 + 战斗区点；非编队只显示战斗区点
     this->output_data_.leader_show_points.clear();
-    this->output_data_.leader_show_points.reserve(this->input_data_.leader_midway_point_wgs84.size() + this->input_data_.high_zhandou_point_wgs84.size());
-    for (const auto &pt : this->input_data_.leader_midway_point_wgs84) {
-        this->output_data_.leader_show_points.emplace_back(WGS84Coord(pt.lon, pt.lat, pt.alt));
-    }
-    double leader_show_last_alt = 0.0;
-    if (!this->output_data_.uav_leader_plane1.empty()) {
-        leader_show_last_alt = this->output_data_.uav_leader_plane1.back().alt;
-    } else if (!this->input_data_.leader_midway_point_wgs84.empty()) {
-        leader_show_last_alt = this->input_data_.leader_midway_point_wgs84.back().alt;
-    }
-    for (const auto &pt : this->input_data_.high_zhandou_point_wgs84) {
-        this->output_data_.leader_show_points.emplace_back(
-            WGS84Coord(pt.lon, pt.lat, leader_show_last_alt + this->input_data_.leader_fly_high));
+    if (formation_enabled) {
+        this->output_data_.leader_show_points.reserve(this->input_data_.leader_midway_point_wgs84.size() + this->input_data_.high_zhandou_point_wgs84.size());
+        for (const auto &pt : this->input_data_.leader_midway_point_wgs84) {
+            this->output_data_.leader_show_points.emplace_back(WGS84Coord(pt.lon, pt.lat, pt.alt));
+        }
+        double leader_show_last_alt = 0.0;
+        if (!this->output_data_.uav_leader_plane1.empty()) {
+            leader_show_last_alt = this->output_data_.uav_leader_plane1.back().alt;
+        } else if (!this->input_data_.leader_midway_point_wgs84.empty()) {
+            leader_show_last_alt = this->input_data_.leader_midway_point_wgs84.back().alt;
+        }
+        for (const auto &pt : this->input_data_.high_zhandou_point_wgs84) {
+            this->output_data_.leader_show_points.emplace_back(
+                WGS84Coord(pt.lon, pt.lat, leader_show_last_alt + this->input_data_.leader_fly_high));
+        }
+    } else {
+        // 非编队：战斗区点高度用 plane3 目标高度（若可用），否则用起点高度 + leader_fly_high
+        double zhandou_alt = 0.0;
+        if (!this->output_data_.uav_leader_plane3.empty()) {
+            zhandou_alt = this->output_data_.uav_leader_plane3.front().alt;
+        } else {
+            double base_alt = this->input_data_.uav_leader_start_point_wgs84.alt;
+            if ((!std::isfinite(base_alt) || std::abs(base_alt) < 1e-6) && !this->input_data_.leader_midway_point_wgs84.empty()) {
+                base_alt = this->input_data_.leader_midway_point_wgs84.front().alt;
+            }
+            zhandou_alt = base_alt + this->input_data_.leader_fly_high;
+        }
+        this->output_data_.leader_show_points.reserve(this->input_data_.high_zhandou_point_wgs84.size());
+        for (const auto &pt : this->input_data_.high_zhandou_point_wgs84) {
+            this->output_data_.leader_show_points.emplace_back(WGS84Coord(pt.lon, pt.lat, zhandou_alt));
+        }
     }
 
     {
@@ -3083,7 +3149,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     //         92,
     //         103
     //     ]
-    {
+    if (formation_enabled) {
         json work_json;
         this->outputDataToJson(this->output_data_, work_json);
         json midway = buildMidwayPointNum(this->input_data_, work_json);
@@ -3095,6 +3161,8 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
                 }
             }
         }
+    } else {
+        this->output_data_.midway_point_num.clear();
     }
 
     // 最终统一转换为 json 输出
@@ -3102,29 +3170,6 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     return true;
 }
 
-//保存经纬度轨迹到JSON
-bool UavPathPlanner::putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj) {
-    try {
-        // 创建二维数组
-        json trajectory_array = json::array();
-        
-        for (const auto& point : traj) {
-            // 每个点创建一维数组 [经度, 纬度, 高度]
-            json point_array = json::array();
-            point_array.push_back(point.lon);
-            point_array.push_back(point.lat);
-            point_array.push_back(point.alt);
-            
-            trajectory_array.push_back(point_array);
-        }        
-        // 将轨迹数组添加到 JSON 对象的指定键
-        j[key] = trajectory_array;        
-        return true;
-    } catch (const std::exception& e) {
-        std::cerr << "Error saving WGS84 to JSON: " << e.what() << std::endl;
-        return false;
-    }
-}
 //生成僚机编队轨迹
 json UavPathPlanner::generateFollowerTrajectories(const InputData &input_data,
                                   const std::vector<ENUPoint> &Trajectory_ENU,
@@ -4239,27 +4284,7 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
         
         std::vector<WGS84Point> Rotated_Patrol_WGS84 = this->enuToWGS84_Batch(Rotated_Patrol, this->origin_);
 
-        output_data.uav_leader_plane3.clear();
-        output_data.uav_leader_plane3.reserve(Rotated_Patrol_WGS84.size());
-        for (const auto &p : Rotated_Patrol_WGS84) {
-            output_data.uav_leader_plane3.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-        }
-
-        bool replaced = false;
-        for (auto &line : output_data.using_midway_lines) {
-            if (line.uav_id == this->input_data_.uav_leader_id && line.segment_id == 3) {
-                line.points = output_data.uav_leader_plane3;
-                replaced = true;
-                break;
-            }
-        }
-        if (!replaced) {
-            UavTrajectoryLine new_line;
-            new_line.uav_id = this->input_data_.uav_leader_id;
-            new_line.segment_id = 3;
-            new_line.points = output_data.uav_leader_plane3;
-            output_data.using_midway_lines.push_back(std::move(new_line));
-        }
+        this->writeLeaderSegment(output_data.uav_leader_plane3, output_data, 3, Rotated_Patrol_WGS84);
         
     } else {
         std::cerr << "Warning: Failed to find valid tangent transition, falling back to straight line." << std::endl;
@@ -4278,29 +4303,7 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
 
     std::vector<WGS84Point> Transition_Path_WGS84 = this->enuToWGS84_Batch(Transition_Path,this->origin_);
 
-    output_data.uav_leader_plane2.clear();
-    output_data.uav_leader_plane2.reserve(Transition_Path_WGS84.size());
-    for (const auto &p : Transition_Path_WGS84) {
-        output_data.uav_leader_plane2.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-    }
-
-    {
-        bool replaced = false;
-        for (auto &line : output_data.using_midway_lines) {
-            if (line.uav_id == this->input_data_.uav_leader_id && line.segment_id == 2) {
-                line.points = output_data.uav_leader_plane2;
-                replaced = true;
-                break;
-            }
-        }
-        if (!replaced) {
-            UavTrajectoryLine new_line;
-            new_line.uav_id = this->input_data_.uav_leader_id;
-            new_line.segment_id = 2;
-            new_line.points = output_data.uav_leader_plane2;
-            output_data.using_midway_lines.push_back(std::move(new_line));
-        }
-    }
+    this->writeLeaderSegment(output_data.uav_leader_plane2, output_data, 2, Transition_Path_WGS84);
 }
 //避开禁飞区域,高度避障或者绕障
 std::vector<ENUPoint> UavPathPlanner::avoidProhibitedZones(const std::vector<ENUPoint>& path) {
@@ -4505,27 +4508,6 @@ std::vector<ENUPoint> UavPathPlanner::avoidProhibitedZones(const std::vector<ENU
 
     return current_path;
 }
-//将规划的轨迹保存到using_midway_lines 输出
-void UavPathPlanner::appendTrajectoryToOutput(json &output_json, int uav_id, int segment_id, const std::vector<WGS84Point> &traj) {
-    if (!output_json.contains("using_midway_lines")) {
-        output_json["using_midway_lines"] = json::array();
-    }
-
-    json segment_entry = json::array();
-    segment_entry.push_back(uav_id);
-    segment_entry.push_back(segment_id);
-
-    for (const auto& point : traj) {
-        json point_array = json::array();
-        point_array.push_back(point.lon);
-        point_array.push_back(point.lat);
-        point_array.push_back(point.alt);
-        segment_entry.push_back(point_array);
-    }
-
-    output_json["using_midway_lines"].push_back(segment_entry);
-}
-
 bool UavPathPlanner::outputDataToJson(const OutputData &output_data, json &output_json) {
     output_json = json::object();
 

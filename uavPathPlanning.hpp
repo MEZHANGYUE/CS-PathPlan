@@ -236,7 +236,6 @@ public:
     bool loadData(InputData &input_data, json &input_json);
     // 将强类型 OutputData 写入 output_json（字段格式与当前约定保持一致）
     bool outputDataToJson(const OutputData &output_data, json &output_json);
-    bool putWGS84ToJson(json &j, const std::string &key, const std::vector<WGS84Point> &traj);
     json generateFollowerTrajectories(const InputData &input_data,
                                       const std::vector<ENUPoint> &Trajectory_ENU,
                                       const std::vector<WGS84Point> &Trajectory_WGS84);
@@ -256,9 +255,6 @@ public:
     // 计算第二段过渡轨迹（切圆切入优化）并更新第三段巡逻轨迹
     void computeTransitionAndRotatePatrol(const ENUPoint& p0, double heading0, double minR, double resolution,
                                           const std::vector<ENUPoint>& Patrol_Path, OutputData &output_data);
-
-    // 将轨迹信息追加到 output_json 的 using_midway_lines 字段
-    void appendTrajectoryToOutput(json &output_json, int uav_id, int segment_id, const std::vector<WGS84Point> &traj);
 
     // 避障处理
     std::vector<ENUPoint> avoidProhibitedZones(const std::vector<ENUPoint>& path);
@@ -292,38 +288,6 @@ public:
         }
     }
 
-    // CostMap: simple cost map storing height values (float)
-    class CostMap {
-    public:
-      CostMap() : width_(0), height_(0), resolution_(0.0), origin_x_(0.0), origin_y_(0.0) {}
-      void create(int width, int height, double resolution, double origin_x, double origin_y);
-      void setCost(int x, int y, float c);
-      float getCost(int x, int y) const;
-      int getWidth() const { return width_; }
-      int getHeight() const { return height_; }
-      double getResolution() const { return resolution_; }
-      double getOriginX() const { return origin_x_; }
-      double getOriginY() const { return origin_y_; }
-    
-      // get value at world coordinates (x,y)
-      bool getValueAt(double x, double y, float &val) const;
-    
-      // fill from elevation map (copy elevation values)
-      // Note: In this merged version, we pass the UavPathPlanner instance or relevant data directly
-      // But since CostMap is now nested or we just use UavPathPlanner's elevation data, 
-      // we might not need a separate fromElevationMap if we access UavPathPlanner's data.
-      // However, to keep logic similar to before, we can let it access UavPathPlanner's elevation data.
-      // For simplicity, let's keep CostMap as a helper class or struct within UavPathPlanner or just use UavPathPlanner's methods.
-      // The user asked to merge ElevationMap and CostMap classes into uavPathPlanning.
-      // ElevationMap logic is already largely merged into UavPathPlanner (elev_data_, etc).
-      // CostMap logic (grid of costs) can also be merged.
-      
-    private:
-      int width_, height_;
-      double resolution_, origin_x_, origin_y_;
-      std::vector<float> costs_; // row-major, top-left origin
-    };
-
 private:
     // 内部状态
     TrajectoryGeneratorTool generator_;
@@ -334,10 +298,29 @@ private:
 
     // getPlan 内部拆分出的 helper（避免所有逻辑挤在 getPlan 中）
     void upsertUsingMidwayLine(int uav_id, int segment_id, const std::vector<WGS84Point> &traj);
+    void upsertUsingMidwayLine(OutputData &output_data, int uav_id, int segment_id, const std::vector<WGS84Point> &traj) const;
+    void writeLeaderPlane1(OutputData &output_data, const std::vector<WGS84Point> &traj) const;
+    void writeLeaderSegment(std::vector<WGS84Coord> &dst_segment, OutputData &output_data,
+                            int segment_id, const std::vector<WGS84Point> &traj,
+                            bool sync_using_midway_line = true) const;
+    void writeFollowerPlane1(OutputData &output_data, const std::vector<ENUPoint> &leader_traj_enu,
+                             const std::vector<WGS84Point> &leader_traj_wgs);
     bool getFollowerStartWgs84(int uid, WGS84Point &out) const;
     void adjustFollowerStartAltitudeIfNeeded(WGS84Point &p, bool formation_enabled) const;
     bool getFollowerCurrentState(int uid, bool formation_enabled, double final_heading,
                                  ENUPoint &p0, double &heading0, std::vector<ENUPoint> &ctx_enu);
+
+    struct AltitudeOptContext {
+        bool enabled = false;
+        std::string elevation_file;
+    };
+    AltitudeOptContext prepareAltitudeOptimizationContext(bool ensure_elevation_loaded, bool print_config_log);
+
+    void generateLeaderPlane2Plane3NonFormation(const WGS84Point &leader_start_wgs, double distance);
+    void generateFollowerPlane1(const std::vector<ENUPoint> &leader_traj_enu, const std::vector<WGS84Point> &leader_traj_wgs);
+    void generateFollowerPlane2Plane3(bool formation_enabled, double final_heading, double distance, std::vector<int> &out_final_ready_ids);
+    void appendUavSegmentLine(std::vector<UavTrajectoryLine> &dst, int uid, int segment_id, const std::vector<WGS84Point> &traj) const;
+
     // 提取的高度优化器函数仍在 cpp 中实现为私有方法
     // 现在只输入高程文件路径（例如 .tif），函数直接使用类成员 Trajectory_ENU 进行高度优化
     // bool runAltitudeOptimization(const std::string &elev_file);
@@ -346,13 +329,6 @@ private:
                                                   double distance,
                                                   const std::string& patrol_mode,
                                                   const std::vector<ENUPoint>& trajectory_enu);
-
-    // 兼容封装：从 enu_waypoints 尾部截取 patrolpoint_num 个点作为巡逻区域，然后调用 computePatrolPathByMode。
-    std::vector<ENUPoint> computePatrolPathFromWaypoints(const std::vector<ENUPoint>& enu_waypoints,
-                                                         int patrolpoint_num,
-                                                         double distance,
-                                                         const std::string& patrol_mode,
-                                                         const std::vector<ENUPoint>& trajectory_enu);
 
     // SINGLE 巡逻路径生成（从巡逻区域多边形点集生成闭合巡逻轨迹）
     std::vector<ENUPoint> gen_single_patrol(const std::vector<ENUPoint> &patrol_zone,
