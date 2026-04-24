@@ -1007,25 +1007,7 @@ bool UavPathPlanner::optimizeAndApplyOutputSegment(OutputData &output_data, cons
         seg_vec->emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
     }
 
-    auto upsertUsingMidwayLine = [&](int uav_id, int seg_id, const std::vector<WGS84Point> &traj) {
-        std::vector<WGS84Coord> pts;
-        pts.reserve(traj.size());
-        for (const auto &p : traj) {
-            pts.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-        }
-        for (auto &line : output_data.using_midway_lines) {
-            if (line.uav_id == uav_id && line.segment_id == seg_id) {
-                line.points = std::move(pts);
-                return;
-            }
-        }
-        UavTrajectoryLine new_line;
-        new_line.uav_id = uav_id;
-        new_line.segment_id = seg_id;
-        new_line.points = std::move(pts);
-        output_data.using_midway_lines.push_back(std::move(new_line));
-    };
-    upsertUsingMidwayLine(this->input_data_.uav_leader_id, segment_id, seg_wgs);
+    this->upsertUsingMidwayLine(output_data, this->input_data_.uav_leader_id, segment_id, seg_wgs);
 
     return true;
 }
@@ -1129,25 +1111,6 @@ bool UavPathPlanner::optimizeAndApplyJointSegments(OutputData &output_data, cons
 
     joint_wgs = this->enuToWGS84_Batch(joint_enu, this->origin_);
 
-    auto upsertUsingMidwayLine = [&](int uav_id, int seg_id, const std::vector<WGS84Point> &traj) {
-        std::vector<WGS84Coord> pts;
-        pts.reserve(traj.size());
-        for (const auto &p : traj) {
-            pts.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-        }
-        for (auto &line : output_data.using_midway_lines) {
-            if (line.uav_id == uav_id && line.segment_id == seg_id) {
-                line.points = std::move(pts);
-                return;
-            }
-        }
-        UavTrajectoryLine new_line;
-        new_line.uav_id = uav_id;
-        new_line.segment_id = seg_id;
-        new_line.points = std::move(pts);
-        output_data.using_midway_lines.push_back(std::move(new_line));
-    };
-
     // 回写到 OutputData 和 using_midway_lines
     size_t current_offset = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -1164,7 +1127,7 @@ bool UavPathPlanner::optimizeAndApplyJointSegments(OutputData &output_data, cons
         }
 
         int seg_id = segment_ids[i];
-        upsertUsingMidwayLine(this->input_data_.uav_leader_id, seg_id, seg_wgs);
+        this->upsertUsingMidwayLine(output_data, this->input_data_.uav_leader_id, seg_id, seg_wgs);
         current_offset = next_offset;
     }
 
@@ -2319,10 +2282,6 @@ inline void appendUniqueIdLocal(std::vector<int> &v, int id) {
 }
 } // namespace
 
-void UavPathPlanner::upsertUsingMidwayLine(int uav_id, int segment_id, const std::vector<WGS84Point> &traj) {
-    this->upsertUsingMidwayLine(this->output_data_, uav_id, segment_id, traj);
-}
-
 void UavPathPlanner::upsertUsingMidwayLine(OutputData &output_data, int uav_id, int segment_id,
                                            const std::vector<WGS84Point> &traj) const {
     std::vector<WGS84Coord> pts;
@@ -2525,6 +2484,21 @@ bool UavPathPlanner::buildTransitionAndRotatePatrol(const ENUPoint& p0, double h
     out_rotated_patrol.clear();
     if (patrol_path.empty()) return false;
 
+    if (!(minR > 1e-6)) {
+        ENUPoint p1 = patrol_path.front();
+        double dx = p1.east - p0.east;
+        double dy = p1.north - p0.north;
+        double dist = std::hypot(dx, dy);
+        int steps = std::max(1, static_cast<int>(std::ceil(dist / resolution)));
+        for (int i = 0; i <= steps; ++i) {
+            double t = static_cast<double>(i) / steps;
+            ENUPoint q{p0.east + t * dx, p0.north + t * dy, p0.up + t * (p1.up - p0.up)};
+            out_transition_path.push_back(q);
+        }
+        out_rotated_patrol = patrol_path;
+        return false;
+    }
+
     double best_score = std::numeric_limits<double>::max();
     size_t best_idx = 0;
     double best_arc_len = 0.0;
@@ -2653,6 +2627,149 @@ bool UavPathPlanner::buildTransitionAndRotatePatrol(const ENUPoint& p0, double h
     return false;
 }
 
+double UavPathPlanner::computeActualMaxClimbRate(const std::vector<ENUPoint> &path) const {
+    double max_rate = 0.0;
+    if (path.size() < 2) return max_rate;
+
+    for (size_t i = 1; i < path.size(); ++i) {
+        const double dx = path[i].east - path[i - 1].east;
+        const double dy = path[i].north - path[i - 1].north;
+        const double dist_xy = std::hypot(dx, dy);
+        if (dist_xy <= 1e-6) continue;
+        const double dz = path[i].up - path[i - 1].up;
+        max_rate = std::max(max_rate, std::abs(dz) / dist_xy);
+    }
+    return max_rate;
+}
+
+void UavPathPlanner::enforceTransitionClimbRateAndBorrowPatrolPrefix(std::vector<ENUPoint> &transition_path,
+                                                                     std::vector<ENUPoint> &patrol_path,
+                                                                     const std::string &log_label) const {
+    if (transition_path.empty() || patrol_path.empty()) return;
+
+    const double max_climb_rate = this->makeAltitudeParams().max_climb_rate;
+    if (!(max_climb_rate > 0.0)) {
+        std::cout << log_label << " actual max climb rate: "
+                  << this->computeActualMaxClimbRate(transition_path) << std::endl;
+        return;
+    }
+
+    std::vector<ENUPoint> patrol_core = patrol_path;
+    auto sameXY = [](const ENUPoint &a, const ENUPoint &b) {
+        return std::hypot(a.east - b.east, a.north - b.north) <= 1e-6;
+    };
+    const bool patrol_closed = patrol_core.size() >= 2 && sameXY(patrol_core.front(), patrol_core.back());
+    if (patrol_closed) {
+        patrol_core.pop_back();
+    }
+    if (patrol_core.empty()) {
+        std::cout << log_label << " actual max climb rate: "
+                  << this->computeActualMaxClimbRate(transition_path) << std::endl;
+        return;
+    }
+
+    const double target_up = patrol_core.front().up;
+    auto advanceTowardTarget = [&](double current_up, double dist_xy) {
+        const double delta_limit = max_climb_rate * std::max(0.0, dist_xy);
+        if (target_up >= current_up) return std::min(target_up, current_up + delta_limit);
+        return std::max(target_up, current_up - delta_limit);
+    };
+
+    for (size_t i = 1; i < transition_path.size(); ++i) {
+        const double dx = transition_path[i].east - transition_path[i - 1].east;
+        const double dy = transition_path[i].north - transition_path[i - 1].north;
+        const double dist_xy = std::hypot(dx, dy);
+        transition_path[i].up = advanceTowardTarget(transition_path[i - 1].up, dist_xy);
+    }
+
+    const auto reachedTarget = [&](double up) {
+        return std::abs(up - target_up) <= 1e-6;
+    };
+
+    if (!reachedTarget(transition_path.back().up)) {
+        double loop_length = 0.0;
+        for (size_t i = 0; i < patrol_core.size(); ++i) {
+            const ENUPoint &a = patrol_core[i];
+            const ENUPoint &b = patrol_core[(i + 1) % patrol_core.size()];
+            loop_length += std::hypot(b.east - a.east, b.north - a.north);
+        }
+        if (loop_length <= 1e-6) {
+            std::cerr << log_label << " failed to extend plane2: patrol loop length is zero." << std::endl;
+        } else {
+            const double remaining_h = std::abs(target_up - transition_path.back().up);
+            const int max_loops = std::max(1, static_cast<int>(std::ceil(remaining_h / (max_climb_rate * loop_length))) + 1);
+
+            ENUPoint current = transition_path.back();
+            int current_idx = 0;
+            bool reached = false;
+
+            for (int loop = 0; loop < max_loops && !reached; ++loop) {
+                for (size_t step = 0; step < patrol_core.size(); ++step) {
+                    const int next_idx = (current_idx + 1) % static_cast<int>(patrol_core.size());
+                    const ENUPoint &next_patrol = patrol_core[static_cast<size_t>(next_idx)];
+                    const double dx = next_patrol.east - current.east;
+                    const double dy = next_patrol.north - current.north;
+                    const double dist_xy = std::hypot(dx, dy);
+                    if (dist_xy <= 1e-6) {
+                        current = {next_patrol.east, next_patrol.north, current.up};
+                        current_idx = next_idx;
+                        continue;
+                    }
+
+                    const double next_up = advanceTowardTarget(current.up, dist_xy);
+                    if (!reachedTarget(next_up)) {
+                        ENUPoint appended{next_patrol.east, next_patrol.north, next_up};
+                        transition_path.push_back(appended);
+                        current = appended;
+                        current_idx = next_idx;
+                        continue;
+                    }
+
+                    const double delta_up = std::abs(target_up - current.up);
+                    const double step_up = std::abs(next_up - current.up);
+                    double t = (step_up > 1e-9) ? (delta_up / step_up) : 1.0;
+                    t = std::clamp(t, 0.0, 1.0);
+
+                    ENUPoint split_point;
+                    split_point.east = current.east + t * dx;
+                    split_point.north = current.north + t * dy;
+                    split_point.up = target_up;
+                    if (!sameXY(split_point, transition_path.back()) || !reachedTarget(transition_path.back().up)) {
+                        transition_path.push_back(split_point);
+                    }
+
+                    std::vector<ENUPoint> rebuilt_patrol;
+                    rebuilt_patrol.reserve(patrol_core.size() + 2);
+                    rebuilt_patrol.push_back(split_point);
+                    rebuilt_patrol.push_back({next_patrol.east, next_patrol.north, target_up});
+                    for (size_t k = 1; k < patrol_core.size(); ++k) {
+                        const size_t idx = (static_cast<size_t>(next_idx) + k) % patrol_core.size();
+                        rebuilt_patrol.push_back({patrol_core[idx].east, patrol_core[idx].north, target_up});
+                    }
+                    rebuilt_patrol.push_back(split_point);
+                    patrol_path = std::move(rebuilt_patrol);
+                    reached = true;
+                    break;
+                }
+            }
+
+            if (!reached) {
+                std::cerr << log_label << " warning: borrowed full patrol prefix loops but still did not reach patrol altitude." << std::endl;
+                patrol_path = patrol_core;
+                for (auto &pt : patrol_path) pt.up = target_up;
+                if (!patrol_path.empty()) patrol_path.push_back(patrol_path.front());
+            }
+        }
+    } else {
+        for (auto &pt : patrol_path) {
+            pt.up = target_up;
+        }
+    }
+
+    std::cout << log_label << " actual max climb rate: "
+              << this->computeActualMaxClimbRate(transition_path) << std::endl;
+}
+
 void UavPathPlanner::generateLeaderPlane2Plane3NonFormation(const WGS84Point &leader_start_wgs, double distance) {
     this->output_data_.uav_leader_plane2.clear();
     this->output_data_.uav_leader_plane3.clear();
@@ -2695,6 +2812,11 @@ void UavPathPlanner::generateLeaderPlane2Plane3NonFormation(const WGS84Point &le
     std::vector<ENUPoint> rotated_patrol;
     this->buildTransitionAndRotatePatrol(p0, heading0, radius, resolution, patrol_path, transition, rotated_patrol);
     if (transition.empty()) return;
+
+    if (!rotated_patrol.empty()) {
+        this->enforceTransitionClimbRateAndBorrowPatrolPrefix(transition, rotated_patrol,
+                                                              "leader plane2(non-formation)");
+    }
 
     std::vector<WGS84Point> trans_wgs = this->enuToWGS84_Batch(transition, this->origin_);
     std::vector<WGS84Point> patrol_wgs = this->enuToWGS84_Batch(rotated_patrol.empty() ? patrol_path : rotated_patrol, this->origin_);
@@ -2840,12 +2962,18 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
                 continue;
             }
 
+            if (!rotated_battle_patrol.empty()) {
+                this->enforceTransitionClimbRateAndBorrowPatrolPrefix(
+                    battle_transition, rotated_battle_patrol,
+                    std::string("uav ") + std::to_string(rid) + " battle plane2");
+            }
+
             std::vector<WGS84Point> battle_transition_wgs = this->enuToWGS84_Batch(battle_transition, this->origin_);
             std::vector<WGS84Point> battle_patrol_wgs = this->enuToWGS84_Batch(
                 rotated_battle_patrol.empty() ? battle_patrol : rotated_battle_patrol, this->origin_);
 
-            this->upsertUsingMidwayLine(rid, 2, battle_transition_wgs);
-            this->upsertUsingMidwayLine(rid, 3, battle_patrol_wgs);
+            this->upsertUsingMidwayLine(this->output_data_, rid, 2, battle_transition_wgs);
+            this->upsertUsingMidwayLine(this->output_data_, rid, 3, battle_patrol_wgs);
 
             this->appendUavSegmentLine(this->output_data_.uav_plane2, rid, 2, battle_transition_wgs);
             this->appendUavSegmentLine(this->output_data_.uav_plane3, rid, 3, battle_patrol_wgs);
@@ -2926,12 +3054,18 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
                 continue;
             }
 
+            if (!rotated_ready_patrol.empty()) {
+                this->enforceTransitionClimbRateAndBorrowPatrolPrefix(
+                    ready_transition, rotated_ready_patrol,
+                    std::string("uav ") + std::to_string(rid) + " ready plane2");
+            }
+
             std::vector<WGS84Point> ready_transition_wgs = this->enuToWGS84_Batch(ready_transition, this->origin_);
             std::vector<WGS84Point> ready_patrol_wgs = this->enuToWGS84_Batch(
                 rotated_ready_patrol.empty() ? ready_patrol : rotated_ready_patrol, this->origin_);
 
-            this->upsertUsingMidwayLine(rid, 2, ready_transition_wgs);
-            this->upsertUsingMidwayLine(rid, 3, ready_patrol_wgs);
+            this->upsertUsingMidwayLine(this->output_data_, rid, 2, ready_transition_wgs);
+            this->upsertUsingMidwayLine(this->output_data_, rid, 3, ready_patrol_wgs);
 
             this->appendUavSegmentLine(this->output_data_.uav_plane2, rid, 2, ready_transition_wgs);
             this->appendUavSegmentLine(this->output_data_.uav_plane3, rid, 3, ready_patrol_wgs);
@@ -4296,6 +4430,11 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
     std::vector<ENUPoint> Rotated_Patrol;
     this->buildTransitionAndRotatePatrol(p0, heading0, minR, resolution, Patrol_Path,
                                          Transition_Path, Rotated_Patrol);
+
+    if (!Rotated_Patrol.empty()) {
+        this->enforceTransitionClimbRateAndBorrowPatrolPrefix(Transition_Path, Rotated_Patrol,
+                                                              "leader plane2(formation)");
+    }
 
     if (!Rotated_Patrol.empty()) {
         std::vector<WGS84Point> Rotated_Patrol_WGS84 = this->enuToWGS84_Batch(Rotated_Patrol, this->origin_);

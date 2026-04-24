@@ -3,7 +3,7 @@ altitude_optimization:
   elevation_file: "../data/neimeng.tif" #读取地形高程的 DEM 文件路径
   lambda_smooth: 1.0 #平滑项权重
   lambda_follow: 1.0 #跟随地形项权重
-  max_climb_rate: 0.5 #最大爬升率约束
+  max_climb_rate: 0.1 #最大爬升率约束
   uav_R: 2.0
   safe_distance: 50.0 #相对于地形的最小安全垂直距离（米）
 

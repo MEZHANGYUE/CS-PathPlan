@@ -297,22 +297,67 @@ private:
     OutputData output_data_; // 存储解析后的输出数据，避免重复解析
 
     // getPlan 内部拆分出的 helper（避免所有逻辑挤在 getPlan 中）
-    void upsertUsingMidwayLine(int uav_id, int segment_id, const std::vector<WGS84Point> &traj);
+
+    // 将一段 WGS84 轨迹写入指定 output_data.using_midway_lines。
+    // 若相同 (uav_id, segment_id) 已存在则覆盖，否则追加新记录。
     void upsertUsingMidwayLine(OutputData &output_data, int uav_id, int segment_id, const std::vector<WGS84Point> &traj) const;
+
+    // 将长机第一段轨迹（plane1）写入 output_data，
+    // 同时同步 using_midway_lines 中 segment_id=1 的历史记录。
     void writeLeaderPlane1(OutputData &output_data, const std::vector<WGS84Point> &traj) const;
+
+    // 通用的“长机某一段轨迹写回”封装。
+    // dst_segment 通常是 uav_leader_plane2 / uav_leader_plane3。
+    // sync_using_midway_line=true 时，会同步 using_midway_lines 对应段号。
     void writeLeaderSegment(std::vector<WGS84Coord> &dst_segment, OutputData &output_data,
                             int segment_id, const std::vector<WGS84Point> &traj,
                             bool sync_using_midway_line = true) const;
+
+    // 根据长机第一段轨迹生成僚机第一段编队轨迹（plane1），
+    // 并写入 output_data.uav_plane1 / using_midway_lines。
+    // 当 formation_using != 1 时，会清空僚机 plane1。
     void writeFollowerPlane1(OutputData &output_data, const std::vector<ENUPoint> &leader_traj_enu,
                              const std::vector<WGS84Point> &leader_traj_wgs);
+
+    // 按 uid 从输入数据中查找僚机起点经纬高。
+    // 找到返回 true，并通过 out 输出；否则返回 false。
     bool getFollowerStartWgs84(int uid, WGS84Point &out) const;
+
+    // 非编队模式下，对僚机起点高度做安全修正：
+    // - 至少不低于长机参考高度
+    // - 若高程数据可用，则进一步满足离地安全净空
+    // 编队模式下直接返回，不做修改。
     void adjustFollowerStartAltitudeIfNeeded(WGS84Point &p, bool formation_enabled) const;
+
+    // 获取僚机当前状态（plane2 的起点状态）：
+    // - 编队模式优先使用僚机 plane1 末点及其尾朝向
+    // - 否则退回到输入起点（必要时做高度修正）
+    // 同时输出一份上下文轨迹 ctx_enu，供后续巡逻/过渡生成使用。
     bool getFollowerCurrentState(int uid, bool formation_enabled, double final_heading,
                                  ENUPoint &p0, double &heading0, std::vector<ENUPoint> &ctx_enu);
+
+    // B 方案过渡生成器：
+    // 从当前点 p0/heading0 出发，在整个 patrol_path 上搜索“最佳切入点”，
+    // 生成 plane2 过渡轨迹 out_transition_path，
+    // 并将 plane3 巡逻轨迹旋转为从该切入点开始的 out_rotated_patrol。
     bool buildTransitionAndRotatePatrol(const ENUPoint& p0, double heading0, double minR, double resolution,
                                         const std::vector<ENUPoint>& patrol_path,
                                         std::vector<ENUPoint> &out_transition_path,
                                         std::vector<ENUPoint> &out_rotated_patrol) const;
+
+    // 统计一段 ENU 轨迹的“实际最大爬升率”（|Δup| / 水平距离）。
+    // 用于日志打印与约束验证。
+    double computeActualMaxClimbRate(const std::vector<ENUPoint> &path) const;
+
+    // 对 plane2 施加最大爬升率约束，并在高度不足时“借用” plane3 前缀：
+    // - 保留当前 plane2 的平面路径点不变，只回拉/调整高度
+    // - 若 plane2 末点还未达到 plane3 目标高度，则沿 plane3 前缀继续走，
+    //   将这些点并入 plane2，并按 max_climb_rate 逐步抬升
+    // - 一旦达到目标高度，从该点开始重建剩余 plane3
+    // - 最后打印该过渡段的实际最大爬升率日志
+    void enforceTransitionClimbRateAndBorrowPatrolPrefix(std::vector<ENUPoint> &transition_path,
+                                                         std::vector<ENUPoint> &patrol_path,
+                                                         const std::string &log_label) const;
 
     struct AltitudeOptContext {
         bool enabled = false;
