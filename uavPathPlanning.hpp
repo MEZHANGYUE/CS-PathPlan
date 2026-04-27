@@ -341,6 +341,13 @@ private:
                                         std::vector<ENUPoint> &out_transition_path,
                                         std::vector<ENUPoint> &out_rotated_patrol) const;
 
+    // 在生成 plane2 过渡轨迹后，统一执行禁飞区避让后处理；
+    // plane3 的旋转巡逻起点保持不变，仅对 transition_path 做插点绕飞/抬高。
+    bool buildTransitionAndRotatePatrolWithAvoidance(const ENUPoint& p0, double heading0, double minR, double resolution,
+                                                     const std::vector<ENUPoint>& patrol_path,
+                                                     std::vector<ENUPoint> &out_transition_path,
+                                                     std::vector<ENUPoint> &out_rotated_patrol);
+
     // 统计一段 ENU 轨迹的“实际最大爬升率”（|Δup| / 水平距离）。
     // 用于日志打印与约束验证。
     double computeActualMaxClimbRate(const std::vector<ENUPoint> &path) const;

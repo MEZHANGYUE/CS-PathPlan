@@ -2716,6 +2716,33 @@ bool UavPathPlanner::buildTransitionAndRotatePatrol(const ENUPoint& p0, double h
     return false;
 }
 
+bool UavPathPlanner::buildTransitionAndRotatePatrolWithAvoidance(const ENUPoint& p0, double heading0, double minR, double resolution,
+                                                                 const std::vector<ENUPoint>& patrol_path,
+                                                                 std::vector<ENUPoint> &out_transition_path,
+                                                                 std::vector<ENUPoint> &out_rotated_patrol) {
+    const bool found_tangent = this->buildTransitionAndRotatePatrol(
+        p0, heading0, minR, resolution, patrol_path, out_transition_path, out_rotated_patrol);
+
+    if (out_transition_path.empty() || !this->input_data_.has_prohibited_zone || this->input_data_.prohibited_zones.empty()) {
+        return found_tangent;
+    }
+
+    const ENUPoint original_end = out_transition_path.back();
+    std::vector<ENUPoint> avoided_transition = this->avoidProhibitedZones(out_transition_path);
+    if (avoided_transition.empty()) {
+        return found_tangent;
+    }
+
+    const ENUPoint &avoided_end = avoided_transition.back();
+    if (std::hypot(avoided_end.east - original_end.east, avoided_end.north - original_end.north) > 1e-6 ||
+        std::abs(avoided_end.up - original_end.up) > 1e-6) {
+        avoided_transition.push_back(original_end);
+    }
+
+    out_transition_path = std::move(avoided_transition);
+    return found_tangent;
+}
+
 double UavPathPlanner::computeActualMaxClimbRate(const std::vector<ENUPoint> &path) const {
     double max_rate = 0.0;
     if (path.size() < 2) return max_rate;
@@ -2911,7 +2938,7 @@ void UavPathPlanner::generateLeaderPlane2Plane3NonFormation(const WGS84Point &le
     const double resolution = (distance > 0.0) ? distance : 300.0;
     std::vector<ENUPoint> transition;
     std::vector<ENUPoint> rotated_patrol;
-    this->buildTransitionAndRotatePatrol(p0, heading0, radius, resolution, patrol_path, transition, rotated_patrol);
+    this->buildTransitionAndRotatePatrolWithAvoidance(p0, heading0, radius, resolution, patrol_path, transition, rotated_patrol);
     if (transition.empty()) return;
 
     if (!rotated_patrol.empty()) {
@@ -3055,8 +3082,8 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
             const double resolution = (distance > 0.0) ? distance : 300.0;
             std::vector<ENUPoint> battle_transition;
             std::vector<ENUPoint> rotated_battle_patrol;
-            this->buildTransitionAndRotatePatrol(p0, heading0, radius, resolution,
-                                                 battle_patrol, battle_transition, rotated_battle_patrol);
+            this->buildTransitionAndRotatePatrolWithAvoidance(p0, heading0, radius, resolution,
+                                                              battle_patrol, battle_transition, rotated_battle_patrol);
             if (battle_transition.empty()) {
                 std::cerr << "battle_id=" << rid << " failed to generate battle transition path, fallback to ready_zone." << std::endl;
                 appendUniqueIdLocal(out_final_ready_ids, rid);
@@ -3147,8 +3174,8 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
             const double resolution = (distance > 0.0) ? distance : 300.0;
             std::vector<ENUPoint> ready_transition;
             std::vector<ENUPoint> rotated_ready_patrol;
-            this->buildTransitionAndRotatePatrol(p0, heading0, radius, resolution,
-                                                 ready_patrol, ready_transition, rotated_ready_patrol);
+            this->buildTransitionAndRotatePatrolWithAvoidance(p0, heading0, radius, resolution,
+                                                              ready_patrol, ready_transition, rotated_ready_patrol);
 
             if (ready_transition.empty()) {
                 std::cerr << "ready_id=" << rid << " failed to generate ready transition path." << std::endl;
@@ -4529,8 +4556,8 @@ void UavPathPlanner::computeTransitionAndRotatePatrol(const ENUPoint& p0, double
     std::cout<<"开始计算第二段任务区域过渡轨迹 (切圆切入优化)"<<std::endl;
     std::vector<ENUPoint> Transition_Path;
     std::vector<ENUPoint> Rotated_Patrol;
-    this->buildTransitionAndRotatePatrol(p0, heading0, minR, resolution, Patrol_Path,
-                                         Transition_Path, Rotated_Patrol);
+    this->buildTransitionAndRotatePatrolWithAvoidance(p0, heading0, minR, resolution, Patrol_Path,
+                                                      Transition_Path, Rotated_Patrol);
 
     if (!Rotated_Patrol.empty()) {
         this->enforceTransitionClimbRateAndBorrowPatrolPrefix(Transition_Path, Rotated_Patrol,
