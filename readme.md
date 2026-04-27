@@ -60,4 +60,14 @@ WGS84Point:
 先生成原始 plane2 过渡轨迹
 如果存在禁飞区，则对这段过渡轨迹调用 avoidProhibitedZones()
 若避让后末点偏离原目标末点，则把原末点补回去，保证还能正确接上 plane3
-
+----------------------------
+UavPathPlanner使用
+----------------------------
+UavPathPlanner planner;
+if (!planner.getPlan(obj_total, result_json))
+{
+    std::cerr << "Failed to plan!" << std::endl;
+    return 1;
+}
+// 保存到输出路径
+planner.saveJsonToFile(result_json, output_path);
