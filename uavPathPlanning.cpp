@@ -116,6 +116,95 @@ inline bool polygonsOverlap2D(const Polygon2d &a, const Polygon2d &b) {
     return false;
 }
 
+inline bool sameXYPoint(const ENUPoint &a, const ENUPoint &b, double eps = 1e-6) {
+    return std::hypot(a.east - b.east, a.north - b.north) <= eps;
+}
+
+inline double cross2D(const ENUPoint &a, const ENUPoint &b, const ENUPoint &c) {
+    return (b.east - a.east) * (c.north - a.north) - (b.north - a.north) * (c.east - a.east);
+}
+
+inline bool onSegment2D(const ENUPoint &a, const ENUPoint &b, const ENUPoint &p, double eps = 1e-6) {
+    if (std::abs(cross2D(a, b, p)) > eps) return false;
+    return p.east >= std::min(a.east, b.east) - eps && p.east <= std::max(a.east, b.east) + eps &&
+           p.north >= std::min(a.north, b.north) - eps && p.north <= std::max(a.north, b.north) + eps;
+}
+
+inline bool segmentsIntersect2D(const ENUPoint &a1, const ENUPoint &a2,
+                                const ENUPoint &b1, const ENUPoint &b2,
+                                double eps = 1e-6) {
+    const double c1 = cross2D(a1, a2, b1);
+    const double c2 = cross2D(a1, a2, b2);
+    const double c3 = cross2D(b1, b2, a1);
+    const double c4 = cross2D(b1, b2, a2);
+
+    const bool proper_intersect = ((c1 > eps && c2 < -eps) || (c1 < -eps && c2 > eps)) &&
+                                  ((c3 > eps && c4 < -eps) || (c3 < -eps && c4 > eps));
+    if (proper_intersect) return true;
+
+    if (std::abs(c1) <= eps && onSegment2D(a1, a2, b1, eps)) return true;
+    if (std::abs(c2) <= eps && onSegment2D(a1, a2, b2, eps)) return true;
+    if (std::abs(c3) <= eps && onSegment2D(b1, b2, a1, eps)) return true;
+    if (std::abs(c4) <= eps && onSegment2D(b1, b2, a2, eps)) return true;
+    return false;
+}
+
+inline bool hasSelfIntersection2D(const std::vector<ENUPoint> &path, bool closed) {
+    if (path.size() < 4) return false;
+
+    size_t n = path.size();
+    if (closed && sameXYPoint(path.front(), path.back())) {
+        --n;
+    }
+    if (n < 4) return false;
+
+    const size_t segment_count = closed ? n : (n - 1);
+    for (size_t i = 0; i < segment_count; ++i) {
+        const ENUPoint &a1 = path[i];
+        const ENUPoint &a2 = path[(i + 1) % n];
+        for (size_t j = i + 1; j < segment_count; ++j) {
+            if (j == i + 1) continue;
+            if (closed && i == 0 && j + 1 == segment_count) continue;
+
+            const ENUPoint &b1 = path[j];
+            const ENUPoint &b2 = path[(j + 1) % n];
+            if (segmentsIntersect2D(a1, a2, b1, b2)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+inline std::vector<ENUPoint> sampleClosedPolygonBoundary(const std::vector<ENUPoint> &polygon, double spacing) {
+    std::vector<ENUPoint> sampled;
+    if (polygon.size() < 3) return sampled;
+
+    const double effective_spacing = (spacing > 1e-6) ? spacing : 1.0;
+    sampled.reserve(polygon.size() * 2);
+    for (size_t i = 0; i < polygon.size(); ++i) {
+        const ENUPoint &a = polygon[i];
+        const ENUPoint &b = polygon[(i + 1) % polygon.size()];
+        const double dx = b.east - a.east;
+        const double dy = b.north - a.north;
+        const double dz = b.up - a.up;
+        const double len = std::hypot(dx, dy);
+        const int steps = std::max(1, static_cast<int>(std::ceil(len / effective_spacing)));
+        for (int k = 0; k < steps; ++k) {
+            const double t = static_cast<double>(k) / steps;
+            ENUPoint p{a.east + t * dx, a.north + t * dy, a.up + t * dz};
+            if (sampled.empty() || !sameXYPoint(sampled.back(), p)) {
+                sampled.push_back(p);
+            }
+        }
+    }
+
+    if (!sampled.empty() && !sameXYPoint(sampled.front(), sampled.back())) {
+        sampled.push_back(sampled.front());
+    }
+    return sampled;
+}
+
 inline bool parseWGS84PointArray(const json &arr, WGS84Point &out) {
     if (!arr.is_array() || arr.size() < 2 || !arr[0].is_number() || !arr[1].is_number()) {
         return false;
@@ -1166,7 +1255,7 @@ bool UavPathPlanner::runAltitudeOptimization(const std::string &elev_file, ::Out
         // Convert updated ENU trajectory to WGS84
         std::vector<WGS84Point> Trajectory_WGS84 = this->enuToWGS84_Batch(this->Trajectory_ENU, this->origin_);
 
-        this->writeLeaderPlane1(output_data, Trajectory_WGS84);
+        this->writeLeaderSegment(output_data.uav_leader_plane1, output_data, 1, Trajectory_WGS84);
         this->writeFollowerPlane1(output_data, this->Trajectory_ENU, Trajectory_WGS84);
         std::cerr << "AltitudeOptimizer: updated output_data with new trajectories.\n";
 
@@ -1443,6 +1532,8 @@ std::vector<ENUPoint> UavPathPlanner::gen_single_patrol(const std::vector<ENUPoi
         return patrol_path;
     }
 
+    const double keep_up = !trajectory_enu.empty() ? trajectory_enu.back().up : patrol_zone.front().up;
+
     std::vector<ENUPoint> patrol_waypoints = patrol_zone;
     patrol_waypoints.push_back(patrol_waypoints[0]); // 闭合巡逻路径
 
@@ -1487,17 +1578,24 @@ std::vector<ENUPoint> UavPathPlanner::gen_single_patrol(const std::vector<ENUPoi
     }
 
     // 第三段高度与第一段（已优化后的）高度保持一致
-    if (!trajectory_enu.empty()) {
-        const double h_plane1 = trajectory_enu.back().up;
-        for (auto &pt : patrol_path) {
-            pt.up = h_plane1;
-        }
+    for (auto &pt : patrol_path) {
+        pt.up = keep_up;
     }
 
     if (!patrol_path.empty()) {
         patrol_path.push_back(patrol_path[0]); // 闭合巡逻路径
     } else {
         std::cerr << "gen_single_patrol failed: final patrol_path is empty." << std::endl;
+    }
+
+    // 小区域在 SINGLE 模式下经过 Minisnap 平滑后，可能出现非相邻线段交叉。
+    // 一旦检测到自交，则回退为沿原始巡逻区域边界直接采样，保证单圈巡逻不交叉。
+    if (hasSelfIntersection2D(patrol_path, /*closed=*/true)) {
+        std::cerr << "gen_single_patrol: detected self-intersection after smoothing, fallback to boundary sampling." << std::endl;
+        patrol_path = sampleClosedPolygonBoundary(patrol_zone, distance);
+        for (auto &pt : patrol_path) {
+            pt.up = keep_up;
+        }
     }
 
     return patrol_path;
@@ -2304,15 +2402,6 @@ void UavPathPlanner::upsertUsingMidwayLine(OutputData &output_data, int uav_id, 
     output_data.using_midway_lines.push_back(std::move(new_line));
 }
 
-void UavPathPlanner::writeLeaderPlane1(OutputData &output_data, const std::vector<WGS84Point> &traj) const {
-    output_data.uav_leader_plane1.clear();
-    output_data.uav_leader_plane1.reserve(traj.size());
-    for (const auto &p : traj) {
-        output_data.uav_leader_plane1.emplace_back(WGS84Coord(p.lon, p.lat, p.alt));
-    }
-    this->upsertUsingMidwayLine(output_data, this->input_data_.uav_leader_id, 1, traj);
-}
-
 void UavPathPlanner::writeLeaderSegment(std::vector<WGS84Coord> &dst_segment, OutputData &output_data,
                                         int segment_id, const std::vector<WGS84Point> &traj,
                                         bool sync_using_midway_line) const {
@@ -2675,11 +2764,23 @@ void UavPathPlanner::enforceTransitionClimbRateAndBorrowPatrolPrefix(std::vector
         return std::max(target_up, current_up - delta_limit);
     };
 
+    // 优先保留原始过渡轨迹的高度分布；只有某一段实际爬升率超过约束时，
+    // 才将该点高度回拉到允许包络内。
     for (size_t i = 1; i < transition_path.size(); ++i) {
         const double dx = transition_path[i].east - transition_path[i - 1].east;
         const double dy = transition_path[i].north - transition_path[i - 1].north;
         const double dist_xy = std::hypot(dx, dy);
-        transition_path[i].up = advanceTowardTarget(transition_path[i - 1].up, dist_xy);
+        if (dist_xy <= 1e-6) {
+            transition_path[i].up = transition_path[i - 1].up;
+            continue;
+        }
+
+        const double delta_limit = max_climb_rate * dist_xy;
+        const double prev_up = transition_path[i - 1].up;
+        const double desired_up = transition_path[i].up;
+        const double min_allowed_up = prev_up - delta_limit;
+        const double max_allowed_up = prev_up + delta_limit;
+        transition_path[i].up = std::clamp(desired_up, min_allowed_up, max_allowed_up);
     }
 
     const auto reachedTarget = [&](double up) {
@@ -3204,7 +3305,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
             planning_waypoints = Enu_waypoint;
         }
 
-        // 避障处理  todo : 所有的轨迹都需要避障处理，而不仅仅是长机 plane1
+        // 避障处理  todo : 所有的轨迹都需要避障处理，而不仅仅是 plane1
         if (this->input_data_.has_prohibited_zone) {
             std::cout << "Applying prohibited zone avoidance..." << std::endl;
             planning_waypoints = this->avoidProhibitedZones(planning_waypoints);
@@ -3228,7 +3329,7 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
 
         // ENU -> WGS84，并写入长机 plane1
         Trajectory_WGS84 = this->enuToWGS84_Batch(Trajectory_ENU, this->origin_);
-        this->writeLeaderPlane1(this->output_data_, Trajectory_WGS84);
+        this->writeLeaderSegment(this->output_data_.uav_leader_plane1, this->output_data_, 1, Trajectory_WGS84);
     } else {
         // 非编队：长机 plane1 必须为空
         this->Trajectory_ENU.clear();

@@ -302,12 +302,8 @@ private:
     // 若相同 (uav_id, segment_id) 已存在则覆盖，否则追加新记录。
     void upsertUsingMidwayLine(OutputData &output_data, int uav_id, int segment_id, const std::vector<WGS84Point> &traj) const;
 
-    // 将长机第一段轨迹（plane1）写入 output_data，
-    // 同时同步 using_midway_lines 中 segment_id=1 的历史记录。
-    void writeLeaderPlane1(OutputData &output_data, const std::vector<WGS84Point> &traj) const;
-
     // 通用的“长机某一段轨迹写回”封装。
-    // dst_segment 通常是 uav_leader_plane2 / uav_leader_plane3。
+    // dst_segment 可为 uav_leader_plane1 / uav_leader_plane2 / uav_leader_plane3。
     // sync_using_midway_line=true 时，会同步 using_midway_lines 对应段号。
     void writeLeaderSegment(std::vector<WGS84Coord> &dst_segment, OutputData &output_data,
                             int segment_id, const std::vector<WGS84Point> &traj,
@@ -350,7 +346,8 @@ private:
     double computeActualMaxClimbRate(const std::vector<ENUPoint> &path) const;
 
     // 对 plane2 施加最大爬升率约束，并在高度不足时“借用” plane3 前缀：
-    // - 保留当前 plane2 的平面路径点不变，只回拉/调整高度
+    // - 优先保留当前 plane2 原有的平缓上升高度分布
+    // - 仅当某一段爬升率超过 max_climb_rate 时，才对该段及其后续高度做回拉/裁剪
     // - 若 plane2 末点还未达到 plane3 目标高度，则沿 plane3 前缀继续走，
     //   将这些点并入 plane2，并按 max_climb_rate 逐步抬升
     // - 一旦达到目标高度，从该点开始重建剩余 plane3
