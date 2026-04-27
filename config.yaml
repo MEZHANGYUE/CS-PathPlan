@@ -5,14 +5,15 @@ altitude_optimization:
   lambda_follow: 1.0 #跟随地形项权重
   max_climb_rate: 0.3 #最大爬升率约束
   uav_R: 2.0
-  safe_distance: 50.0 #相对于地形的最小安全垂直距离（米）
+  safe_distance: 10.0 #相对于地形的最小安全垂直距离（米）
 
 path_planning:
   minimum_snap_config_file: "../math_util/minimum_snap_config.yaml" # minimum_snap 轨迹生成参数配置文件路径
-  patrol_region_shrink_distance: 100.0  #区域内缩距离
-  position_misalignment: 100  #无人机定位误差（米）
+  patrol_region_shrink_distance: 150.0  #区域内缩距离
+  position_misalignment: 10  #无人机定位误差（米）
   prohibited_zone_conflict_distance: 100.0 #禁飞区冲突判定距离阈值（米）
   min_turning_radius: 300.0 #路径规划时允许的最小转弯半径（米）
+  enable_extend_ready_zone: 1 # 准备区尺寸不足时是否先扩展外接矩形，再按无人机数量/安全半径/最小转弯半径生成内缩子区域
   # safe_distance: 50.0 #路径规划中的安全距离 (编队的安全距离) , 改用 formation_distance 参数
   patrol_width: 600.0  #巡逻路径之间的间距
   patrol_mode: "BOW" #巡逻模式，支持"CIRCULAR"（回形）和"BOW"（弓形）,"SINGLE"(原始的单圈巡逻) , 回形保留配置 暂不实现

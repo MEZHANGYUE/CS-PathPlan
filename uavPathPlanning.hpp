@@ -190,6 +190,7 @@ public:
             double position_misalignment = 0.0;
             double min_turning_radius = 0.0;
             double patrol_width = 0.0;
+            int enable_extend_ready_zone = 1;
             std::string patrol_mode = "BOW";
             // minimum_snap 轨迹生成参数配置文件路径（相对路径以 config.yaml 所在目录为基准）
             std::string minimum_snap_config_file;

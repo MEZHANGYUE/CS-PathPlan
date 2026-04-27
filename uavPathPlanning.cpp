@@ -205,6 +205,309 @@ inline std::vector<ENUPoint> sampleClosedPolygonBoundary(const std::vector<ENUPo
     return sampled;
 }
 
+inline bool shrinkPolygonCopy(const std::vector<ENUPoint> &polygon,
+                              double shrink_meters,
+                              std::vector<ENUPoint> *out_polygon) {
+    if (out_polygon == nullptr) return false;
+    out_polygon->clear();
+    if (polygon.size() < 3) return false;
+    if (!(shrink_meters > 1e-6)) {
+        *out_polygon = polygon;
+        return true;
+    }
+
+    constexpr double kScale = 1000.0;
+    ClipperLib::Path subj;
+    subj.reserve(polygon.size());
+    for (const auto &pt : polygon) {
+        subj.emplace_back(
+            static_cast<ClipperLib::cInt>(std::llround(pt.east * kScale)),
+            static_cast<ClipperLib::cInt>(std::llround(pt.north * kScale)));
+    }
+
+    ClipperLib::ClipperOffset co;
+    co.AddPath(subj, ClipperLib::jtMiter, ClipperLib::etClosedPolygon);
+
+    ClipperLib::Paths solution;
+    co.Execute(solution, -shrink_meters * kScale);
+    if (solution.empty()) {
+        return false;
+    }
+
+    size_t best_idx = 0;
+    double best_area = 0.0;
+    for (size_t i = 0; i < solution.size(); ++i) {
+        const double area = std::abs(ClipperLib::Area(solution[i]));
+        if (area > best_area) {
+            best_area = area;
+            best_idx = i;
+        }
+    }
+    if (solution[best_idx].size() < 3) {
+        return false;
+    }
+
+    const double keep_up = polygon.front().up;
+    out_polygon->reserve(solution[best_idx].size());
+    for (const auto &ipt : solution[best_idx]) {
+        out_polygon->push_back({
+            static_cast<double>(ipt.X) / kScale,
+            static_cast<double>(ipt.Y) / kScale,
+            keep_up,
+        });
+    }
+    return out_polygon->size() >= 3;
+}
+
+inline std::vector<ENUPoint> makeAxisAlignedRectangle(double min_x, double min_y,
+                                                      double max_x, double max_y,
+                                                      double up) {
+    std::vector<ENUPoint> rect;
+    if (max_x - min_x <= 1e-6 || max_y - min_y <= 1e-6) return rect;
+    rect.push_back({min_x, min_y, up});
+    rect.push_back({max_x, min_y, up});
+    rect.push_back({max_x, max_y, up});
+    rect.push_back({min_x, max_y, up});
+    return rect;
+}
+
+inline std::vector<std::vector<ENUPoint>> buildNestedReadySubregions(const std::vector<ENUPoint> &ready_zone_enu,
+                                                                     int required_count,
+                                                                     double uav_position_r,
+                                                                     double min_rotation_r,
+                                                                     double formation_distance,
+                                                                     bool enable_extend_ready_zone) {
+    std::vector<std::vector<ENUPoint>> subregions;
+    if (ready_zone_enu.size() < 3 || required_count <= 0) return subregions;
+
+    const double ring_gap = std::max(1.0, formation_distance);
+    const double base_shrink = std::max(0.0, uav_position_r) + std::max(0.0, min_rotation_r);
+    const double max_shrink = base_shrink + std::max(0, required_count - 1) * ring_gap;
+
+    double min_x = std::numeric_limits<double>::max();
+    double min_y = std::numeric_limits<double>::max();
+    double max_x = -std::numeric_limits<double>::max();
+    double max_y = -std::numeric_limits<double>::max();
+    for (const auto &pt : ready_zone_enu) {
+        min_x = std::min(min_x, pt.east);
+        min_y = std::min(min_y, pt.north);
+        max_x = std::max(max_x, pt.east);
+        max_y = std::max(max_y, pt.north);
+    }
+
+    const double keep_up = ready_zone_enu.front().up;
+    const double min_inner_half_side = std::max(ring_gap, std::max(0.0, min_rotation_r));
+    const double min_required_side = 2.0 * (max_shrink + min_inner_half_side);
+    if (enable_extend_ready_zone) {
+        const double width = max_x - min_x;
+        const double height = max_y - min_y;
+        if (width < min_required_side) {
+            const double extra = 0.5 * (min_required_side - width);
+            min_x -= extra;
+            max_x += extra;
+        }
+        if (height < min_required_side) {
+            const double extra = 0.5 * (min_required_side - height);
+            min_y -= extra;
+            max_y += extra;
+        }
+    }
+
+    subregions.reserve(required_count);
+
+    std::vector<ENUPoint> last_good = makeAxisAlignedRectangle(min_x, min_y, max_x, max_y, keep_up);
+    for (int i = 0; i < required_count; ++i) {
+        const double total_shrink = base_shrink + static_cast<double>(i) * ring_gap;
+        const double cur_min_x = min_x + total_shrink;
+        const double cur_min_y = min_y + total_shrink;
+        const double cur_max_x = max_x - total_shrink;
+        const double cur_max_y = max_y - total_shrink;
+        std::vector<ENUPoint> subregion = makeAxisAlignedRectangle(cur_min_x, cur_min_y, cur_max_x, cur_max_y, keep_up);
+        if (!subregion.empty()) {
+            last_good = subregion;
+            subregions.push_back(std::move(subregion));
+        } else {
+            std::cerr << "ready_zone subregion shrink failed at index=" << i
+                      << ", total_shrink=" << total_shrink
+                      << ", fallback to previous valid subregion." << std::endl;
+            subregions.push_back(last_good);
+        }
+    }
+    return subregions;
+}
+
+inline std::vector<size_t> sampleClosedPathCandidateIndices(const std::vector<ENUPoint> &path,
+                                                            size_t max_candidates = 8) {
+    std::vector<size_t> indices;
+    if (path.empty()) return indices;
+
+    size_t unique_count = path.size();
+    if (unique_count >= 2 && sameXYPoint(path.front(), path.back())) {
+        --unique_count;
+    }
+    if (unique_count == 0) return indices;
+
+    if (unique_count <= max_candidates) {
+        indices.reserve(unique_count);
+        for (size_t i = 0; i < unique_count; ++i) indices.push_back(i);
+        return indices;
+    }
+
+    indices.reserve(max_candidates);
+    std::set<size_t> uniq;
+    for (size_t i = 0; i < max_candidates; ++i) {
+        size_t idx = static_cast<size_t>(std::llround(static_cast<double>(i) * unique_count / max_candidates)) % unique_count;
+        if (uniq.insert(idx).second) {
+            indices.push_back(idx);
+        }
+    }
+    if (indices.empty()) indices.push_back(0);
+    return indices;
+}
+
+inline std::vector<ENUPoint> rotateClosedPathToIndex(const std::vector<ENUPoint> &path, size_t start_idx) {
+    std::vector<ENUPoint> rotated;
+    if (path.empty()) return rotated;
+
+    size_t unique_count = path.size();
+    if (unique_count >= 2 && sameXYPoint(path.front(), path.back())) {
+        --unique_count;
+    }
+    if (unique_count == 0) return rotated;
+
+    start_idx %= unique_count;
+    rotated.reserve(unique_count + 1);
+    for (size_t offset = 0; offset < unique_count; ++offset) {
+        rotated.push_back(path[(start_idx + offset) % unique_count]);
+    }
+    if (!rotated.empty() && !sameXYPoint(rotated.front(), rotated.back())) {
+        rotated.push_back(rotated.front());
+    }
+    return rotated;
+}
+
+inline double readyEntrySelectionScore(const std::vector<ENUPoint> &starts,
+                                       const std::vector<std::vector<ENUPoint>> &candidate_points,
+                                       const std::vector<size_t> &choice_pos) {
+    double total_distance = 0.0;
+    int intersections = 0;
+
+    for (size_t i = 0; i < starts.size(); ++i) {
+        const ENUPoint &entry = candidate_points[i][choice_pos[i]];
+        total_distance += std::hypot(entry.east - starts[i].east, entry.north - starts[i].north);
+    }
+
+    for (size_t i = 0; i < starts.size(); ++i) {
+        const ENUPoint &a2 = candidate_points[i][choice_pos[i]];
+        for (size_t j = i + 1; j < starts.size(); ++j) {
+            const ENUPoint &b2 = candidate_points[j][choice_pos[j]];
+            if (segmentsIntersect2D(starts[i], a2, starts[j], b2) &&
+                !sameXYPoint(starts[i], starts[j]) &&
+                !sameXYPoint(a2, b2)) {
+                ++intersections;
+            }
+        }
+    }
+
+    return total_distance + static_cast<double>(intersections) * 1e6;
+}
+
+inline std::vector<size_t> chooseReadyEntryIndices(const std::vector<ENUPoint> &starts,
+                                                   const std::vector<std::vector<ENUPoint>> &patrol_paths) {
+    std::vector<size_t> chosen_indices;
+    if (starts.empty() || starts.size() != patrol_paths.size()) return chosen_indices;
+
+    std::vector<std::vector<size_t>> sampled_indices(starts.size());
+    std::vector<std::vector<ENUPoint>> candidate_points(starts.size());
+    std::vector<size_t> choice_pos(starts.size(), 0);
+
+    for (size_t i = 0; i < patrol_paths.size(); ++i) {
+        sampled_indices[i] = sampleClosedPathCandidateIndices(patrol_paths[i]);
+        if (sampled_indices[i].empty()) sampled_indices[i].push_back(0);
+        candidate_points[i].reserve(sampled_indices[i].size());
+
+        double best_dist = std::numeric_limits<double>::max();
+        for (size_t k = 0; k < sampled_indices[i].size(); ++k) {
+            const ENUPoint &p = patrol_paths[i][sampled_indices[i][k]];
+            candidate_points[i].push_back(p);
+            const double dist = std::hypot(p.east - starts[i].east, p.north - starts[i].north);
+            if (dist < best_dist) {
+                best_dist = dist;
+                choice_pos[i] = k;
+            }
+        }
+    }
+
+    for (size_t iter = 0; iter < starts.size() * 4 + 4; ++iter) {
+        bool improved = false;
+        for (size_t i = 0; i < starts.size(); ++i) {
+            size_t best_choice = choice_pos[i];
+            double best_score = readyEntrySelectionScore(starts, candidate_points, choice_pos);
+            for (size_t k = 0; k < candidate_points[i].size(); ++k) {
+                if (k == choice_pos[i]) continue;
+                std::vector<size_t> trial = choice_pos;
+                trial[i] = k;
+                const double score = readyEntrySelectionScore(starts, candidate_points, trial);
+                if (score + 1e-6 < best_score) {
+                    best_score = score;
+                    best_choice = k;
+                }
+            }
+            if (best_choice != choice_pos[i]) {
+                choice_pos[i] = best_choice;
+                improved = true;
+            }
+        }
+        if (!improved) break;
+    }
+
+    chosen_indices.resize(starts.size(), 0);
+    for (size_t i = 0; i < starts.size(); ++i) {
+        chosen_indices[i] = sampled_indices[i][choice_pos[i]];
+    }
+    return chosen_indices;
+}
+
+inline std::vector<ENUPoint> buildTransitionToReadyPatrolEntry(UavPathPlanner *planner,
+                                                               const ENUPoint &p0,
+                                                               double heading0,
+                                                               double minR,
+                                                               double resolution,
+                                                               const std::vector<ENUPoint> &rotated_patrol) {
+    std::vector<ENUPoint> transition;
+    if (planner == nullptr || rotated_patrol.empty()) return transition;
+
+    const ENUPoint entry = rotated_patrol.front();
+    if (rotated_patrol.size() >= 2 && minR > 1e-6 && !sameXYPoint(rotated_patrol.front(), rotated_patrol[1])) {
+        transition = planner->generateArcLineArc(p0, heading0, rotated_patrol.front(), rotated_patrol[1], minR, resolution);
+    }
+
+    if (transition.empty()) {
+        const double dx = entry.east - p0.east;
+        const double dy = entry.north - p0.north;
+        const double dist = std::hypot(dx, dy);
+        const int steps = std::max(1, static_cast<int>(std::ceil(dist / std::max(1.0, resolution))));
+        transition.reserve(static_cast<size_t>(steps) + 1);
+        for (int i = 0; i <= steps; ++i) {
+            const double t = static_cast<double>(i) / steps;
+            transition.push_back({
+                p0.east + t * dx,
+                p0.north + t * dy,
+                p0.up + t * (entry.up - p0.up),
+            });
+        }
+    }
+
+    std::vector<ENUPoint> avoided = planner->avoidProhibitedZones(transition);
+    if (!avoided.empty()) {
+        transition = std::move(avoided);
+    }
+    if (transition.empty() || !sameXYPoint(transition.back(), entry) || std::abs(transition.back().up - entry.up) > 1e-6) {
+        transition.push_back(entry);
+    }
+    return transition;
+}
+
 inline bool parseWGS84PointArray(const json &arr, WGS84Point &out) {
     if (!arr.is_array() || arr.size() < 2 || !arr[0].is_number() || !arr[1].is_number()) {
         return false;
@@ -531,6 +834,7 @@ bool UavPathPlanner::loadFromYAML(const std::string &config_path)
             yamlAssignIfPresent(pp, "position_misalignment", cfg.path_planning.position_misalignment);
             yamlAssignIfPresent(pp, "min_turning_radius", cfg.path_planning.min_turning_radius);
             yamlAssignIfPresent(pp, "patrol_width", cfg.path_planning.patrol_width);
+            yamlAssignIfPresent(pp, "enable_extend_ready_zone", cfg.path_planning.enable_extend_ready_zone);
             yamlAssignIfPresent(pp, "patrol_mode", cfg.path_planning.patrol_mode);
             yamlAssignIfPresent(pp, "formation_distance", cfg.path_planning.formation_distance);
             yamlAssignIfPresent(pp, "uav_formation_max_row", cfg.path_planning.uav_formation_max_row);
@@ -3111,11 +3415,21 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
     // 再为 out_final_ready_ids 生成 plane2/plane3
     if (!out_final_ready_ids.empty() && this->input_data_.ready_zone.polygon.size() >= 3) {
 
-        // ready_zone 相对高度：使用 ready_high_list 的平均值
+        struct ReadyPlan {
+            int rid = 0;
+            ENUPoint p0{};
+            double heading0 = 0.0;
+            std::vector<ENUPoint> ctx_enu;
+            double target_up = 0.0;
+            std::vector<ENUPoint> patrol;
+            std::vector<ENUPoint> rotated_patrol;
+        };
+
         const double ready_relative_h = 0.5 * (this->input_data_.ready_zone.height_range.first + this->input_data_.ready_zone.height_range.second);
 
+        std::vector<ReadyPlan> ready_plans;
+        ready_plans.reserve(out_final_ready_ids.size());
         for (int rid : out_final_ready_ids) {
-            // 如果该机已经生成了 battle plane2/3，则跳过 ready 生成
             bool already_has_plane2 = false;
             for (const auto &l2 : this->output_data_.uav_plane2) {
                 if (l2.uav_id == rid) { already_has_plane2 = true; break; }
@@ -3130,73 +3444,100 @@ void UavPathPlanner::generateFollowerPlane2Plane3(bool formation_enabled, double
                 continue;
             }
 
-            const double ready_target_up = p0.up + ready_relative_h;
+            const double add_h = -20.0 * static_cast<double>(ready_plans.size() % 10);
+            ready_plans.push_back({rid, p0, heading0, std::move(ctx_enu), p0.up + ready_relative_h + add_h});
+        }
 
+        if (!ready_plans.empty()) {
             std::vector<WGS84Point> ready_zone_wgs;
             ready_zone_wgs.reserve(this->input_data_.ready_zone.polygon.size());
             for (const auto &pt : this->input_data_.ready_zone.polygon) {
-                ready_zone_wgs.push_back({pt.lon, pt.lat, ready_target_up});
+                ready_zone_wgs.push_back({pt.lon, pt.lat, 0.0});
             }
-            if (ready_zone_wgs.size() < 3) {
-                std::cerr << "ready_zone invalid (<3 points), skip ready_id=" << rid << std::endl;
-                continue;
-            }
-
             std::vector<ENUPoint> ready_zone_enu = this->wgs84ToENU_Batch(ready_zone_wgs, this->origin_);
+            for (auto &pt : ready_zone_enu) pt.up = 0.0;
 
-            std::vector<ENUPoint> ready_patrol = this->computePatrolPathByMode(
+            double ready_position_misalignment = this->config_.path_planning.position_misalignment;
+            if (this->input_data_.position_misalignment >= 0.0) {
+                ready_position_misalignment = this->input_data_.position_misalignment;
+            }
+            double ready_uav_r = this->config_.altitude_optimization.uav_R;
+            if (this->input_data_.uav_R > 0.0) {
+                ready_uav_r = this->input_data_.uav_R;
+            }
+            const double ready_uav_position_r = std::max(0.0, ready_position_misalignment + ready_uav_r);
+            const double ready_min_rotation_r = std::max(0.0, this->input_data_.min_turning_radius > 0.0
+                                                                  ? this->input_data_.min_turning_radius
+                                                                  : this->config_.path_planning.min_turning_radius);
+
+            const auto ready_subregions = buildNestedReadySubregions(
                 ready_zone_enu,
-                distance,
-                this->config_.path_planning.patrol_mode,
-                ctx_enu);
-
-            if (ready_patrol.empty()) {
-                std::cerr << "ready_id=" << rid << " failed to generate ready patrol path." << std::endl;
-                continue;
+                static_cast<int>(ready_plans.size()),
+                ready_uav_position_r,
+                ready_min_rotation_r,
+                this->config_.path_planning.formation_distance,
+                this->config_.path_planning.enable_extend_ready_zone == 1);
+            if (ready_subregions.empty()) {
+                std::cerr << "ready_zone subregion generation failed, skip ready plane2/plane3 generation." << std::endl;
+                return;
             }
 
-            for (auto &pt : ready_patrol) {
-                pt.up = ready_target_up;
-            }
-
-            if (!std::isfinite(heading0) || ctx_enu.size() < 2) {
-                ENUPoint p1 = ready_patrol.front();
-                const double dx = p1.east - p0.east;
-                const double dy = p1.north - p0.north;
-                if (std::hypot(dx, dy) > 1e-6) {
-                    heading0 = std::atan2(dy, dx);
-                } else {
-                    heading0 = 0.0;
+            for (size_t i = 0; i < ready_plans.size(); ++i) {
+                const auto &subregion = ready_subregions[std::min(i, ready_subregions.size() - 1)];
+                ready_plans[i].patrol = this->gen_single_patrol(subregion, distance, ready_plans[i].ctx_enu);
+                if (ready_plans[i].patrol.empty()) {
+                    std::cerr << "ready_id=" << ready_plans[i].rid << " failed to generate ready patrol path." << std::endl;
+                    continue;
+                }
+                for (auto &pt : ready_plans[i].patrol) {
+                    pt.up = ready_plans[i].target_up;
                 }
             }
 
-            const double radius = std::max(0.0, this->input_data_.min_turning_radius);
-            const double resolution = (distance > 0.0) ? distance : 300.0;
-            std::vector<ENUPoint> ready_transition;
-            std::vector<ENUPoint> rotated_ready_patrol;
-            this->buildTransitionAndRotatePatrolWithAvoidance(p0, heading0, radius, resolution,
-                                                              ready_patrol, ready_transition, rotated_ready_patrol);
+            for (auto &plan : ready_plans) {
+                if (plan.patrol.empty()) {
+                    continue;
+                }
 
-            if (ready_transition.empty()) {
-                std::cerr << "ready_id=" << rid << " failed to generate ready transition path." << std::endl;
-                continue;
+                if ((!std::isfinite(plan.heading0) || plan.ctx_enu.size() < 2) && !plan.patrol.empty()) {
+                    const ENUPoint &p1 = plan.patrol.front();
+                    const double dx = p1.east - plan.p0.east;
+                    const double dy = p1.north - plan.p0.north;
+                    if (std::hypot(dx, dy) > 1e-6) {
+                        plan.heading0 = std::atan2(dy, dx);
+                    } else {
+                        plan.heading0 = 0.0;
+                    }
+                }
+
+                const double radius = std::max(0.0, this->input_data_.min_turning_radius);
+                const double resolution = (distance > 0.0) ? distance : 300.0;
+                std::vector<ENUPoint> ready_transition;
+                this->buildTransitionAndRotatePatrolWithAvoidance(
+                    plan.p0, plan.heading0, radius, resolution,
+                    plan.patrol, ready_transition, plan.rotated_patrol);
+
+                if (ready_transition.empty()) {
+                    std::cerr << "ready_id=" << plan.rid << " failed to generate ready transition path." << std::endl;
+                    continue;
+                }
+
+                if (!plan.rotated_patrol.empty()) {
+                    this->enforceTransitionClimbRateAndBorrowPatrolPrefix(
+                        ready_transition, plan.rotated_patrol,
+                        std::string("uav ") + std::to_string(plan.rid) + " ready plane2");
+                }
+
+                std::vector<WGS84Point> ready_transition_wgs = this->enuToWGS84_Batch(ready_transition, this->origin_);
+                std::vector<WGS84Point> ready_patrol_wgs = this->enuToWGS84_Batch(
+                    plan.rotated_patrol.empty() ? plan.patrol : plan.rotated_patrol, this->origin_);
+
+                this->upsertUsingMidwayLine(this->output_data_, plan.rid, 2, ready_transition_wgs);
+                this->upsertUsingMidwayLine(this->output_data_, plan.rid, 3, ready_patrol_wgs);
+
+                this->appendUavSegmentLine(this->output_data_.uav_plane2, plan.rid, 2, ready_transition_wgs);
+                this->appendUavSegmentLine(this->output_data_.uav_plane3, plan.rid, 3, ready_patrol_wgs);
             }
-
-            if (!rotated_ready_patrol.empty()) {
-                this->enforceTransitionClimbRateAndBorrowPatrolPrefix(
-                    ready_transition, rotated_ready_patrol,
-                    std::string("uav ") + std::to_string(rid) + " ready plane2");
-            }
-
-            std::vector<WGS84Point> ready_transition_wgs = this->enuToWGS84_Batch(ready_transition, this->origin_);
-            std::vector<WGS84Point> ready_patrol_wgs = this->enuToWGS84_Batch(
-                rotated_ready_patrol.empty() ? ready_patrol : rotated_ready_patrol, this->origin_);
-
-            this->upsertUsingMidwayLine(this->output_data_, rid, 2, ready_transition_wgs);
-            this->upsertUsingMidwayLine(this->output_data_, rid, 3, ready_patrol_wgs);
-
-            this->appendUavSegmentLine(this->output_data_.uav_plane2, rid, 2, ready_transition_wgs);
-            this->appendUavSegmentLine(this->output_data_.uav_plane3, rid, 3, ready_patrol_wgs);
         }
     }
 }
