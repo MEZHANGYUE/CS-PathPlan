@@ -4346,6 +4346,47 @@ json UavPathPlanner::generateTriangleShapeTrajectories(const json &uavs_ids, con
     size_t N = Trajectory_ENU.size();
     double leader_start_alt = (N > 0) ? Trajectory_ENU.front().up : 0.0;
 
+    // 计算需要的无人机数量和每一层的分布
+    // 空心三角形：三角形三条边都填满（每层首尾+最后一层全填）
+    std::vector<std::pair<int, int>> triangle_indices; // (row, pos_in_row)
+    int total = 0;
+    int row = 1;
+    int max_row = 1;
+    // 先估算最大层数
+    while (true) {
+        int count_this_row = (row == 1) ? 2 : row + 1;
+        int edge_count = (row == 1) ? 2 : 2 + (row - 1); // 只算边
+        if (total + edge_count > (int)uavs_ids.size()) break;
+        total += edge_count;
+        max_row = row;
+        row++;
+    }
+    // 重新分配
+    total = 0;
+    row = 1;
+    while (total < (int)uavs_ids.size()) {
+        int count_this_row = (row == 1) ? 2 : row + 1;
+        for (int pos = 0; pos < count_this_row; ++pos) {
+            // 第一层（顶点）
+            if (row == 1) {
+                triangle_indices.emplace_back(row, pos);
+                total++;
+            }
+            // 最后一层（底边）
+            else if (row == max_row) {
+                triangle_indices.emplace_back(row, pos);
+                total++;
+            }
+            // 其它层只放两侧
+            else if (pos == 0 || pos == count_this_row - 1) {
+                triangle_indices.emplace_back(row, pos);
+                total++;
+            }
+            if (total >= (int)uavs_ids.size()) break;
+        }
+        row++;
+    }
+
     for (size_t idx = 0; idx < uavs_ids.size(); ++idx) {
         int uid = uavs_ids[idx].get<int>();
         if (idx >= uav_starts.size()) break;
@@ -4357,23 +4398,13 @@ json UavPathPlanner::generateTriangleShapeTrajectories(const json &uavs_ids, con
         start_wp.lat = s[1].get<double>();
         start_wp.alt = s.size() >= 3 ? s[2].get<double>() : 0.0;
 
-        // Triangle (Delta) layers for followers:
-        // row 1: 2 UAVs at (-d, ±d)
-        // row 2: 3 UAVs at (-2d, -2d/0/+2d)
-        // ... row r: (r+1) UAVs
-        int k = static_cast<int>(idx) + 1; // 1-based follower index
-        int row = 1;
-        int prev_count = 0;
-        while (prev_count + (row + 1) < k) {
-            prev_count += (row + 1);
-            row++;
-        }
-        int pos_in_row = k - prev_count - 1; // 0..row
+        // 获取空心三角形的 row/pos_in_row
+        int row = triangle_indices[idx].first;
+        int pos_in_row = triangle_indices[idx].second;
 
         // Use body frame: +x forward, +y left
         double dx = -row * safety_distance;
         double center = (double)row / 2.0;
-        // Make the first UAV on the left side (consistent with V-shape idx%2==0 => left)
         double dy = (center - pos_in_row) * 2.0 * safety_distance;
 
         Eigen::Vector2d rel_body(dx, dy);
