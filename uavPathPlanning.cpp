@@ -820,6 +820,19 @@ bool UavPathPlanner::loadFromYAML(const std::string &config_path)
             auto alt = root["altitude_optimization"];
             yamlAssignIfPresent(alt, "enabled", cfg.altitude_optimization.enabled);
             yamlAssignIfPresent(alt, "elevation_file", cfg.altitude_optimization.elevation_file);
+            // elevation_file 必须存在，否则直接返回失败
+            if (cfg.altitude_optimization.enabled && cfg.altitude_optimization.elevation_file.empty()) {
+                cfg.loaded = false;
+                cfg.load_error = "elevation_file not specified";
+                this->config_ = cfg;
+                return false;
+            }
+            if (cfg.altitude_optimization.enabled && !fileExists(cfg.altitude_optimization.elevation_file)) {
+                cfg.loaded = false;
+                cfg.load_error = std::string("elevation_file not found: ") + cfg.altitude_optimization.elevation_file;
+                this->config_ = cfg;
+                return false;
+            }
             yamlAssignIfPresent(alt, "lambda_smooth", cfg.altitude_optimization.lambda_smooth);
             yamlAssignIfPresent(alt, "lambda_follow", cfg.altitude_optimization.lambda_follow);
             yamlAssignIfPresent(alt, "max_climb_rate", cfg.altitude_optimization.max_climb_rate);
@@ -846,33 +859,42 @@ bool UavPathPlanner::loadFromYAML(const std::string &config_path)
             } else {
                 yamlAssignIfPresent(pp, "distance_points", cfg.path_planning.distance_points);
             }
+            // minimum_snap_config_file 必须存在，否则直接返回失败
+            if (cfg.path_planning.minimum_snap_config_file.empty()) {
+                cfg.loaded = false;
+                cfg.load_error = "minimum_snap_config_file not specified";
+                this->config_ = cfg;
+                return false;
+            }
+            if (!fileExists(cfg.path_planning.minimum_snap_config_file)) {
+                cfg.loaded = false;
+                cfg.load_error = std::string("minimum_snap_config_file not found: ") + cfg.path_planning.minimum_snap_config_file;
+                this->config_ = cfg;
+                return false;
+            }
         }
 
         // minimum_snap 参数：仅从 path_planning.minimum_snap_config_file 指向的独立配置文件读取
         if (!cfg.path_planning.minimum_snap_config_file.empty()) {
             std::string resolved = cfg.path_planning.minimum_snap_config_file;
             try {
-                if (!fileExists(resolved)) {
-                    std::cerr << "Warning: minimum_snap_config_file not found: " << resolved << std::endl;
-                } else {
-                    YAML::Node ms_root = YAML::LoadFile(resolved);
-                    YAML::Node ms = ms_root;
-                    // allow wrapper style: minimum_snap: { ... }
-                    if (ms_root["minimum_snap"]) ms = ms_root["minimum_snap"];
+                YAML::Node ms_root = YAML::LoadFile(resolved);
+                YAML::Node ms = ms_root;
+                // allow wrapper style: minimum_snap: { ... }
+                if (ms_root["minimum_snap"]) ms = ms_root["minimum_snap"];
 
-                    yamlAssignIfPresent(ms, "order", cfg.minimum_snap.order);
-                    yamlAssignIfPresent(ms, "path_weight", cfg.minimum_snap.path_weight);
-                    yamlAssignIfPresent(ms, "vel_zero_weight", cfg.minimum_snap.vel_zero_weight);
-                    yamlAssignIfPresent(ms, "V_avg", cfg.minimum_snap.V_avg);
-                    yamlAssignIfPresent(ms, "min_time_s", cfg.minimum_snap.min_time_s);
-                    yamlAssignIfPresent(ms, "sample_distance", cfg.minimum_snap.sample_distance);
-                    yamlAssignVec3IfPresent(ms, "start_vel", cfg.minimum_snap.start_vel);
-                    yamlAssignVec3IfPresent(ms, "end_vel", cfg.minimum_snap.end_vel);
-                    yamlAssignVec3IfPresent(ms, "start_acc", cfg.minimum_snap.start_acc);
-                    yamlAssignVec3IfPresent(ms, "end_acc", cfg.minimum_snap.end_acc);
+                yamlAssignIfPresent(ms, "order", cfg.minimum_snap.order);
+                yamlAssignIfPresent(ms, "path_weight", cfg.minimum_snap.path_weight);
+                yamlAssignIfPresent(ms, "vel_zero_weight", cfg.minimum_snap.vel_zero_weight);
+                yamlAssignIfPresent(ms, "V_avg", cfg.minimum_snap.V_avg);
+                yamlAssignIfPresent(ms, "min_time_s", cfg.minimum_snap.min_time_s);
+                yamlAssignIfPresent(ms, "sample_distance", cfg.minimum_snap.sample_distance);
+                yamlAssignVec3IfPresent(ms, "start_vel", cfg.minimum_snap.start_vel);
+                yamlAssignVec3IfPresent(ms, "end_vel", cfg.minimum_snap.end_vel);
+                yamlAssignVec3IfPresent(ms, "start_acc", cfg.minimum_snap.start_acc);
+                yamlAssignVec3IfPresent(ms, "end_acc", cfg.minimum_snap.end_acc);
 
-                    std::cerr << "Loaded minimum_snap config from " << resolved << std::endl;
-                }
+                std::cerr << "Loaded minimum_snap config from " << resolved << std::endl;
             } catch (const std::exception &e) {
                 std::cerr << "Warning: failed to load minimum_snap config from " << resolved << ": " << e.what() << std::endl;
             }
