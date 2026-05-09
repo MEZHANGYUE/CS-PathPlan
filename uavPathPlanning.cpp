@@ -3644,6 +3644,25 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
     const bool altitude_opt_enabled = altitude_ctx.enabled;
     const std::string elevation_file = altitude_ctx.elevation_file;
 
+    // Check if start points are within elevation map bounds if elevation is valid
+    if (this->elev_cost_map_ && this->elev_cost_map_->isElevationValid()) {
+        double dummy_elev = 0.0;
+        // Check leader start point
+        if (!this->elev_cost_map_->getElevationAt(leader_start_wgs.lon, leader_start_wgs.lat, dummy_elev)) {
+            std::cerr << "Planning failed: leader start point (" << leader_start_wgs.lon << ", " << leader_start_wgs.lat 
+                      << ") is outside elevation map coverage." << std::endl;
+            return false;
+        }
+        // Check follower start points
+        for (const auto& follower_start : this->input_data_.uav_start_point_wgs84) {
+            if (!this->elev_cost_map_->getElevationAt(follower_start.lon, follower_start.lat, dummy_elev)) {
+                std::cerr << "Planning failed: follower start point (" << follower_start.lon << ", " << follower_start.lat 
+                          << ") is outside elevation map coverage." << std::endl;
+                return false;
+            }
+        }
+    }
+
     // ---------- 原点选择 ----------
     // 统一使用长机起点作为 origin_（仅经纬度参与 ENU 原点，alt 置 0）
     // 非编队时仍保留现有起点高度优化，用于后续 plane2/3 起点与离地净空约束。
