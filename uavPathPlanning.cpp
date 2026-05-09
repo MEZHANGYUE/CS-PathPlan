@@ -3628,6 +3628,15 @@ bool UavPathPlanner::getPlan(json &input_json, json &output_json, bool use3D, st
                                 this->input_data_.uav_leader_start_point_wgs84.lat,
                                 this->input_data_.uav_leader_start_point_wgs84.alt};
 
+    // 如果没有长机起点，但有僚机起点，则取第一个僚机起点作为参考原点
+    if (std::abs(leader_start_wgs.lon) < 1e-9 && std::abs(leader_start_wgs.lat) < 1e-9) {
+        if (!this->input_data_.uav_start_point_wgs84.empty()) {
+            leader_start_wgs.lon = this->input_data_.uav_start_point_wgs84.front().lon;
+            leader_start_wgs.lat = this->input_data_.uav_start_point_wgs84.front().lat;
+            leader_start_wgs.alt = this->input_data_.uav_start_point_wgs84.front().alt;
+        }
+    }
+
     // ---------- 高度优化开关 / 高程数据加载（非编队也可能依赖地形查询用于起点抬升与后续 plane2/3 优化） ----------
     const auto altitude_ctx = this->prepareAltitudeOptimizationContext(
         /*ensure_elevation_loaded=*/true,
