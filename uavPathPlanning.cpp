@@ -2667,12 +2667,12 @@ std::vector<ENUPoint> UavPathPlanner::preparePlanningWaypoints(int &midwaypoint_
         std::vector<ENUPoint> filtered_wpts;
         filtered_wpts.reserve(Enu_waypoint.size());
         double min_dist = 200.0; // Minimum distance in meters for waypoints
-        //只过滤路径点的间距,不影响区域边界点
-        for (size_t i = 0; i < midwaypoint_num - 1; ++i) {
+        // 只过滤路径点的间距,不影响区域边界点
+        size_t filter_count = std::min<size_t>(midwaypoint_num > 0 ? midwaypoint_num - 1 : 0, Enu_waypoint.size() - 1);
+        for (size_t i = 0; i < filter_count; ++i) {
             const auto& p1 = Enu_waypoint[i];
             const auto& p2 = Enu_waypoint[i+1];
             double dist2d = std::hypot(p1.east - p2.east, p1.north - p2.north);
-
             if (dist2d > min_dist) {
                 filtered_wpts.push_back(p1);
             } else {
@@ -2680,7 +2680,7 @@ std::vector<ENUPoint> UavPathPlanner::preparePlanningWaypoints(int &midwaypoint_
             }
         }
         // 将剩余的点（包括最后一个 midway 点和所有的 zhandou 点）添加到结果中
-        int start_idx = (midwaypoint_num > 0) ? (midwaypoint_num - 1) : 0;
+        size_t start_idx = filter_count;
         for (size_t i = start_idx; i < Enu_waypoint.size(); ++i) {
             filtered_wpts.push_back(Enu_waypoint[i]);
         }
